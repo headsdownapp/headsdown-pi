@@ -19,7 +19,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
+
+      # The SDK is a git dependency. npm lockfile resolves to ssh://
+      # but CI doesn't have SSH keys. Rewrite to HTTPS.
+      - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
       - run: npm ci
       - run: npm run typecheck
