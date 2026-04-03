@@ -30,7 +30,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@headsdown/sdk": "file:../headsdown-sdk"
+    "@headsdown/sdk": "github:headsdownapp/headsdown-sdk"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
