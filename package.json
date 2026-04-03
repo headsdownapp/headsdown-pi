@@ -1,40 +1,30 @@
 {
-  "name": "headsdown-pi-skill",
+  "name": "headsdown-pi",
   "version": "0.1.0",
-  "description": "HeadsDown availability skill for Pi agent. Gives Pi awareness of your focus mode, schedule, and availability before starting tasks.",
+  "description": "HeadsDown availability skill and extension for Pi agent. Gives Pi awareness of your focus mode, schedule, and availability before starting tasks.",
   "type": "module",
-  "bin": {
-    "headsdown": "./dist/cli.js"
-  },
-  "main": "./dist/cli.js",
-  "files": ["dist", "skills", "README.md", "LICENSE"],
+  "keywords": ["pi-package", "headsdown", "availability", "focus", "ai-agent"],
+  "files": ["extensions", "skills", "README.md", "LICENSE"],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "dev": "tsc -p tsconfig.build.json --watch",
+    "build": "echo 'No build needed. Extensions are loaded directly by Pi via jiti.'",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "prettier --check 'src/**/*.ts' 'test/**/*.ts'",
-    "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts'",
-    "prepublishOnly": "npm run build",
-    "clean": "rm -rf dist"
+    "lint": "prettier --check 'extensions/**/*.ts' 'test/**/*.ts'",
+    "format": "prettier --write 'extensions/**/*.ts' 'test/**/*.ts'",
+    "typecheck": "tsc --noEmit"
   },
-  "keywords": [
-    "pi",
-    "pi-agent",
-    "headsdown",
-    "availability",
-    "focus",
-    "ai-agent",
-    "agent-skill"
-  ],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/headsdownapp/headsdown-pi-skill.git"
+    "url": "https://github.com/headsdownapp/headsdown-pi.git"
   },
-  "homepage": "https://github.com/headsdownapp/headsdown-pi-skill#readme",
+  "homepage": "https://github.com/headsdownapp/headsdown-pi#readme",
   "bugs": {
-    "url": "https://github.com/headsdownapp/headsdown-pi-skill/issues"
+    "url": "https://github.com/headsdownapp/headsdown-pi/issues"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -42,7 +32,15 @@
   "dependencies": {
     "@headsdown/sdk": "file:../headsdown-sdk"
   },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  },
   "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*",
     "@types/node": "^20.17.0",
     "prettier": "^3.4.0",
     "typescript": "^5.7.0",
