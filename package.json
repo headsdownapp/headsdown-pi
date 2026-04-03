@@ -1,0 +1,51 @@
+{
+  "name": "headsdown-pi-skill",
+  "version": "0.1.0",
+  "description": "HeadsDown availability skill for Pi agent. Gives Pi awareness of your focus mode, schedule, and availability before starting tasks.",
+  "type": "module",
+  "bin": {
+    "headsdown": "./dist/cli.js"
+  },
+  "main": "./dist/cli.js",
+  "files": ["dist", "skills", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "prettier --check 'src/**/*.ts' 'test/**/*.ts'",
+    "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts'",
+    "prepublishOnly": "npm run build",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "headsdown",
+    "availability",
+    "focus",
+    "ai-agent",
+    "agent-skill"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/headsdownapp/headsdown-pi-skill.git"
+  },
+  "homepage": "https://github.com/headsdownapp/headsdown-pi-skill#readme",
+  "bugs": {
+    "url": "https://github.com/headsdownapp/headsdown-pi-skill/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@headsdown/sdk": "file:../headsdown-sdk"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0"
+  }
+}
