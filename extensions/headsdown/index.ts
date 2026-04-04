@@ -12,7 +12,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { HeadsDownClient, ConfigStore, AuthError } from "@headsdown/sdk";
+import { HeadsDownClient, ConfigStore, AuthError, CalibrationTracker } from "@headsdown/sdk";
 import type { Contract, Calendar, ProposalInput, HeadsDownConfig } from "@headsdown/sdk";
 import { applyTrustPolicy, isSensitivePath, formatSummary } from "./policy.js";
 
@@ -33,6 +33,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let approvedProposals: ProposalState["proposals"] = [];
   let cachedConfig: HeadsDownConfig | null = null;
   let cachedClient: HeadsDownClient | null = null;
+  let activeTracker: CalibrationTracker | null = null;
+  let filesWritten = 0;
 
   // === Helpers ===
 
@@ -91,6 +93,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   // === Session events ===
 
   pi.on("session_start", async (_event, ctx) => {
+    if (activeTracker) {
+      // Clean up any leftover tracker from previous session
+      activeTracker.complete("cancelled").catch(() => {});
+      activeTracker = null;
+    }
+    filesWritten = 0;
     restoreProposals(ctx);
     cachedConfig = null;
     cachedClient = null; // Re-validate credentials on new session
@@ -106,6 +114,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   // Inject availability context at the start of each agent turn
   pi.on("before_agent_start", async (_event, _ctx) => {
+    if (activeTracker) {
+      activeTracker.recordTurn();
+    }
+
     try {
       const client = await getClient();
       if (!client) return undefined;
@@ -130,6 +142,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "write" && event.toolName !== "edit") {
       return undefined;
+    }
+
+    if (activeTracker) {
+      filesWritten++;
+      activeTracker.recordFilesModified(filesWritten);
     }
 
     const filePath = (event.input as { path?: string }).path ?? "";
@@ -244,6 +261,23 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         pi.appendEntry<ProposalState>("headsdown-proposal", {
           proposals: approvedProposals,
         });
+
+        // Start calibration tracking
+        try {
+          const config = await loadConfig();
+          if (config.calibration !== false) {
+            if (activeTracker) {
+              activeTracker.dispose();
+            }
+            activeTracker = new CalibrationTracker(client, verdict.proposalId, {
+              enabled: true,
+            });
+            activeTracker.start();
+            filesWritten = 0;
+          }
+        } catch {
+          // Don't fail the proposal if calibration setup fails
+        }
       }
 
       const guidance =
@@ -270,6 +304,86 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         ],
         details: { verdict },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "headsdown_report",
+    label: "HeadsDown Report Outcome",
+    description:
+      "Report the outcome of a task that was approved via headsdown_propose. " +
+      "Call this when you've finished or failed a task. Helps HeadsDown " +
+      "calibrate future verdicts for better accuracy.",
+    promptSnippet: "Report task outcome to HeadsDown after completing work",
+    parameters: Type.Object({
+      outcome: Type.Union(
+        [
+          Type.Literal("completed"),
+          Type.Literal("failed"),
+          Type.Literal("partially_completed"),
+          Type.Literal("cancelled"),
+          Type.Literal("timed_out"),
+        ],
+        { description: "What happened with the task." },
+      ),
+      error_category: Type.Optional(
+        Type.String({
+          description: "If failed: category like 'compilation_error', 'test_failure'.",
+        }),
+      ),
+      tests_passed: Type.Optional(Type.Boolean({ description: "Whether the changes pass tests." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      if (!activeTracker || !activeTracker.isActive) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No active calibration session. Submit a proposal via headsdown_propose first.",
+            },
+          ],
+          details: {},
+        };
+      }
+
+      try {
+        const extras: Record<string, unknown> = {};
+        if (params.error_category) extras.errorCategory = params.error_category;
+        if (params.tests_passed !== undefined) extras.testsPassed = params.tests_passed;
+
+        await activeTracker.complete(params.outcome, extras);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  reported: true,
+                  outcome: params.outcome,
+                  message: "Outcome recorded. This helps HeadsDown calibrate future verdicts.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: { outcome: params.outcome },
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to report outcome: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          details: {},
+        };
+      } finally {
+        activeTracker = null;
+        filesWritten = 0;
+      }
     },
   });
 

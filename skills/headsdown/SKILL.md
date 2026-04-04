@@ -9,10 +9,11 @@ This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of
 
 ## Available Tools
 
-This package registers three tools. Use them directly via tool calls:
+This package registers four tools. Use them directly via tool calls:
 
 - **headsdown_status**: Check current availability (mode, schedule, time remaining)
 - **headsdown_propose**: Submit a task proposal for verdict (approved/deferred)
+- **headsdown_report**: Report the outcome of a completed task (completed/failed/etc.)
 - **headsdown_auth**: Authenticate with HeadsDown via Device Flow
 
 ## When to Check
@@ -39,6 +40,7 @@ This package registers three tools. Use them directly via tool calls:
 ### Schedule Context
 
 The status also returns calendar information:
+
 - **Work hours**: User is in their normal work window.
 - **Off hours**: User is outside work hours. Be mindful of scope.
 - **Next workday**: When the user's next work window starts.
@@ -53,6 +55,16 @@ When you submit a proposal via `headsdown_propose`:
 
 - **approved**: The task fits within the user's current availability. Start working.
 - **deferred**: The task should wait. Tell the user what the verdict was and why, then suggest postponing or offer to scope the task down.
+
+## Reporting Outcomes
+
+After completing work on an approved task, report the outcome:
+
+1. Call `headsdown_report` with the outcome: `completed`, `failed`, `partially_completed`, `cancelled`, or `timed_out`.
+2. If the task failed, include an `error_category` (e.g., "test_failure", "compilation_error").
+3. If you ran tests, include `tests_passed: true/false`.
+
+This calibration data helps HeadsDown learn how long tasks actually take and how often they succeed, making future verdicts more accurate.
 
 ## Authentication
 
