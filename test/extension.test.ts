@@ -30,6 +30,23 @@ describe("Extension file", () => {
     expect(content).toContain("isSensitivePath");
     expect(content).toContain("formatSummary");
   });
+
+  it("registers headsdown_presets tool with list/apply actions", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('name: "headsdown_presets"');
+    expect(content).toContain('Type.Literal("list")');
+    expect(content).toContain('Type.Literal("apply")');
+    expect(content).toContain("client.listPresets()");
+    expect(content).toContain("client.applyPreset(selected.id)");
+  });
+
+  it("keeps headsdown_report but degrades gracefully when sdk lacks reportOutcome", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('name: "headsdown_report"');
+    expect(content).toContain(
+      "Outcome reporting is unavailable with the current installed @headsdown/sdk version.",
+    );
+  });
 });
 
 describe("Policy module", () => {
@@ -73,6 +90,7 @@ describe("SKILL.md", () => {
     const content = await readFile(skillPath, "utf-8");
     // Should reference tool names
     expect(content).toContain("headsdown_status");
+    expect(content).toContain("headsdown_presets");
     expect(content).toContain("headsdown_propose");
     expect(content).toContain("headsdown_auth");
     // Should NOT reference the old CLI

@@ -9,9 +9,10 @@ This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of
 
 ## Available Tools
 
-This package registers four tools. Use them directly via tool calls:
+This package registers five tools. Use them directly via tool calls:
 
 - **headsdown_status**: Check current availability (mode, schedule, time remaining)
+- **headsdown_presets**: List saved presets or apply one to change mode quickly
 - **headsdown_propose**: Submit a task proposal for verdict (approved/deferred)
 - **headsdown_report**: Report the outcome of a completed task (completed/failed/etc.)
 - **headsdown_auth**: Authenticate with HeadsDown via Device Flow
@@ -27,6 +28,15 @@ This package registers four tools. Use them directly via tool calls:
    - **deferred**: Tell the user the task was deferred and why. Suggest postponing or reducing scope.
 
 **Skip the check** for trivial tasks like answering a question, reading a file, or running a quick command.
+
+## Presets
+
+If the user explicitly asks to change their mode (for example, "set me to deep focus"), use `headsdown_presets`:
+
+- `action: "list"` to show available presets
+- `action: "apply"` with `id` or `name` to activate one
+
+Never apply a preset unless the user clearly asked to change availability.
 
 ## Interpreting Availability
 

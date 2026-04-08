@@ -151,7 +151,8 @@ export function formatSummary(contract: Contract | null, calendar: Calendar): st
       const minutesLeft = Math.round((expires.getTime() - now.getTime()) / 60000);
       if (minutesLeft > 0) parts.push(`${minutesLeft}min remaining`);
     }
-    if (contract.afk) parts.push("AFK");
+    const afk = (contract as Contract & { afk?: boolean }).afk === true;
+    if (afk) parts.push("AFK");
     if (contract.lock) parts.push("locked");
   }
 

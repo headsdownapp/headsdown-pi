@@ -12,8 +12,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { HeadsDownClient, ConfigStore, AuthError, CalibrationTracker } from "@headsdown/sdk";
-import type { Contract, Calendar, ProposalInput, HeadsDownConfig } from "@headsdown/sdk";
+import { HeadsDownClient, ConfigStore, AuthError } from "@headsdown/sdk";
+import type { Contract, ProposalInput, HeadsDownConfig } from "@headsdown/sdk";
 import { applyTrustPolicy, isSensitivePath, formatSummary } from "./policy.js";
 
 // === State ===
@@ -33,8 +33,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let approvedProposals: ProposalState["proposals"] = [];
   let cachedConfig: HeadsDownConfig | null = null;
   let cachedClient: HeadsDownClient | null = null;
-  let activeTracker: CalibrationTracker | null = null;
-  let filesWritten = 0;
+  let lastApprovedProposalId: string | null = null;
 
   // === Helpers ===
 
@@ -93,13 +92,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   // === Session events ===
 
   pi.on("session_start", async (_event, ctx) => {
-    if (activeTracker) {
-      // Clean up any leftover tracker from previous session
-      activeTracker.complete("cancelled").catch(() => {});
-      activeTracker = null;
-    }
-    filesWritten = 0;
     restoreProposals(ctx);
+    lastApprovedProposalId = null;
     cachedConfig = null;
     cachedClient = null; // Re-validate credentials on new session
   });
@@ -114,10 +108,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   // Inject availability context at the start of each agent turn
   pi.on("before_agent_start", async (_event, _ctx) => {
-    if (activeTracker) {
-      activeTracker.recordTurn();
-    }
-
     try {
       const client = await getClient();
       if (!client) return undefined;
@@ -142,11 +132,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "write" && event.toolName !== "edit") {
       return undefined;
-    }
-
-    if (activeTracker) {
-      filesWritten++;
-      activeTracker.recordFilesModified(filesWritten);
     }
 
     const filePath = (event.input as { path?: string }).path ?? "";
@@ -217,6 +202,100 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "headsdown_presets",
+    label: "HeadsDown Presets",
+    description:
+      "List your saved HeadsDown presets or apply one to set your current mode. " +
+      "Only apply a preset when the user explicitly asks to change availability.",
+    promptSnippet: "List or apply availability presets when user asks to change mode",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union([Type.Literal("list"), Type.Literal("apply")], {
+          description: "Use 'list' to view presets (default), or 'apply' to activate one.",
+        }),
+      ),
+      id: Type.Optional(Type.String({ description: "Preset ID to apply." })),
+      name: Type.Optional(
+        Type.String({
+          description: "Preset name to apply (case-insensitive exact match).",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const client = await getClientOrThrow();
+      const action = params.action ?? "list";
+
+      const presets = await client.listPresets();
+
+      if (action === "list") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  presets: presets.map((preset) => ({
+                    id: preset.id,
+                    name: preset.name,
+                    statusText: preset.statusText,
+                    statusEmoji: preset.statusEmoji,
+                    duration: preset.duration,
+                  })),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: { presets },
+        };
+      }
+
+      let selected = presets.find((preset) => params.id && preset.id === params.id) ?? null;
+
+      if (!selected && params.name) {
+        const byName = presets.filter(
+          (preset) => preset.name.trim().toLowerCase() === params.name!.trim().toLowerCase(),
+        );
+        if (byName.length > 1) {
+          throw new Error(
+            `Multiple presets match name '${params.name}'. Please apply by preset id instead.`,
+          );
+        }
+        selected = byName[0] ?? null;
+      }
+
+      if (!selected) {
+        throw new Error(
+          "Preset not found. Provide a valid 'id' or exact preset 'name'. Run with action='list' to view options.",
+        );
+      }
+
+      const contract = await client.applyPreset(selected.id);
+      const calendar = await client.getCalendar();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                appliedPreset: { id: selected.id, name: selected.name },
+                contract,
+                calendar,
+                summary: formatSummary(contract, calendar),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: { appliedPreset: selected, contract, calendar },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "headsdown_propose",
     label: "HeadsDown Propose",
     description:
@@ -252,6 +331,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const verdict = await client.submitProposal(input);
 
       if (verdict.decision === "approved") {
+        lastApprovedProposalId = verdict.proposalId;
         approvedProposals.push({
           id: verdict.proposalId,
           decision: "approved",
@@ -261,23 +341,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         pi.appendEntry<ProposalState>("headsdown-proposal", {
           proposals: approvedProposals,
         });
-
-        // Start calibration tracking
-        try {
-          const config = await loadConfig();
-          if (config.calibration !== false) {
-            if (activeTracker) {
-              activeTracker.dispose();
-            }
-            activeTracker = new CalibrationTracker(client, verdict.proposalId, {
-              enabled: true,
-            });
-            activeTracker.start();
-            filesWritten = 0;
-          }
-        } catch {
-          // Don't fail the proposal if calibration setup fails
-        }
       }
 
       const guidance =
@@ -334,24 +397,43 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       tests_passed: Type.Optional(Type.Boolean({ description: "Whether the changes pass tests." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      if (!activeTracker || !activeTracker.isActive) {
+      if (!lastApprovedProposalId) {
         return {
           content: [
             {
               type: "text",
-              text: "No active calibration session. Submit a proposal via headsdown_propose first.",
+              text: "No approved proposal found in this session. Submit a proposal via headsdown_propose first.",
             },
           ],
           details: {},
         };
       }
 
-      try {
-        const extras: Record<string, unknown> = {};
-        if (params.error_category) extras.errorCategory = params.error_category;
-        if (params.tests_passed !== undefined) extras.testsPassed = params.tests_passed;
+      const client = await getClientOrThrow();
+      const reportOutcome = (
+        client as unknown as {
+          reportOutcome?: (input: Record<string, unknown>) => Promise<unknown>;
+        }
+      ).reportOutcome;
+      if (typeof reportOutcome !== "function") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Outcome reporting is unavailable with the current installed @headsdown/sdk version.",
+            },
+          ],
+          details: { proposalId: lastApprovedProposalId, outcome: params.outcome },
+        };
+      }
 
-        await activeTracker.complete(params.outcome, extras);
+      try {
+        await reportOutcome({
+          proposalId: lastApprovedProposalId,
+          outcome: params.outcome,
+          errorCategory: params.error_category,
+          testsPassed: params.tests_passed,
+        });
 
         return {
           content: [
@@ -360,6 +442,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               text: JSON.stringify(
                 {
                   reported: true,
+                  proposalId: lastApprovedProposalId,
                   outcome: params.outcome,
                   message: "Outcome recorded. This helps HeadsDown calibrate future verdicts.",
                 },
@@ -368,7 +451,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               ),
             },
           ],
-          details: { outcome: params.outcome },
+          details: { proposalId: lastApprovedProposalId, outcome: params.outcome },
         };
       } catch (error) {
         return {
@@ -378,11 +461,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               text: `Failed to report outcome: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
-          details: {},
+          details: { proposalId: lastApprovedProposalId, outcome: params.outcome },
         };
-      } finally {
-        activeTracker = null;
-        filesWritten = 0;
       }
     },
   });

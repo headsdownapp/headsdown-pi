@@ -48,7 +48,9 @@ A full Pi extension that:
 
 **Registers native tools:**
 - `headsdown_status` - Check current availability
+- `headsdown_presets` - List or apply saved availability presets
 - `headsdown_propose` - Submit task proposal for verdict
+- `headsdown_report` - Report task outcome for calibration
 - `headsdown_auth` - Device Flow authentication
 
 **Registers `/headsdown` command** for quick status checks.
