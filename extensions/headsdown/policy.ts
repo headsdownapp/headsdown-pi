@@ -15,17 +15,15 @@ type AvailabilityContext = Calendar | ScheduleContext | null | undefined;
 function isCalendarContext(context: AvailabilityContext): context is Calendar {
   return Boolean(
     context &&
-      typeof context === "object" &&
-      "offHours" in context &&
-      "workHours" in context &&
-      "day" in context,
+    typeof context === "object" &&
+    "offHours" in context &&
+    "workHours" in context &&
+    "day" in context,
   );
 }
 
 function isScheduleContext(context: AvailabilityContext): context is ScheduleContext {
-  return Boolean(
-    context && typeof context === "object" && "inReachableHours" in context,
-  );
+  return Boolean(context && typeof context === "object" && "inReachableHours" in context);
 }
 
 // === Trust Policy ===
