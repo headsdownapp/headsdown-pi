@@ -40,6 +40,13 @@ describe("Extension file", () => {
     expect(content).toContain("client.applyPreset(selected.id)");
   });
 
+  it("uses availability compatibility fallback when calendar field is unavailable", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("AVAILABILITY_COMPAT_QUERY");
+    expect(content).toContain('Cannot query field "calendar"');
+    expect(content).toContain("getAvailabilityContext(client)");
+  });
+
   it("keeps headsdown_report but degrades gracefully when sdk lacks reportOutcome", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_report"');

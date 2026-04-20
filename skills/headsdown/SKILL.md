@@ -1,6 +1,6 @@
 ---
 name: headsdown
-description: HeadsDown availability awareness. Checks the user's focus mode, schedule, and availability before starting tasks. Submits task proposals for verdict (approved/deferred). Use before any significant work to respect the user's focus time.
+description: HeadsDown availability awareness. Checks the user's focus mode and availability schedule before starting tasks. Submits task proposals for verdict (approved/deferred). Use before any significant work to respect the user's focus time.
 ---
 
 # HeadsDown Availability Skill
@@ -21,7 +21,7 @@ This package registers five tools. Use them directly via tool calls:
 
 **Before starting any non-trivial task**, check the user's availability:
 
-1. Call `headsdown_status` to see their current mode and schedule.
+1. Call `headsdown_status` to see their current mode and availability schedule.
 2. If they have an active contract (especially busy, limited, or offline), call `headsdown_propose` with a clear description of what you plan to do.
 3. Follow the verdict:
    - **approved**: Proceed normally.
@@ -49,11 +49,11 @@ Never apply a preset unless the user clearly asked to change availability.
 
 ### Schedule Context
 
-The status also returns calendar information:
+The status returns schedule information from availability:
 
-- **Work hours**: User is in their normal work window.
-- **Off hours**: User is outside work hours. Be mindful of scope.
-- **Next workday**: When the user's next work window starts.
+- **Within reachable hours**: User is in their normal reachable window.
+- **Outside reachable hours**: User is currently outside their reachable window.
+- **Next transition**: When their schedule is expected to change next.
 
 ### Locked Status
 

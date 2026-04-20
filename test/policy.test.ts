@@ -424,4 +424,13 @@ describe("formatSummary", () => {
     expect(summary).toContain("off-hours");
     expect(summary).toContain("thursday");
   });
+
+  it("handles schedule-based availability context", () => {
+    const summary = formatSummary(null, {
+      inReachableHours: false,
+      nextTransitionAt: "2025-06-15T17:00:00Z",
+    });
+    expect(summary).toContain("outside reachable hours");
+    expect(summary).toContain("next transition");
+  });
 });
