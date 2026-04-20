@@ -29,6 +29,110 @@ interface ProposalState {
 
 const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
 
+interface ScheduleContext {
+  inReachableHours?: boolean | null;
+  nextTransitionAt?: string | null;
+  activeWindow?: unknown;
+  nextWindow?: unknown;
+}
+
+interface AvailabilityContext {
+  contract: Contract | null;
+  calendar: unknown | null;
+  schedule: ScheduleContext | null;
+}
+
+const AVAILABILITY_COMPAT_QUERY = `
+  query AvailabilityCompat {
+    activeContract {
+      id
+      mode
+      status
+      statusEmoji
+      statusText
+      autoRespond
+      lock
+      duration
+      expiresAt
+      insertedAt
+    }
+    availability {
+      inReachableHours
+      nextTransitionAt
+      activeWindow {
+        id
+        label
+        mode
+        statusEmoji
+        statusText
+      }
+      nextWindow {
+        id
+        label
+        mode
+        statusEmoji
+        statusText
+      }
+    }
+  }
+`;
+
+function getLowLevelGraphQLClient(client: HeadsDownClient): {
+  request: (query: string, variables?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+} | null {
+  const maybeGraphQL = (client as unknown as { graphql?: unknown }).graphql;
+  if (!maybeGraphQL || typeof maybeGraphQL !== "object") return null;
+
+  const request = (maybeGraphQL as { request?: unknown }).request;
+  if (typeof request !== "function") return null;
+
+  return {
+    request: request.bind(maybeGraphQL) as (
+      query: string,
+      variables?: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>,
+  };
+}
+
+async function getAvailabilityContext(client: HeadsDownClient): Promise<AvailabilityContext> {
+  try {
+    const result = await client.getAvailability();
+    const typedResult = result as {
+      contract: Contract | null;
+      calendar?: unknown;
+      schedule?: ScheduleContext;
+    };
+
+    return {
+      contract: typedResult.contract,
+      calendar: typedResult.calendar ?? null,
+      schedule: typedResult.schedule ?? null,
+    };
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('Cannot query field "calendar"')) {
+      throw error;
+    }
+
+    const graphql = getLowLevelGraphQLClient(client);
+    if (!graphql) {
+      throw error;
+    }
+
+    const data = await graphql.request(AVAILABILITY_COMPAT_QUERY);
+    return {
+      contract: (data.activeContract as Contract | null | undefined) ?? null,
+      calendar: null,
+      schedule: (data.availability as ScheduleContext | null | undefined) ?? null,
+    };
+  }
+}
+
+export const __internal = {
+  AVAILABILITY_COMPAT_QUERY,
+  getLowLevelGraphQLClient,
+  getAvailabilityContext,
+};
+
 export default function headsdownExtension(pi: ExtensionAPI) {
   let approvedProposals: ProposalState["proposals"] = [];
   let cachedConfig: HeadsDownConfig | null = null;
@@ -112,8 +216,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const client = await getClient();
       if (!client) return undefined;
 
-      const { contract, calendar } = await client.getAvailability();
-      const summary = formatSummary(contract, calendar);
+      const availability = await getAvailabilityContext(client);
+      const summary = formatSummary(
+        availability.contract,
+        availability.calendar ?? availability.schedule,
+      );
 
       return {
         message: {
@@ -148,7 +255,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     try {
       const client = await getClient();
       if (!client) return undefined;
-      const result = await client.getAvailability();
+      const result = await getAvailabilityContext(client);
       contract = result.contract;
     } catch {
       return undefined;
@@ -183,20 +290,33 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
-      const { contract, calendar } = await client.getAvailability();
+      const availability = await getAvailabilityContext(client);
+      const summary = formatSummary(
+        availability.contract,
+        availability.calendar ?? availability.schedule,
+      );
 
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
-              { contract, calendar, summary: formatSummary(contract, calendar) },
+              {
+                contract: availability.contract,
+                calendar: availability.calendar,
+                schedule: availability.schedule,
+                summary,
+              },
               null,
               2,
             ),
           },
         ],
-        details: { contract, calendar },
+        details: {
+          contract: availability.contract,
+          calendar: availability.calendar,
+          schedule: availability.schedule,
+        },
       };
     },
   });
@@ -272,7 +392,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       const contract = await client.applyPreset(selected.id);
-      const calendar = await client.getCalendar();
+      const availability = await getAvailabilityContext(client);
+      const summary = formatSummary(contract, availability.calendar ?? availability.schedule);
 
       return {
         content: [
@@ -282,15 +403,21 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               {
                 appliedPreset: { id: selected.id, name: selected.name },
                 contract,
-                calendar,
-                summary: formatSummary(contract, calendar),
+                calendar: availability.calendar,
+                schedule: availability.schedule,
+                summary,
               },
               null,
               2,
             ),
           },
         ],
-        details: { appliedPreset: selected, contract, calendar },
+        details: {
+          appliedPreset: selected,
+          contract,
+          calendar: availability.calendar,
+          schedule: availability.schedule,
+        },
       };
     },
   });
@@ -533,8 +660,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
           return;
         }
-        const { contract, calendar } = await client.getAvailability();
-        const summary = formatSummary(contract, calendar);
+        const availability = await getAvailabilityContext(client);
+        const summary = formatSummary(
+          availability.contract,
+          availability.calendar ?? availability.schedule,
+        );
         ctx.ui.notify(`[HeadsDown] ${summary}`, "info");
       } catch (error) {
         ctx.ui.notify(

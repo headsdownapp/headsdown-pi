@@ -5,6 +5,29 @@
 
 import type { TrustLevel, Contract, Calendar } from "@headsdown/sdk";
 
+type ScheduleContext = {
+  inReachableHours?: boolean | null;
+  nextTransitionAt?: string | null;
+};
+
+type AvailabilityContext = Calendar | ScheduleContext | null | undefined;
+
+function isCalendarContext(context: AvailabilityContext): context is Calendar {
+  return Boolean(
+    context &&
+      typeof context === "object" &&
+      "offHours" in context &&
+      "workHours" in context &&
+      "day" in context,
+  );
+}
+
+function isScheduleContext(context: AvailabilityContext): context is ScheduleContext {
+  return Boolean(
+    context && typeof context === "object" && "inReachableHours" in context,
+  );
+}
+
 // === Trust Policy ===
 
 export interface PolicyDecision {
@@ -134,7 +157,7 @@ export function matchGlob(pattern: string, filePath: string): boolean {
 /**
  * Format a human-readable summary of the user's availability.
  */
-export function formatSummary(contract: Contract | null, calendar: Calendar): string {
+export function formatSummary(contract: Contract | null, context: AvailabilityContext): string {
   const parts: string[] = [];
 
   if (!contract) {
@@ -156,10 +179,21 @@ export function formatSummary(contract: Contract | null, calendar: Calendar): st
     if (contract.lock) parts.push("locked");
   }
 
-  if (calendar.offHours) {
-    parts.push(`off-hours, next workday: ${calendar.nextWorkday}`);
-  } else if (calendar.workHours) {
-    parts.push(`work hours (${calendar.day})`);
+  if (isCalendarContext(context)) {
+    if (context.offHours) {
+      parts.push(`off-hours, next workday: ${context.nextWorkday}`);
+    } else if (context.workHours) {
+      parts.push(`work hours (${context.day})`);
+    }
+  } else if (isScheduleContext(context)) {
+    if (context.inReachableHours === true) {
+      parts.push("within reachable hours");
+    } else if (context.inReachableHours === false) {
+      const nextTransition = context.nextTransitionAt
+        ? `, next transition: ${context.nextTransitionAt}`
+        : "";
+      parts.push(`outside reachable hours${nextTransition}`);
+    }
   }
 
   return parts.join(", ");
