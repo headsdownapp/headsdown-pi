@@ -12,6 +12,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import * as HeadsDownSDK from "@headsdown/sdk";
 import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
 import type {
   ActorContext,
@@ -24,6 +25,7 @@ import type {
   HeadsDownConfig,
   ProposalInput,
   ScheduleResolution,
+  Verdict,
 } from "@headsdown/sdk";
 import {
   applyTrustPolicy,
@@ -253,6 +255,29 @@ function withActorContext(client: HeadsDownClient, ctx: ExtensionContext): Heads
   return client.withActor(buildActorContext(ctx));
 }
 
+function resolveExecutionInstruction(input: {
+  contract?: Contract | null;
+  schedule?: ScheduleResolution | null;
+  verdict?: Pick<Verdict, "decision" | "reason" | "wrapUpGuidance"> | null;
+}): string | null {
+  const describeExecutionDirective = (
+    HeadsDownSDK as unknown as {
+      describeExecutionDirective?: (value: {
+        contract?: Contract | null;
+        schedule?: ScheduleResolution | null;
+        verdict?: Pick<Verdict, "decision" | "reason" | "wrapUpGuidance"> | null;
+      }) => { primaryDirective?: string };
+    }
+  ).describeExecutionDirective;
+
+  if (typeof describeExecutionDirective === "function") {
+    const directive = describeExecutionDirective(input);
+    return directive.primaryDirective ?? null;
+  }
+
+  return formatWrapUpInstruction(input.verdict?.wrapUpGuidance ?? input.schedule?.wrapUpGuidance);
+}
+
 function isSessionTokenOnlyGrantError(message: string): boolean {
   return (
     message.includes("session-token auth path") ||
@@ -463,7 +488,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         availability.contract,
         availability.calendar ?? availability.schedule,
       );
-      const wrapUpInstruction = formatWrapUpInstruction(availability.schedule?.wrapUpGuidance);
+      const wrapUpInstruction = resolveExecutionInstruction({
+        contract: availability.contract,
+        schedule: availability.schedule,
+      });
       const content = wrapUpInstruction
         ? `[HeadsDown] ${summary}\n[HeadsDown] Wrap-Up instruction: ${wrapUpInstruction}`
         : `[HeadsDown] ${summary}`;
@@ -543,7 +571,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         availability.contract,
         availability.calendar ?? availability.schedule,
       );
-      const wrapUpInstruction = formatWrapUpInstruction(availability.schedule?.wrapUpGuidance);
+      const wrapUpInstruction = resolveExecutionInstruction({
+        contract: availability.contract,
+        schedule: availability.schedule,
+      });
 
       return {
         content: [
@@ -732,7 +763,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         verdict.decision === "approved"
           ? "The task was approved. Proceed with the work as described."
           : "The task was deferred. Inform the user and suggest postponing or reducing scope.";
-      const wrapUpInstruction = formatWrapUpInstruction(verdict.wrapUpGuidance);
+      const wrapUpInstruction = resolveExecutionInstruction({
+        verdict: {
+          decision: verdict.decision,
+          reason: verdict.reason,
+          wrapUpGuidance: verdict.wrapUpGuidance,
+        },
+      });
 
       return {
         content: [
