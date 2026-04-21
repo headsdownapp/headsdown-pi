@@ -197,6 +197,20 @@ export function formatSummary(contract: Contract | null, context: AvailabilityCo
         : "";
       parts.push(`outside reachable hours${nextTransition}`);
     }
+
+    const wrapUpGuidance =
+      context && typeof context === "object" && "wrapUpGuidance" in context
+        ? (context as { wrapUpGuidance?: { active?: boolean; remainingMinutes?: number | null } })
+            .wrapUpGuidance
+        : undefined;
+
+    if (wrapUpGuidance?.active) {
+      const remaining =
+        typeof wrapUpGuidance.remainingMinutes === "number"
+          ? `${wrapUpGuidance.remainingMinutes}min left`
+          : "active";
+      parts.push(`Wrap-Up: ${remaining}`);
+    }
   }
 
   return parts.join(", ");

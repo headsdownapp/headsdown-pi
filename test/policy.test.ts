@@ -441,4 +441,14 @@ describe("formatSummary", () => {
     expect(summary).toContain("outside reachable hours");
     expect(summary).toContain("next transition");
   });
+
+  it("includes Wrap-Up guidance when active in schedule context", () => {
+    const summary = formatSummary(null, {
+      inReachableHours: true,
+      wrapUpGuidance: { active: true, remainingMinutes: 18 },
+    } as never);
+
+    expect(summary).toContain("Wrap-Up");
+    expect(summary).toContain("18min left");
+  });
 });
