@@ -12,8 +12,19 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { HeadsDownClient, ConfigStore, AuthError } from "@headsdown/sdk";
-import type { Contract, ProposalInput, HeadsDownConfig } from "@headsdown/sdk";
+import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
+import type {
+  ActorContext,
+  Contract,
+  DelegationGrant,
+  DelegationGrantFilterInput,
+  DelegationGrantInput,
+  DelegationGrantPermission,
+  DelegationGrantScope,
+  HeadsDownConfig,
+  ProposalInput,
+  ScheduleResolution,
+} from "@headsdown/sdk";
 import { applyTrustPolicy, isSensitivePath, formatSummary } from "./policy.js";
 
 // === State ===
@@ -29,17 +40,24 @@ interface ProposalState {
 
 const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
 
-interface ScheduleContext {
-  inReachableHours?: boolean | null;
-  nextTransitionAt?: string | null;
-  activeWindow?: unknown;
-  nextWindow?: unknown;
-}
-
 interface AvailabilityContext {
   contract: Contract | null;
   calendar: unknown | null;
-  schedule: ScheduleContext | null;
+  schedule: ScheduleResolution | null;
+}
+
+interface AvailabilityOverride {
+  id: string;
+  mode: string;
+  reason: string | null;
+  source: string;
+  expiresAt: string;
+  cancelledAt: string | null;
+  expiredAt: string | null;
+  createdById: string;
+  cancelledById: string | null;
+  insertedAt: string;
+  updatedAt: string;
 }
 
 const AVAILABILITY_COMPAT_QUERY = `
@@ -59,20 +77,102 @@ const AVAILABILITY_COMPAT_QUERY = `
     availability {
       inReachableHours
       nextTransitionAt
+      attentionDeadlineAt
+      wrapUpGuidance {
+        active
+        deadlineAt
+        remainingMinutes
+        profile
+        source
+        reason
+        hints
+        thresholdMinutes
+        selectedMode
+      }
       activeWindow {
         id
         label
+        priority
+        startTime
+        endTime
+        days
         mode
+        alertsPolicy
+        snooze
+        status
         statusEmoji
         statusText
+        autoActivate
       }
       nextWindow {
         id
         label
+        priority
+        startTime
+        endTime
+        days
         mode
+        alertsPolicy
+        snooze
+        status
         statusEmoji
         statusText
+        autoActivate
       }
+    }
+  }
+`;
+
+const ACTIVE_AVAILABILITY_OVERRIDE_QUERY = `
+  query ActiveAvailabilityOverride {
+    activeAvailabilityOverride {
+      id
+      mode
+      reason
+      source
+      expiresAt
+      cancelledAt
+      expiredAt
+      createdById
+      cancelledById
+      insertedAt
+      updatedAt
+    }
+  }
+`;
+
+const CREATE_AVAILABILITY_OVERRIDE_MUTATION = `
+  mutation CreateAvailabilityOverride($input: AvailabilityOverrideInput!) {
+    createAvailabilityOverride(input: $input) {
+      id
+      mode
+      reason
+      source
+      expiresAt
+      cancelledAt
+      expiredAt
+      createdById
+      cancelledById
+      insertedAt
+      updatedAt
+    }
+  }
+`;
+
+const CANCEL_AVAILABILITY_OVERRIDE_MUTATION = `
+  mutation CancelAvailabilityOverride($id: ID!, $reason: String, $source: String) {
+    cancelAvailabilityOverride(id: $id, reason: $reason, source: $source) {
+      id
+      mode
+      reason
+      source
+      expiresAt
+      cancelledAt
+      expiredAt
+      createdById
+      cancelledById
+      insertedAt
+      updatedAt
     }
   }
 `;
@@ -100,7 +200,7 @@ async function getAvailabilityContext(client: HeadsDownClient): Promise<Availabi
     const typedResult = result as {
       contract: Contract | null;
       calendar?: unknown;
-      schedule?: ScheduleContext;
+      schedule?: ScheduleResolution;
     };
 
     return {
@@ -122,15 +222,143 @@ async function getAvailabilityContext(client: HeadsDownClient): Promise<Availabi
     return {
       contract: (data.activeContract as Contract | null | undefined) ?? null,
       calendar: null,
-      schedule: (data.availability as ScheduleContext | null | undefined) ?? null,
+      schedule: (data.availability as ScheduleResolution | null | undefined) ?? null,
     };
   }
 }
 
+function getSessionId(ctx: ExtensionContext): string | undefined {
+  const sessionManager = ctx.sessionManager as { getSessionId?: () => string };
+  return typeof sessionManager.getSessionId === "function"
+    ? sessionManager.getSessionId()
+    : undefined;
+}
+
+function buildActorContext(ctx: ExtensionContext): ActorContext {
+  const sessionId = getSessionId(ctx);
+  return {
+    source: "pi",
+    agentId: "pi-agent",
+    sessionId,
+    workspaceRef: ctx.cwd,
+  };
+}
+
+function withActorContext(client: HeadsDownClient, ctx: ExtensionContext): HeadsDownClient {
+  return client.withActor(buildActorContext(ctx));
+}
+
+type AvailabilityOverrideInput = {
+  mode: "online" | "busy" | "limited" | "offline";
+  durationMinutes?: number;
+  expiresAt?: string;
+  reason?: string;
+  source?: string;
+};
+
+async function createAvailabilityOverrideCompat(
+  client: HeadsDownClient,
+  input: AvailabilityOverrideInput,
+): Promise<AvailabilityOverride> {
+  const nativeMethod = (
+    client as unknown as {
+      createAvailabilityOverride?: (
+        value: AvailabilityOverrideInput,
+      ) => Promise<AvailabilityOverride>;
+    }
+  ).createAvailabilityOverride;
+
+  if (typeof nativeMethod === "function") {
+    return nativeMethod(input);
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
+  }
+
+  const data = await graphql.request(CREATE_AVAILABILITY_OVERRIDE_MUTATION, {
+    input,
+  });
+
+  const override =
+    (data.createAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
+  if (!override) {
+    throw new Error("HeadsDown API returned no availability override data.");
+  }
+
+  return override;
+}
+
+async function getActiveAvailabilityOverrideCompat(
+  client: HeadsDownClient,
+): Promise<AvailabilityOverride | null> {
+  const nativeMethod = (
+    client as unknown as {
+      getActiveAvailabilityOverride?: () => Promise<AvailabilityOverride | null>;
+    }
+  ).getActiveAvailabilityOverride;
+
+  if (typeof nativeMethod === "function") {
+    return nativeMethod();
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
+  }
+
+  const data = await graphql.request(ACTIVE_AVAILABILITY_OVERRIDE_QUERY);
+  return (data.activeAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
+}
+
+async function cancelAvailabilityOverrideCompat(
+  client: HeadsDownClient,
+  id: string,
+  reason?: string,
+): Promise<AvailabilityOverride> {
+  const nativeMethod = (
+    client as unknown as {
+      cancelAvailabilityOverride?: (id: string, reason?: string) => Promise<AvailabilityOverride>;
+    }
+  ).cancelAvailabilityOverride;
+
+  if (typeof nativeMethod === "function") {
+    return nativeMethod(id, reason);
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
+  }
+
+  const data = await graphql.request(CANCEL_AVAILABILITY_OVERRIDE_MUTATION, {
+    id,
+    reason,
+    source: "pi",
+  });
+
+  const override =
+    (data.cancelAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
+  if (!override) {
+    throw new Error("HeadsDown API returned no cancelled availability override data.");
+  }
+
+  return override;
+}
+
 export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
+  ACTIVE_AVAILABILITY_OVERRIDE_QUERY,
+  CREATE_AVAILABILITY_OVERRIDE_MUTATION,
+  CANCEL_AVAILABILITY_OVERRIDE_MUTATION,
   getLowLevelGraphQLClient,
   getAvailabilityContext,
+  buildActorContext,
+  withActorContext,
+  createAvailabilityOverrideCompat,
+  getActiveAvailabilityOverrideCompat,
+  cancelAvailabilityOverrideCompat,
 };
 
 export default function headsdownExtension(pi: ExtensionAPI) {
@@ -216,7 +444,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const client = await getClient();
       if (!client) return undefined;
 
-      const availability = await getAvailabilityContext(client);
+      const actorClient = withActorContext(client, _ctx);
+      const availability = await getAvailabilityContext(actorClient);
       const summary = formatSummary(
         availability.contract,
         availability.calendar ?? availability.schedule,
@@ -255,7 +484,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     try {
       const client = await getClient();
       if (!client) return undefined;
-      const result = await getAvailabilityContext(client);
+      const actorClient = withActorContext(client, ctx);
+      const result = await getAvailabilityContext(actorClient);
       contract = result.contract;
     } catch {
       return undefined;
@@ -290,7 +520,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
-      const availability = await getAvailabilityContext(client);
+      const actorClient = withActorContext(client, _ctx);
+      const availability = await getAvailabilityContext(actorClient);
       const summary = formatSummary(
         availability.contract,
         availability.calendar ?? availability.schedule,
@@ -343,9 +574,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
       const action = params.action ?? "list";
 
-      const presets = await client.listPresets();
+      const presets = await actorClient.listPresets();
 
       if (action === "list") {
         return {
@@ -391,8 +623,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         );
       }
 
-      const contract = await client.applyPreset(selected.id);
-      const availability = await getAvailabilityContext(client);
+      const contract = await actorClient.applyPreset(selected.id);
+      const availability = await getAvailabilityContext(actorClient);
       const summary = formatSummary(contract, availability.calendar ?? availability.schedule);
 
       return {
@@ -444,6 +676,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
 
       const input: ProposalInput = {
         agentRef: "pi-agent",
@@ -455,7 +688,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         sourceRef: params.source_ref,
       };
 
-      const verdict = await client.submitProposal(input);
+      const verdict = await actorClient.submitProposal(input);
 
       if (verdict.decision === "approved") {
         lastApprovedProposalId = verdict.proposalId;
@@ -493,6 +726,225 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           },
         ],
         details: { verdict },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "headsdown_grants",
+    label: "HeadsDown Delegation Grants",
+    description:
+      "Manage delegation grants for actor-scoped authorization. " +
+      "Supports listing, creating, and revoking grants.",
+    promptSnippet: "Manage HeadsDown delegation grants for the current workspace/session context",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("list"),
+            Type.Literal("list_active"),
+            Type.Literal("create"),
+            Type.Literal("revoke"),
+            Type.Literal("revoke_many"),
+          ],
+          {
+            description:
+              "Action to run: list/list_active/create/revoke/revoke_many (default: list_active).",
+          },
+        ),
+      ),
+      id: Type.Optional(Type.String({ description: "Delegation grant id (for revoke)." })),
+      scope: Type.Optional(
+        Type.Union([Type.Literal("session"), Type.Literal("workspace"), Type.Literal("agent")], {
+          description: "Grant scope for create/filter operations.",
+        }),
+      ),
+      session_id: Type.Optional(Type.String({ description: "Session id for session scope." })),
+      workspace_ref: Type.Optional(
+        Type.String({ description: "Workspace reference for workspace scope." }),
+      ),
+      agent_id: Type.Optional(Type.String({ description: "Agent id for agent scope." })),
+      permissions: Type.Optional(
+        Type.Array(
+          Type.Union([
+            Type.Literal("availability_override_create"),
+            Type.Literal("availability_override_cancel"),
+            Type.Literal("preset_apply"),
+          ]),
+        ),
+      ),
+      duration_minutes: Type.Optional(
+        Type.Number({ description: "Duration in minutes when creating a grant." }),
+      ),
+      expires_at: Type.Optional(Type.String({ description: "Absolute ISO expiry for create." })),
+      source: Type.Optional(Type.String({ description: "Audit source label." })),
+      active: Type.Optional(
+        Type.Boolean({ description: "Filter active grants for list/revoke_many." }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
+      const action = params.action ?? "list_active";
+
+      if (action === "list_active") {
+        const grants = await actorClient.listActiveDelegationGrants();
+        return {
+          content: [{ type: "text", text: JSON.stringify({ grants }, null, 2) }],
+          details: { grants },
+        };
+      }
+
+      if (action === "list") {
+        const filter: DelegationGrantFilterInput = {
+          active: params.active,
+          scope: params.scope as DelegationGrantScope | undefined,
+          sessionId: params.session_id,
+          workspaceRef: params.workspace_ref,
+          agentId: params.agent_id,
+          source: params.source,
+        };
+        const hasFilter = Object.values(filter).some((value) => value !== undefined);
+        const grants = await actorClient.listDelegationGrants(hasFilter ? filter : undefined);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ grants }, null, 2) }],
+          details: { grants },
+        };
+      }
+
+      if (action === "create") {
+        if (!params.scope) {
+          throw new Error("scope is required when action='create'.");
+        }
+        if (!params.permissions || params.permissions.length === 0) {
+          throw new Error("permissions is required when action='create'.");
+        }
+
+        const input: DelegationGrantInput = {
+          scope: params.scope as DelegationGrantScope,
+          sessionId: params.session_id,
+          workspaceRef: params.workspace_ref,
+          agentId: params.agent_id,
+          permissions: params.permissions as DelegationGrantPermission[],
+          durationMinutes: params.duration_minutes,
+          expiresAt: params.expires_at,
+          source: params.source ?? "pi",
+        };
+
+        const grant = await actorClient.createDelegationGrant(input);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ grant }, null, 2) }],
+          details: { grant },
+        };
+      }
+
+      if (action === "revoke") {
+        if (!params.id) {
+          throw new Error("id is required when action='revoke'.");
+        }
+
+        const grant = await actorClient.revokeDelegationGrant(params.id);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ grant }, null, 2) }],
+          details: { grant },
+        };
+      }
+
+      const filter: DelegationGrantFilterInput = {
+        active: params.active,
+        scope: params.scope as DelegationGrantScope | undefined,
+        sessionId: params.session_id,
+        workspaceRef: params.workspace_ref,
+        agentId: params.agent_id,
+        source: params.source,
+      };
+      const hasFilter = Object.values(filter).some((value) => value !== undefined);
+      const result = await actorClient.revokeDelegationGrants(hasFilter ? filter : undefined);
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ result }, null, 2) }],
+        details: { result },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "headsdown_override",
+    label: "HeadsDown Availability Override",
+    description:
+      "Manage temporary availability overrides. " +
+      "Supports setting, viewing, and cancelling active overrides.",
+    promptSnippet: "Manage temporary HeadsDown availability overrides",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union([Type.Literal("get"), Type.Literal("set"), Type.Literal("clear")], {
+          description: "Action to run: get/set/clear (default: get).",
+        }),
+      ),
+      id: Type.Optional(Type.String({ description: "Override id for clear (optional)." })),
+      mode: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("online"),
+            Type.Literal("busy"),
+            Type.Literal("limited"),
+            Type.Literal("offline"),
+          ],
+          { description: "Override mode for action='set'." },
+        ),
+      ),
+      duration_minutes: Type.Optional(
+        Type.Number({ description: "Duration in minutes for action='set'." }),
+      ),
+      expires_at: Type.Optional(
+        Type.String({ description: "Absolute ISO expiry for action='set'." }),
+      ),
+      reason: Type.Optional(Type.String({ description: "Optional reason for set/clear." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
+      const action = params.action ?? "get";
+
+      if (action === "get") {
+        const override = await getActiveAvailabilityOverrideCompat(actorClient);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
+          details: { override },
+        };
+      }
+
+      if (action === "set") {
+        if (!params.mode) {
+          throw new Error("mode is required when action='set'.");
+        }
+
+        const override = await createAvailabilityOverrideCompat(actorClient, {
+          mode: params.mode,
+          durationMinutes: params.duration_minutes,
+          expiresAt: params.expires_at,
+          reason: params.reason,
+          source: "pi",
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
+          details: { override },
+        };
+      }
+
+      const targetId = params.id ?? (await getActiveAvailabilityOverrideCompat(actorClient))?.id;
+      if (!targetId) {
+        return {
+          content: [{ type: "text", text: "No active availability override found to cancel." }],
+          details: { override: null },
+        };
+      }
+
+      const override = await cancelAvailabilityOverrideCompat(actorClient, targetId, params.reason);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
+        details: { override },
       };
     },
   });
@@ -537,8 +989,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
       const reportOutcome = (
-        client as unknown as {
+        actorClient as unknown as {
           reportOutcome?: (input: Record<string, unknown>) => Promise<unknown>;
         }
       ).reportOutcome;
@@ -660,7 +1113,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
           return;
         }
-        const availability = await getAvailabilityContext(client);
+        const actorClient = withActorContext(client, ctx);
+        const availability = await getAvailabilityContext(actorClient);
         const summary = formatSummary(
           availability.contract,
           availability.calendar ?? availability.schedule,

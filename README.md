@@ -50,6 +50,8 @@ A full Pi extension that:
 - `headsdown_status` - Check current availability
 - `headsdown_presets` - List or apply saved availability presets
 - `headsdown_propose` - Submit task proposal for verdict
+- `headsdown_grants` - List/create/revoke delegation grants
+- `headsdown_override` - Get/set/clear temporary availability overrides
 - `headsdown_report` - Report task outcome for calibration
 - `headsdown_auth` - Device Flow authentication
 
@@ -85,7 +87,7 @@ Files like `.env`, `.ssh/*`, `package.json`, `Dockerfile`, and CI configs always
 
 This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). It sends requests only to the HeadsDown API.
 
-**What is sent:** Task descriptions and scope estimates (when proposals are submitted), your API key for authentication.
+**What is sent:** Task descriptions and scope estimates (when proposals are submitted), your API key for authentication, and actor context metadata (`source`, `agentId`, `sessionId`, `workspaceRef`) for delegated authorization paths.
 
 **What is received:** Your availability status, work schedule, and task verdicts.
 

@@ -9,11 +9,13 @@ This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of
 
 ## Available Tools
 
-This package registers five tools. Use them directly via tool calls:
+This package registers seven tools. Use them directly via tool calls:
 
 - **headsdown_status**: Check current availability (mode, schedule, time remaining)
 - **headsdown_presets**: List saved presets or apply one to change mode quickly
 - **headsdown_propose**: Submit a task proposal for verdict (approved/deferred)
+- **headsdown_grants**: List/create/revoke delegation grants for actor-scoped access
+- **headsdown_override**: Get/set/clear temporary availability overrides
 - **headsdown_report**: Report the outcome of a completed task (completed/failed/etc.)
 - **headsdown_auth**: Authenticate with HeadsDown via Device Flow
 
@@ -37,6 +39,8 @@ If the user explicitly asks to change their mode (for example, "set me to deep f
 - `action: "apply"` with `id` or `name` to activate one
 
 Never apply a preset unless the user clearly asked to change availability.
+
+If the user asks about delegated control for session/workspace operations, use `headsdown_grants`. If the user asks for a one-off temporary mode change (without changing presets), use `headsdown_override`.
 
 ## Interpreting Availability
 

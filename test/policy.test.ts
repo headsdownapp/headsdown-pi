@@ -5,7 +5,21 @@ import {
   matchGlob,
   formatSummary,
 } from "../extensions/headsdown/policy.js";
-import type { Contract, Calendar } from "@headsdown/sdk";
+import type { Contract } from "@headsdown/sdk";
+
+type CalendarContext = {
+  automateEndOfDay: boolean;
+  automateStartOfDay: boolean;
+  day: string;
+  endsAt: string;
+  nextWorkday: string;
+  nextWorkdayStartsAt: string;
+  now: string;
+  offHours: boolean;
+  startsAt: string;
+  workHours: boolean;
+  working: boolean;
+};
 
 // === applyTrustPolicy ===
 
@@ -292,7 +306,7 @@ describe("matchGlob", () => {
 // === formatSummary ===
 
 describe("formatSummary", () => {
-  const baseCalendar: Calendar = {
+  const baseCalendar: CalendarContext = {
     automateEndOfDay: true,
     automateStartOfDay: true,
     day: "wednesday",
@@ -319,14 +333,13 @@ describe("formatSummary", () => {
       status: true,
       statusEmoji: null,
       statusText: null,
-      afk: false,
       autoRespond: false,
       lock: false,
       duration: null,
+      ruleSetType: null,
+      ruleSetParams: null,
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       insertedAt: "2025-06-15T14:00:00Z",
-      recordMessages: false,
-      snooze: false,
     };
 
     const summary = formatSummary(contract, baseCalendar);
@@ -340,14 +353,13 @@ describe("formatSummary", () => {
       status: true,
       statusEmoji: "🔨",
       statusText: "Deep work",
-      afk: false,
       autoRespond: false,
       lock: false,
       duration: null,
+      ruleSetType: null,
+      ruleSetParams: null,
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       insertedAt: "2025-06-15T14:00:00Z",
-      recordMessages: false,
-      snooze: false,
     };
 
     const summary = formatSummary(contract, baseCalendar);
@@ -361,14 +373,13 @@ describe("formatSummary", () => {
       status: true,
       statusEmoji: null,
       statusText: null,
-      afk: false,
       autoRespond: false,
       lock: false,
       duration: null,
+      ruleSetType: null,
+      ruleSetParams: null,
       expiresAt: new Date(Date.now() + 90 * 60 * 1000).toISOString(),
       insertedAt: "2025-06-15T14:00:00Z",
-      recordMessages: false,
-      snooze: false,
     };
 
     const summary = formatSummary(contract, baseCalendar);
@@ -382,44 +393,41 @@ describe("formatSummary", () => {
       status: true,
       statusEmoji: null,
       statusText: null,
-      afk: false,
       autoRespond: false,
       lock: false,
       duration: null,
+      ruleSetType: null,
+      ruleSetParams: null,
       expiresAt: new Date(Date.now() - 60 * 1000).toISOString(),
       insertedAt: "2025-06-15T14:00:00Z",
-      recordMessages: false,
-      snooze: false,
     };
 
     const summary = formatSummary(contract, baseCalendar);
     expect(summary).not.toContain("remaining");
   });
 
-  it("includes AFK and locked flags", () => {
+  it("includes locked flag", () => {
     const contract: Contract = {
       id: "1",
       mode: "offline",
       status: true,
       statusEmoji: null,
       statusText: null,
-      afk: true,
       autoRespond: false,
       lock: true,
       duration: null,
+      ruleSetType: null,
+      ruleSetParams: null,
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       insertedAt: "2025-06-15T14:00:00Z",
-      recordMessages: false,
-      snooze: false,
     };
 
     const summary = formatSummary(contract, baseCalendar);
-    expect(summary).toContain("AFK");
     expect(summary).toContain("locked");
   });
 
   it("shows off-hours info", () => {
-    const offHoursCal: Calendar = { ...baseCalendar, offHours: true, workHours: false };
+    const offHoursCal: CalendarContext = { ...baseCalendar, offHours: true, workHours: false };
     const summary = formatSummary(null, offHoursCal);
     expect(summary).toContain("off-hours");
     expect(summary).toContain("thursday");
