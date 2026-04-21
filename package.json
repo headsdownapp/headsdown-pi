@@ -45,7 +45,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@headsdown/sdk": "^0.2.11"
+    "@headsdown/sdk": "^0.2.12"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
