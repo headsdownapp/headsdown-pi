@@ -3,7 +3,7 @@
  * Extracted from the extension for testability.
  */
 
-import type { TrustLevel, Contract, ScheduleResolution } from "@headsdown/sdk";
+import type { TrustLevel, Contract, ScheduleResolution, WrapUpGuidance } from "@headsdown/sdk";
 
 type ScheduleContext = {
   inReachableHours?: boolean | null;
@@ -162,6 +162,45 @@ export function matchGlob(pattern: string, filePath: string): boolean {
 /**
  * Format a human-readable summary of the user's availability.
  */
+export function formatWrapUpInstruction(
+  guidance: WrapUpGuidance | null | undefined,
+): string | null {
+  if (!guidance || !guidance.active) {
+    return null;
+  }
+
+  let instruction = "";
+
+  if (guidance.selectedMode === "wrap_up") {
+    instruction =
+      "Execution policy for this task: keep scope minimal, avoid starting new refactors, finish the current slice cleanly, and include clear handoff notes for anything deferred.";
+  } else if (guidance.selectedMode === "full_depth") {
+    instruction =
+      "Execution policy for this task: proceed with full implementation depth, include robust validation and tests, and do not shrink scope only because a deadline is near.";
+  } else {
+    instruction =
+      "Execution policy for this task: follow the provided context to balance scope and depth, stay focused on the requested outcome, and avoid unnecessary expansion.";
+  }
+
+  const context: string[] = [];
+
+  if (typeof guidance.remainingMinutes === "number") {
+    context.push(
+      `About ${guidance.remainingMinutes} minutes remain before the attention deadline.`,
+    );
+  }
+
+  if (guidance.reason) {
+    context.push(`Reason: ${guidance.reason}`);
+  }
+
+  if (guidance.hints.length > 0) {
+    context.push(`Hints: ${guidance.hints.join("; ")}`);
+  }
+
+  return [instruction, ...context].join(" ");
+}
+
 export function formatSummary(contract: Contract | null, context: AvailabilityContext): string {
   const parts: string[] = [];
 

@@ -25,7 +25,12 @@ import type {
   ProposalInput,
   ScheduleResolution,
 } from "@headsdown/sdk";
-import { applyTrustPolicy, isSensitivePath, formatSummary } from "./policy.js";
+import {
+  applyTrustPolicy,
+  isSensitivePath,
+  formatSummary,
+  formatWrapUpInstruction,
+} from "./policy.js";
 
 // === State ===
 
@@ -458,11 +463,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         availability.contract,
         availability.calendar ?? availability.schedule,
       );
+      const wrapUpInstruction = formatWrapUpInstruction(availability.schedule?.wrapUpGuidance);
+      const content = wrapUpInstruction
+        ? `[HeadsDown] ${summary}\n[HeadsDown] Wrap-Up instruction: ${wrapUpInstruction}`
+        : `[HeadsDown] ${summary}`;
 
       return {
         message: {
           customType: "headsdown-context",
-          content: `[HeadsDown] ${summary}`,
+          content,
           display: false,
         },
       };
@@ -534,6 +543,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         availability.contract,
         availability.calendar ?? availability.schedule,
       );
+      const wrapUpInstruction = formatWrapUpInstruction(availability.schedule?.wrapUpGuidance);
 
       return {
         content: [
@@ -545,6 +555,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
                 calendar: availability.calendar,
                 schedule: availability.schedule,
                 summary,
+                wrapUpInstruction,
               },
               null,
               2,
@@ -721,6 +732,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         verdict.decision === "approved"
           ? "The task was approved. Proceed with the work as described."
           : "The task was deferred. Inform the user and suggest postponing or reducing scope.";
+      const wrapUpInstruction = formatWrapUpInstruction(verdict.wrapUpGuidance);
 
       return {
         content: [
@@ -734,6 +746,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
                 proposalId: verdict.proposalId,
                 evaluatedAt: verdict.evaluatedAt,
                 wrapUpGuidance: verdict.wrapUpGuidance,
+                wrapUpInstruction,
               },
               null,
               2,

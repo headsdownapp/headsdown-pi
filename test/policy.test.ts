@@ -4,6 +4,7 @@ import {
   isSensitivePath,
   matchGlob,
   formatSummary,
+  formatWrapUpInstruction,
 } from "../extensions/headsdown/policy.js";
 import type { Contract } from "@headsdown/sdk";
 
@@ -304,6 +305,60 @@ describe("matchGlob", () => {
 });
 
 // === formatSummary ===
+
+describe("formatWrapUpInstruction", () => {
+  it("returns null when guidance is inactive", () => {
+    const instruction = formatWrapUpInstruction({
+      active: false,
+      deadlineAt: null,
+      remainingMinutes: null,
+      profile: "normal",
+      source: "inactive",
+      reason: "",
+      hints: [],
+      thresholdMinutes: 30,
+      selectedMode: "auto",
+    });
+
+    expect(instruction).toBeNull();
+  });
+
+  it("returns cold-start wrap_up instruction with context", () => {
+    const instruction = formatWrapUpInstruction({
+      active: true,
+      deadlineAt: "2026-04-22T01:00:00Z",
+      remainingMinutes: 14,
+      profile: "wrap_up",
+      source: "threshold",
+      reason: "Approaching end of focus window",
+      hints: ["Summarize progress", "Leave handoff notes"],
+      thresholdMinutes: 30,
+      selectedMode: "wrap_up",
+    });
+
+    expect(instruction).toContain("Execution policy for this task");
+    expect(instruction).toContain("keep scope minimal");
+    expect(instruction).toContain("About 14 minutes remain");
+    expect(instruction).toContain("Reason: Approaching end of focus window");
+  });
+
+  it("returns cold-start full_depth instruction", () => {
+    const instruction = formatWrapUpInstruction({
+      active: true,
+      deadlineAt: "2026-04-22T01:00:00Z",
+      remainingMinutes: 40,
+      profile: "normal",
+      source: "forced_full_depth",
+      reason: "",
+      hints: [],
+      thresholdMinutes: 30,
+      selectedMode: "full_depth",
+    });
+
+    expect(instruction).toContain("Execution policy for this task");
+    expect(instruction).toContain("full implementation depth");
+  });
+});
 
 describe("formatSummary", () => {
   const baseCalendar: CalendarContext = {
