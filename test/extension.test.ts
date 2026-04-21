@@ -36,23 +36,32 @@ describe("Extension file", () => {
     expect(content).toContain('name: "headsdown_presets"');
     expect(content).toContain('Type.Literal("list")');
     expect(content).toContain('Type.Literal("apply")');
-    expect(content).toContain("client.listPresets()");
-    expect(content).toContain("client.applyPreset(selected.id)");
+    expect(content).toContain("actorClient.listPresets()");
+    expect(content).toContain("actorClient.applyPreset(selected.id)");
   });
 
   it("uses availability compatibility fallback when calendar field is unavailable", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain("AVAILABILITY_COMPAT_QUERY");
     expect(content).toContain('Cannot query field "calendar"');
-    expect(content).toContain("getAvailabilityContext(client)");
+    expect(content).toContain("getAvailabilityContext(actorClient)");
   });
 
-  it("keeps headsdown_report but degrades gracefully when sdk lacks reportOutcome", async () => {
+  it("registers delegation grants and override tools", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('name: "headsdown_grants"');
+    expect(content).toContain("listActiveDelegationGrants");
+    expect(content).toContain("createDelegationGrant");
+    expect(content).toContain("revokeDelegationGrant");
+    expect(content).toContain('name: "headsdown_override"');
+    expect(content).toContain("createAvailabilityOverrideCompat");
+    expect(content).toContain("cancelAvailabilityOverrideCompat");
+  });
+
+  it("keeps headsdown_report and supports modern sdk reportOutcome", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_report"');
-    expect(content).toContain(
-      "Outcome reporting is unavailable with the current installed @headsdown/sdk version.",
-    );
+    expect(content).toContain("reportOutcome");
   });
 });
 

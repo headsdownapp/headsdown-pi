@@ -3,16 +3,23 @@
  * Extracted from the extension for testability.
  */
 
-import type { TrustLevel, Contract, Calendar } from "@headsdown/sdk";
+import type { TrustLevel, Contract, ScheduleResolution } from "@headsdown/sdk";
 
 type ScheduleContext = {
   inReachableHours?: boolean | null;
   nextTransitionAt?: string | null;
 };
 
-type AvailabilityContext = Calendar | ScheduleContext | null | undefined;
+type CalendarLike = {
+  offHours?: boolean;
+  workHours?: boolean;
+  day?: string;
+  nextWorkday?: string;
+};
 
-function isCalendarContext(context: AvailabilityContext): context is Calendar {
+type AvailabilityContext = CalendarLike | ScheduleResolution | ScheduleContext | null | undefined;
+
+function isCalendarContext(context: AvailabilityContext): context is CalendarLike {
   return Boolean(
     context &&
     typeof context === "object" &&
@@ -172,8 +179,6 @@ export function formatSummary(contract: Contract | null, context: AvailabilityCo
       const minutesLeft = Math.round((expires.getTime() - now.getTime()) / 60000);
       if (minutesLeft > 0) parts.push(`${minutesLeft}min remaining`);
     }
-    const afk = (contract as Contract & { afk?: boolean }).afk === true;
-    if (afk) parts.push("AFK");
     if (contract.lock) parts.push("locked");
   }
 

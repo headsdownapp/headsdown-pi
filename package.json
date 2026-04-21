@@ -3,8 +3,19 @@
   "version": "0.1.0",
   "description": "HeadsDown availability skill and extension for Pi agent. Gives Pi awareness of your focus mode, schedule, and availability before starting tasks.",
   "type": "module",
-  "keywords": ["pi-package", "headsdown", "availability", "focus", "ai-agent"],
-  "files": ["extensions", "skills", "README.md", "LICENSE"],
+  "keywords": [
+    "pi-package",
+    "headsdown",
+    "availability",
+    "focus",
+    "ai-agent"
+  ],
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "echo 'No build needed. Extensions are loaded directly by Pi via jiti.'",
     "test": "vitest run",
@@ -14,8 +25,12 @@
     "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "license": "MIT",
   "repository": {
@@ -30,16 +45,16 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@headsdown/sdk": "^0.1.0"
+    "@headsdown/sdk": "^0.2.11"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*",
     "@types/node": "^20.17.0",
     "prettier": "^3.4.0",
