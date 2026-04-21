@@ -58,6 +58,19 @@ describe("Extension file", () => {
     expect(content).toContain("cancelAvailabilityOverrideCompat");
   });
 
+  it("supports delivery_mode and returns Wrap-Up guidance in propose responses", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("delivery_mode");
+    expect(content).toContain("deliveryMode: params.delivery_mode");
+    expect(content).toContain("wrapUpGuidance: verdict.wrapUpGuidance");
+  });
+
+  it("shows explicit session-token guidance for delegation grant management", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("session-token auth path");
+    expect(content).toContain("unavailable for API-key clients");
+  });
+
   it("keeps headsdown_report and supports modern sdk reportOutcome", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_report"');
