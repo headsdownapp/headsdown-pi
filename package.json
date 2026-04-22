@@ -1,6 +1,6 @@
 {
   "name": "headsdown-pi",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "HeadsDown availability skill and extension for Pi agent. Gives Pi awareness of your focus mode, schedule, and availability before starting tasks.",
   "type": "module",
   "keywords": [
