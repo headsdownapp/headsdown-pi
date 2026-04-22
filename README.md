@@ -1,12 +1,14 @@
 # headsdown-pi
 
-[HeadsDown](https://headsdown.app) availability package for [Pi agent](https://github.com/badlogic/pi-coding-agent). Gives Pi awareness of your focus mode, schedule, and availability before it starts tasks.
+[HeadsDown](https://headsdown.app) availability package for [Pi agent](https://github.com/badlogic/pi-coding-agent). It gives Pi deep availability awareness across the full task lifecycle: planning, execution, scope drift, compaction, branching, and session handoff.
 
 When installed, Pi will:
-1. **Know your availability from the start** via context injection at session start
-2. **Check before starting work** via native tools and a skill that teaches Pi to submit proposals
-3. **Gate file modifications** by intercepting write/edit calls and enforcing trust levels
-4. **Respect your focus time** by blocking or warning based on your mode
+1. **Know your availability continuously** via cached status + turn-level execution policy injection
+2. **Check before significant work** with native status/proposal tools and skill guidance
+3. **Gate mutating actions** on `write`, `edit`, and mutating `bash` commands using trust levels
+4. **Track realized scope drift** from successful file mutations against approved proposal estimates
+5. **Preserve continuity** across compaction, tree navigation, and session shutdown/switch
+6. **Support resumable work** with continuation artifacts and digest triage for missed updates
 
 ## Install
 
@@ -14,7 +16,7 @@ When installed, Pi will:
 pi install git:github.com/headsdownapp/headsdown-pi
 ```
 
-Or add to your Pi settings (`~/.pi/agent/settings.json`):
+Or add to `~/.pi/agent/settings.json`:
 
 ```json
 {
@@ -28,44 +30,71 @@ After installing, authenticate with HeadsDown:
 
 > "Run headsdown_auth to connect my HeadsDown account"
 
-Pi will guide you through the Device Flow: visit a URL, enter a code, and the API key is saved at `~/.config/headsdown/credentials.json`.
+Pi guides Device Flow auth. Credentials are stored at `~/.config/headsdown/credentials.json`.
 
-## What's in the Package
+## Extension Features
 
-### Extension (`extensions/headsdown/index.ts`)
+### Policy Injection and Session UI
 
-A full Pi extension that:
+The extension injects concise HeadsDown policy context into the active turn system prompt and updates UI status/widget lines with mode, schedule summary, wrap-up guidance, and active proposal scope.
 
-**Injects availability context** at the start of each agent turn via `before_agent_start`. Pi always knows your mode before you say anything.
+### Mutating Tool Gating
 
-**Intercepts file writes** via `tool_call` on write/edit. Checks your mode and enforces trust levels:
+The extension intercepts mutating tool calls via `tool_call`:
+
+- `write`
+- `edit`
+- mutating `bash` commands (for example `touch`, `rm`, redirection writes, mutating git/package commands)
+
+Trust policy matrix:
 
 | | online | busy | busy+locked | limited | offline |
 |---|---|---|---|---|---|
-| **advisory** (default) | silent | warn | warn | warn | warn |
-| **active** | silent | silent | block | silent | block (no proposal) |
-| **guarded** | silent | block (no proposal) | block | block (no proposal) | block (no proposal) |
+| **advisory** (default) | allow | warn | warn | warn | warn |
+| **active** | allow | allow | block | allow | block (no proposal) |
+| **guarded** | allow | block (no proposal) | block | block (no proposal) | block (no proposal) |
 
-**Registers native tools:**
-- `headsdown_status` - Check current availability
-- `headsdown_presets` - List or apply saved availability presets
-- `headsdown_propose` - Submit task proposal for verdict
-- `headsdown_grants` - List/create/revoke delegation grants
-- `headsdown_override` - Get/set/clear temporary availability overrides
-- `headsdown_report` - Report task outcome for calibration
-- `headsdown_auth` - Device Flow authentication
+Sensitive paths (`.env*`, `.ssh/*`, `package.json`, `Dockerfile*`, `.github/**`, etc.) always trigger warnings.
 
-**Registers `/headsdown` command** for quick status checks.
+### Scope Drift Tracking
 
-**Persists proposal state** in Pi's session via `pi.appendEntry()`. Approved proposals survive session navigation and branch forking.
+On `tool_result`, successful `write`/`edit` operations are tracked as realized modified files for the active approved proposal. If touched files exceed the approved estimate by more than 50%, Pi emits a scope-drift warning and prompts re-proposal.
 
-### Skill (`skills/headsdown/SKILL.md`)
+### Continuity Hooks
 
-Agent behavioral instructions that teach Pi when and how to check availability. Pi loads this contextually before starting tasks.
+The extension records HeadsDown continuity snapshots on:
 
-### Sensitive Path Protection
+- `session_before_compact`
+- `session_before_tree`
+- `session_before_switch`
+- `session_shutdown`
 
-Files like `.env`, `.ssh/*`, `package.json`, `Dockerfile`, and CI configs always trigger a warning regardless of trust level or proposal status.
+It also auto-saves continuation artifacts for unfinished approved work when switching or ending sessions.
+
+### Registered Tools
+
+- `headsdown_status` - current availability, schedule, wrap-up instruction, active scope
+- `headsdown_presets` - list/apply saved presets
+- `headsdown_propose` - submit task proposal for approved/deferred verdict
+- `headsdown_digest` - review grouped summaries of updates received during focus windows
+- `headsdown_grants` - manage delegation grants
+- `headsdown_override` - manage temporary availability overrides
+- `headsdown_continuation` - save/load/check/clear resumable continuation artifacts
+- `headsdown_report` - report approved task outcome
+- `headsdown_auth` - authenticate via Device Flow
+
+The package also registers `/headsdown` for quick status checks.
+
+## Skill
+
+`skills/headsdown/SKILL.md` teaches Pi how to:
+
+- run status/proposal flow before non-trivial work
+- slice work by available time windows
+- re-propose when scope drifts
+- triage digest updates
+- persist/resume continuation artifacts
+- report outcomes for calibration
 
 ## Configuration
 
@@ -81,17 +110,17 @@ Files like `.env`, `.ssh/*`, `package.json`, `Dockerfile`, and CI configs always
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `trustLevel` | `"advisory"` | `advisory`, `active`, or `guarded` |
-| `sensitivePaths` | (see defaults) | Glob patterns that always require confirmation |
+| `sensitivePaths` | built-in defaults + config | Glob patterns that always warn |
 
 ## Data Transparency
 
-This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). It sends requests only to the HeadsDown API.
+This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). Requests go only to HeadsDown APIs.
 
-**What is sent:** Task descriptions and scope estimates (when proposals are submitted), your API key for authentication, and actor context metadata (`source`, `agentId`, `sessionId`, `workspaceRef`) for delegated authorization paths.
+**Sent:** task descriptions and estimates (for proposals), auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`).
 
-**What is received:** Your availability status, work schedule, and task verdicts.
+**Received:** availability state, schedule context, verdicts, digest summaries.
 
-**What is stored locally:** Your API key at `~/.config/headsdown/credentials.json` (0600 permissions).
+**Stored locally:** API credentials and optional continuation artifact (`~/.config/headsdown/continuation.json`).
 
 No telemetry. No analytics. No third-party requests.
 
@@ -101,11 +130,11 @@ No telemetry. No analytics. No third-party requests.
 git clone https://github.com/headsdownapp/headsdown-pi.git
 cd headsdown-pi
 npm install
-npm test        # 99 tests
+npm test
 npm run typecheck
 ```
 
-No build step needed. Pi loads TypeScript extensions directly via jiti.
+No build step is required. Pi loads TypeScript extensions via jiti.
 
 ## License
 

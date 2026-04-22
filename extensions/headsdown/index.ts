@@ -3,13 +3,17 @@
  *
  * Gives Pi awareness of the user's focus mode, schedule, and availability.
  *
- * - Injects availability context at session start
- * - Registers headsdown_status, headsdown_propose, headsdown_auth tools
- * - Intercepts write/edit tool calls to check availability (trust levels)
- * - Registers /headsdown command
- * - Persists proposal state in the session
+ * - Injects HeadsDown execution policy directly into the turn system prompt
+ * - Registers native HeadsDown tools (status/propose/digest/continuation/auth/etc.)
+ * - Intercepts mutating tool calls (write/edit/mutating bash) based on trust policy
+ * - Tracks realized scope drift from successful tool results
+ * - Persists continuity snapshots across compaction/tree/session transitions
+ * - Registers /headsdown command for quick status checks
  */
 
+import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import * as HeadsDownSDK from "@headsdown/sdk";
@@ -17,7 +21,6 @@ import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
 import type {
   ActorContext,
   Contract,
-  DelegationGrant,
   DelegationGrantFilterInput,
   DelegationGrantInput,
   DelegationGrantPermission,
@@ -29,23 +32,44 @@ import type {
 } from "@headsdown/sdk";
 import {
   applyTrustPolicy,
-  isSensitivePath,
   formatSummary,
   formatWrapUpInstruction,
+  isSensitivePath,
 } from "./policy.js";
 
 // === State ===
 
-interface ProposalState {
-  proposals: Array<{
-    id: string;
-    decision: "approved" | "deferred";
-    description: string;
-    evaluatedAt: string;
-  }>;
+interface ProposalRecord {
+  id: string;
+  decision: "approved" | "deferred";
+  description: string;
+  evaluatedAt: string;
+  estimatedFiles?: number;
+  estimatedMinutes?: number;
+  scopeSummary?: string;
+  sourceRef?: string;
+  reportedAt?: string;
 }
 
-const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
+interface ProposalState {
+  proposals: ProposalRecord[];
+}
+
+interface ProposalScopeSnapshot {
+  proposalId: string;
+  modifiedFiles: string[];
+  warningSent: boolean;
+  updatedAt: string;
+}
+
+interface AvailabilitySnapshot {
+  contract: Contract | null;
+  calendar: unknown | null;
+  schedule: ScheduleResolution | null;
+  summary: string;
+  wrapUpInstruction: string | null;
+  fetchedAt: number;
+}
 
 interface AvailabilityContext {
   contract: Contract | null;
@@ -66,6 +90,57 @@ interface AvailabilityOverride {
   insertedAt: string;
   updatedAt: string;
 }
+
+interface ContinuationArtifact {
+  branch: string | null;
+  approvedProposalId: string | null;
+  approvedProposalDescription: string | null;
+  estimatedFiles: number | null;
+  modifiedFiles: string[];
+  openDecisions: string[];
+  pendingSteps: string[];
+  completedSteps: string[];
+  resumeInstruction: string | null;
+  wrapUpInstruction: string | null;
+  savedAt: string;
+  reason: string;
+}
+
+interface HeadsDownCompactionDetails {
+  v: 1;
+  headsdown: {
+    summary: string | null;
+    wrapUpInstruction: string | null;
+    proposal: {
+      id: string;
+      description: string;
+      estimatedFiles: number | null;
+      estimatedMinutes: number | null;
+      scopeSummary: string | null;
+      sourceRef: string | null;
+    } | null;
+    scope: {
+      modifiedFiles: string[];
+      warningSent: boolean;
+      updatedAt: string;
+    } | null;
+    savedAt: string;
+  };
+}
+
+interface HeadsDownCompactionInput {
+  availabilitySummary: string | null;
+  wrapUpInstruction: string | null;
+  proposal: ProposalRecord | null;
+  scope: ProposalScopeSnapshot | null;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+}
+
+const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
+const AVAILABILITY_CACHE_TTL_MS = 90 * 1000; // 90 seconds
+const SCOPE_WARNING_MULTIPLIER = 1.5;
+const CONTINUATION_PATH = join(homedir(), ".config", "headsdown", "continuation.json");
 
 const AVAILABILITY_COMPAT_QUERY = `
   query AvailabilityCompat {
@@ -385,6 +460,178 @@ async function cancelAvailabilityOverrideCompat(
   return override;
 }
 
+function normalizeToolPath(input: string | undefined): string {
+  if (!input) return "";
+  const path = input.trim();
+  return path.startsWith("@") ? path.slice(1) : path;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function isReadonlyBashCommand(command: string): boolean {
+  const normalized = command.trim();
+  if (normalized.length === 0) return true;
+
+  const readonlyPatterns = [
+    /^(?:env\s+)?(?:ls|pwd|cat|grep|rg|find|head|tail|wc|which|whereis|whoami|date)\b/i,
+    /^(?:env\s+)?git\s+(?:status|diff|show|log|branch|rev-parse|remote|fetch)\b/i,
+    /^(?:env\s+)?(?:npm|pnpm|yarn)\s+(?:test|run\s+test|run\s+lint|run\s+typecheck|list)\b/i,
+    /^(?:env\s+)?(?:vitest|jest|pytest|go\s+test|cargo\s+test|mix\s+test)\b/i,
+  ];
+
+  return readonlyPatterns.some((pattern) => pattern.test(normalized));
+}
+
+function isPotentiallyMutatingBashCommand(command: string): boolean {
+  const normalized = command.trim();
+  if (normalized.length === 0) return false;
+  if (isReadonlyBashCommand(normalized)) return false;
+
+  const mutatingPatterns = [
+    /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|rmdir|truncate|chmod|chown|ln|install)\b/i,
+    /(^|[;&|]\s*)git\s+(add|commit|reset|checkout|switch|restore|clean|apply|am|cherry-pick|merge|rebase)\b/i,
+    /(^|[;&|]\s*)(npm|pnpm|yarn)\s+(install|add|remove|uninstall|update)\b/i,
+    /(^|[;&|]\s*)(pip|pip3|brew|cargo|go\s+mod)\s+(install|add|remove|uninstall|tidy|get)\b/i,
+    /(^|[;&|]\s*)(sed|perl)\s+-i\b/i,
+    /(^|[;&|]\s*)tee\b/i,
+    /(^|[^\\])>>?\s*[^\s]/,
+  ];
+
+  return mutatingPatterns.some((pattern) => pattern.test(normalized));
+}
+
+async function continuationExists(): Promise<boolean> {
+  try {
+    await access(CONTINUATION_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadContinuationArtifact(
+  removeAfterRead: boolean,
+): Promise<ContinuationArtifact | null> {
+  try {
+    const raw = await readFile(CONTINUATION_PATH, "utf-8");
+    const parsed = JSON.parse(raw) as ContinuationArtifact;
+    if (removeAfterRead) {
+      await unlink(CONTINUATION_PATH);
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function clearContinuationArtifact(): Promise<boolean> {
+  try {
+    await unlink(CONTINUATION_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function saveContinuationArtifact(artifact: ContinuationArtifact): Promise<void> {
+  await mkdir(dirname(CONTINUATION_PATH), { recursive: true });
+  await writeFile(CONTINUATION_PATH, JSON.stringify(artifact, null, 2), { mode: 0o600 });
+}
+
+function buildHeadsDownCompaction(input: HeadsDownCompactionInput): {
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  details: HeadsDownCompactionDetails;
+} | null {
+  const hasContext =
+    Boolean(input.availabilitySummary) ||
+    Boolean(input.wrapUpInstruction) ||
+    Boolean(input.proposal) ||
+    Boolean(input.scope && input.scope.modifiedFiles.length > 0);
+
+  if (!hasContext) {
+    return null;
+  }
+
+  const lines: string[] = [
+    "## HeadsDown continuity",
+    "Capture this context to preserve task execution constraints after compaction.",
+  ];
+
+  if (input.availabilitySummary) {
+    lines.push(`- Availability: ${input.availabilitySummary}`);
+  }
+
+  if (input.wrapUpInstruction) {
+    lines.push(`- Execution policy: ${input.wrapUpInstruction}`);
+  }
+
+  if (input.proposal) {
+    lines.push(
+      `- Active approved proposal: ${input.proposal.description} (id: ${input.proposal.id})`,
+    );
+
+    if (typeof input.proposal.estimatedFiles === "number") {
+      const touched = input.scope?.modifiedFiles.length ?? 0;
+      lines.push(`- Scope progress: ${touched}/${input.proposal.estimatedFiles} files touched.`);
+    }
+
+    if (input.proposal.scopeSummary) {
+      lines.push(`- Approved scope summary: ${input.proposal.scopeSummary}`);
+    }
+  }
+
+  if (input.scope && input.scope.modifiedFiles.length > 0) {
+    lines.push(`- Modified files tracked: ${input.scope.modifiedFiles.join(", ")}`);
+  }
+
+  if (input.scope?.warningSent) {
+    lines.push(
+      "- Scope drift warning already triggered. Re-propose if continuing beyond approved scope.",
+    );
+  }
+
+  lines.push("- Next step: resume from the active proposal before starting unrelated work.");
+
+  return {
+    summary: lines.join("\n"),
+    firstKeptEntryId: input.firstKeptEntryId,
+    tokensBefore: input.tokensBefore,
+    details: {
+      v: 1,
+      headsdown: {
+        summary: input.availabilitySummary,
+        wrapUpInstruction: input.wrapUpInstruction,
+        proposal: input.proposal
+          ? {
+              id: input.proposal.id,
+              description: input.proposal.description,
+              estimatedFiles: input.proposal.estimatedFiles ?? null,
+              estimatedMinutes: input.proposal.estimatedMinutes ?? null,
+              scopeSummary: input.proposal.scopeSummary ?? null,
+              sourceRef: input.proposal.sourceRef ?? null,
+            }
+          : null,
+        scope: input.scope
+          ? {
+              modifiedFiles: input.scope.modifiedFiles,
+              warningSent: input.scope.warningSent,
+              updatedAt: input.scope.updatedAt,
+            }
+          : null,
+        savedAt: new Date().toISOString(),
+      },
+    },
+  };
+}
+
 export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
   ACTIVE_AVAILABILITY_OVERRIDE_QUERY,
@@ -397,38 +644,105 @@ export const __internal = {
   createAvailabilityOverrideCompat,
   getActiveAvailabilityOverrideCompat,
   cancelAvailabilityOverrideCompat,
+  normalizeToolPath,
+  isPotentiallyMutatingBashCommand,
+  isReadonlyBashCommand,
+  buildHeadsDownCompaction,
+  CONTINUATION_PATH,
 };
 
 export default function headsdownExtension(pi: ExtensionAPI) {
-  let approvedProposals: ProposalState["proposals"] = [];
+  let approvedProposals: ProposalRecord[] = [];
+  let proposalScopes = new Map<string, ProposalScopeSnapshot>();
   let cachedConfig: HeadsDownConfig | null = null;
   let cachedClient: HeadsDownClient | null = null;
   let lastApprovedProposalId: string | null = null;
+  let availabilitySnapshot: AvailabilitySnapshot | null = null;
 
-  // === Helpers ===
-
-  function restoreProposals(ctx: ExtensionContext) {
-    approvedProposals = [];
+  function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
-
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom" && entry.customType === "headsdown-proposal") {
-        const data = entry.data as ProposalState | undefined;
-        if (data?.proposals) {
-          approvedProposals = data.proposals.filter(
-            (p) => now - new Date(p.evaluatedAt).getTime() < MAX_PROPOSAL_AGE_MS,
-          );
-        }
-      }
-    }
+    const approved = approvedProposals.filter(
+      (proposal) =>
+        proposal.decision === "approved" &&
+        now - new Date(proposal.evaluatedAt).getTime() < MAX_PROPOSAL_AGE_MS,
+    );
+    if (approved.length === 0) return null;
+    return approved.reduce((latest, current) => {
+      return new Date(current.evaluatedAt).getTime() > new Date(latest.evaluatedAt).getTime()
+        ? current
+        : latest;
+    });
   }
 
   function hasApprovedProposal(): boolean {
+    return getLatestApprovedProposal() !== null;
+  }
+
+  function getScopeSnapshot(proposalId: string): ProposalScopeSnapshot {
+    const existing = proposalScopes.get(proposalId);
+    if (existing) return existing;
+
+    const snapshot: ProposalScopeSnapshot = {
+      proposalId,
+      modifiedFiles: [],
+      warningSent: false,
+      updatedAt: new Date().toISOString(),
+    };
+
+    proposalScopes.set(proposalId, snapshot);
+    return snapshot;
+  }
+
+  function restoreProposalState(ctx: ExtensionContext) {
+    approvedProposals = [];
+    proposalScopes = new Map<string, ProposalScopeSnapshot>();
     const now = Date.now();
-    return approvedProposals.some(
-      (p) =>
-        p.decision === "approved" && now - new Date(p.evaluatedAt).getTime() < MAX_PROPOSAL_AGE_MS,
-    );
+
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom") continue;
+
+      if (entry.customType === "headsdown-proposal") {
+        const data = entry.data as ProposalState | undefined;
+        if (data?.proposals) {
+          approvedProposals = data.proposals
+            .filter(
+              (proposal) => now - new Date(proposal.evaluatedAt).getTime() < MAX_PROPOSAL_AGE_MS,
+            )
+            .map((proposal) => ({
+              ...proposal,
+              estimatedFiles:
+                typeof proposal.estimatedFiles === "number" ? proposal.estimatedFiles : undefined,
+              estimatedMinutes:
+                typeof proposal.estimatedMinutes === "number"
+                  ? proposal.estimatedMinutes
+                  : undefined,
+            }));
+        }
+      }
+
+      if (entry.customType === "headsdown-scope") {
+        const data = entry.data as ProposalScopeSnapshot | undefined;
+        if (!data?.proposalId) continue;
+        proposalScopes.set(data.proposalId, {
+          proposalId: data.proposalId,
+          modifiedFiles: normalizeStringArray(data.modifiedFiles),
+          warningSent: data.warningSent === true,
+          updatedAt: data.updatedAt ?? new Date().toISOString(),
+        });
+      }
+    }
+
+    lastApprovedProposalId = getLatestApprovedProposal()?.id ?? null;
+  }
+
+  function persistProposals() {
+    pi.appendEntry<ProposalState>("headsdown-proposal", {
+      proposals: approvedProposals,
+    });
+  }
+
+  function persistScope(snapshot: ProposalScopeSnapshot) {
+    pi.appendEntry<ProposalScopeSnapshot>("headsdown-scope", snapshot);
   }
 
   async function loadConfig(): Promise<HeadsDownConfig> {
@@ -459,30 +773,29 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return client;
   }
 
-  // === Session events ===
+  async function refreshAvailability(
+    ctx: ExtensionContext,
+    options: { force?: boolean } = {},
+  ): Promise<AvailabilitySnapshot | null> {
+    const force = options.force === true;
+    const now = Date.now();
 
-  pi.on("session_start", async (_event, ctx) => {
-    restoreProposals(ctx);
-    lastApprovedProposalId = null;
-    cachedConfig = null;
-    cachedClient = null; // Re-validate credentials on new session
-  });
+    if (
+      !force &&
+      availabilitySnapshot &&
+      now - availabilitySnapshot.fetchedAt < AVAILABILITY_CACHE_TTL_MS
+    ) {
+      return availabilitySnapshot;
+    }
 
-  pi.on("session_tree", async (_event, ctx) => {
-    restoreProposals(ctx);
-  });
+    const client = await getClient();
+    if (!client) {
+      availabilitySnapshot = null;
+      return null;
+    }
 
-  pi.on("session_fork", async (_event, ctx) => {
-    restoreProposals(ctx);
-  });
-
-  // Inject availability context at the start of each agent turn
-  pi.on("before_agent_start", async (_event, _ctx) => {
     try {
-      const client = await getClient();
-      if (!client) return undefined;
-
-      const actorClient = withActorContext(client, _ctx);
+      const actorClient = withActorContext(client, ctx);
       const availability = await getAvailabilityContext(actorClient);
       const summary = formatSummary(
         availability.contract,
@@ -492,65 +805,403 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         contract: availability.contract,
         schedule: availability.schedule,
       });
-      const content = wrapUpInstruction
-        ? `[HeadsDown] ${summary}\n[HeadsDown] Wrap-Up instruction: ${wrapUpInstruction}`
-        : `[HeadsDown] ${summary}`;
 
-      return {
-        message: {
-          customType: "headsdown-context",
-          content,
-          display: false,
-        },
+      availabilitySnapshot = {
+        contract: availability.contract,
+        calendar: availability.calendar,
+        schedule: availability.schedule,
+        summary,
+        wrapUpInstruction,
+        fetchedAt: now,
       };
+
+      return availabilitySnapshot;
     } catch {
+      return availabilitySnapshot;
+    }
+  }
+
+  async function updateStatusUI(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+
+    const snapshot = await refreshAvailability(ctx);
+    const activeProposal = getLatestApprovedProposal();
+    const proposalScope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+
+    if (!snapshot) {
+      ctx.ui.setStatus("headsdown", "HeadsDown unavailable");
+      ctx.ui.setWidget("headsdown", undefined);
+      return;
+    }
+
+    const statusLine = `[HeadsDown] ${snapshot.summary}`;
+    ctx.ui.setStatus("headsdown", statusLine);
+
+    const lines = [statusLine];
+
+    if (snapshot.wrapUpInstruction) {
+      lines.push(`[HeadsDown] Policy: ${snapshot.wrapUpInstruction}`);
+    }
+
+    if (activeProposal) {
+      const estimateText =
+        typeof activeProposal.estimatedFiles === "number"
+          ? `${proposalScope?.modifiedFiles.length ?? 0}/${activeProposal.estimatedFiles} files`
+          : `${proposalScope?.modifiedFiles.length ?? 0} files touched`;
+      lines.push(`[HeadsDown] Active proposal: ${activeProposal.description} (${estimateText})`);
+    }
+
+    if (await continuationExists()) {
+      lines.push(
+        "[HeadsDown] Continuation artifact detected. Use headsdown_continuation action=load.",
+      );
+    }
+
+    ctx.ui.setWidget("headsdown", lines);
+  }
+
+  async function checkPendingDigestCount(ctx: ExtensionContext): Promise<number> {
+    try {
+      const client = await getClient();
+      if (!client) return 0;
+      const actorClient = withActorContext(client, ctx);
+      const summaries = await actorClient.listDigestSummaries({ latest: 20 });
+      return summaries.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function currentBranchName(): Promise<string | null> {
+    try {
+      const result = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+        timeout: 5_000,
+      });
+      if (result.code !== 0) return null;
+      const branch = result.stdout.trim();
+      return branch.length > 0 ? branch : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function createContinuationArtifact(reason: string): Promise<ContinuationArtifact | null> {
+    const activeProposal = getLatestApprovedProposal();
+    if (!activeProposal) return null;
+
+    const scope = getScopeSnapshot(activeProposal.id);
+    const wrapUpInstruction = availabilitySnapshot?.wrapUpInstruction ?? null;
+
+    return {
+      branch: await currentBranchName(),
+      approvedProposalId: activeProposal.id,
+      approvedProposalDescription: activeProposal.description,
+      estimatedFiles: activeProposal.estimatedFiles ?? null,
+      modifiedFiles: [...scope.modifiedFiles],
+      openDecisions: [],
+      pendingSteps: [],
+      completedSteps:
+        scope.modifiedFiles.length > 0 ? ["Implemented part of approved proposal scope"] : [],
+      resumeInstruction:
+        scope.modifiedFiles.length > 0
+          ? "Resume by reviewing modified files and finishing the remaining approved proposal scope."
+          : "Resume by starting the approved proposal scope.",
+      wrapUpInstruction,
+      savedAt: new Date().toISOString(),
+      reason,
+    };
+  }
+
+  async function saveAutomaticContinuation(reason: string) {
+    const artifact = await createContinuationArtifact(reason);
+    if (!artifact) return;
+
+    try {
+      await saveContinuationArtifact(artifact);
+    } catch {
+      // Ignore persistence failures for automatic lifecycle saves.
+    }
+  }
+
+  function appendContinuityEntry(reason: string, details: Record<string, unknown> = {}) {
+    const activeProposal = getLatestApprovedProposal();
+    const scope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+
+    pi.appendEntry("headsdown-continuity", {
+      reason,
+      summary: availabilitySnapshot?.summary ?? null,
+      wrapUpInstruction: availabilitySnapshot?.wrapUpInstruction ?? null,
+      proposal: activeProposal
+        ? {
+            id: activeProposal.id,
+            description: activeProposal.description,
+            estimatedFiles: activeProposal.estimatedFiles ?? null,
+            modifiedFiles: scope?.modifiedFiles ?? [],
+            warningSent: scope?.warningSent ?? false,
+          }
+        : null,
+      savedAt: new Date().toISOString(),
+      ...details,
+    });
+  }
+
+  function policyInstructionForPrompt(): string | null {
+    if (!availabilitySnapshot) return null;
+
+    const policyLines = [`[HeadsDown] ${availabilitySnapshot.summary}`];
+
+    if (availabilitySnapshot.wrapUpInstruction) {
+      policyLines.push(
+        `[HeadsDown] Wrap-Up instruction: ${availabilitySnapshot.wrapUpInstruction}`,
+      );
+    }
+
+    const activeProposal = getLatestApprovedProposal();
+    if (activeProposal) {
+      const scope = getScopeSnapshot(activeProposal.id);
+      const filesTouched = scope.modifiedFiles.length;
+      const estimate =
+        typeof activeProposal.estimatedFiles === "number"
+          ? `${filesTouched}/${activeProposal.estimatedFiles} files touched`
+          : `${filesTouched} files touched`;
+      policyLines.push(
+        `[HeadsDown] Active approved proposal: ${activeProposal.description} (${estimate}).`,
+      );
+    }
+
+    return policyLines.join("\n");
+  }
+
+  function maybeWarnScopeDrift(
+    ctx: ExtensionContext,
+    activeProposal: ProposalRecord,
+    scope: ProposalScopeSnapshot,
+  ) {
+    if (typeof activeProposal.estimatedFiles !== "number" || activeProposal.estimatedFiles <= 0) {
+      return;
+    }
+
+    const threshold = Math.ceil(activeProposal.estimatedFiles * SCOPE_WARNING_MULTIPLIER);
+    if (scope.modifiedFiles.length <= threshold || scope.warningSent) {
+      return;
+    }
+
+    scope.warningSent = true;
+    scope.updatedAt = new Date().toISOString();
+    persistScope(scope);
+
+    const message =
+      `[HeadsDown] Scope drift detected: ${scope.modifiedFiles.length} files touched for an approved estimate ` +
+      `of ${activeProposal.estimatedFiles}. Re-submit headsdown_propose with updated estimates before continuing.`;
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(message, "warning");
+    }
+
+    pi.sendMessage(
+      {
+        customType: "headsdown-scope-warning",
+        content: message,
+        display: false,
+        details: {
+          proposalId: activeProposal.id,
+          estimatedFiles: activeProposal.estimatedFiles,
+          modifiedFiles: scope.modifiedFiles.length,
+        },
+      },
+      { deliverAs: "steer" },
+    );
+  }
+
+  // === Session events ===
+
+  pi.on("session_start", async (event, ctx) => {
+    const sessionStartReason = (event as { reason?: string }).reason;
+    restoreProposalState(ctx);
+    cachedConfig = null;
+    cachedClient = null;
+    availabilitySnapshot = null;
+
+    await refreshAvailability(ctx, { force: true });
+    await updateStatusUI(ctx);
+
+    const digestCount = await checkPendingDigestCount(ctx);
+    if (digestCount > 0 && ctx.hasUI) {
+      const noun = digestCount === 1 ? "digest summary" : "digest summaries";
+      ctx.ui.notify(
+        `[HeadsDown] You have ${digestCount} pending ${noun}. Use headsdown_digest.`,
+        "info",
+      );
+    }
+
+    if (sessionStartReason === "resume" && (await continuationExists()) && ctx.hasUI) {
+      ctx.ui.notify(
+        "[HeadsDown] Continuation artifact found. Load it with headsdown_continuation.",
+        "info",
+      );
+    }
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreProposalState(ctx);
+    await updateStatusUI(ctx);
+  });
+
+  pi.on("session_before_switch", async (event, ctx) => {
+    if (!hasApprovedProposal()) return undefined;
+
+    appendContinuityEntry("before_switch", { switchReason: event.reason });
+    await saveAutomaticContinuation("session-switch");
+
+    if (ctx.hasUI) {
+      ctx.ui.notify("[HeadsDown] Saved continuation snapshot before session switch.", "info");
+    }
+
+    return undefined;
+  });
+
+  pi.on("session_before_tree", async (event, _ctx) => {
+    appendContinuityEntry("before_tree", {
+      targetId: event.preparation.targetId,
+      oldLeafId: event.preparation.oldLeafId,
+      userWantsSummary: event.preparation.userWantsSummary,
+    });
+    return undefined;
+  });
+
+  pi.on("session_before_compact", async (event, _ctx) => {
+    const activeProposal = getLatestApprovedProposal();
+    const scope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+
+    appendContinuityEntry("before_compact", {
+      tokensBefore: event.preparation.tokensBefore,
+      firstKeptEntryId: event.preparation.firstKeptEntryId,
+      messagesToSummarize: event.preparation.messagesToSummarize.length,
+    });
+
+    const compaction = buildHeadsDownCompaction({
+      availabilitySummary: availabilitySnapshot?.summary ?? null,
+      wrapUpInstruction: availabilitySnapshot?.wrapUpInstruction ?? null,
+      proposal: activeProposal,
+      scope,
+      firstKeptEntryId: event.preparation.firstKeptEntryId,
+      tokensBefore: event.preparation.tokensBefore,
+    });
+
+    if (!compaction) {
       return undefined;
     }
+
+    return { compaction };
+  });
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    const shutdownReason = (event as { reason?: string }).reason;
+    appendContinuityEntry("shutdown", { shutdownReason });
+    await saveAutomaticContinuation("session-shutdown");
+
+    const latest = getLatestApprovedProposal();
+    if (!latest || latest.reportedAt) return;
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        "[HeadsDown] Approved proposal has no reported outcome yet. Consider calling headsdown_report.",
+        "warning",
+      );
+    }
+  });
+
+  // Inject availability and policy context into the turn system prompt.
+  pi.on("before_agent_start", async (event, ctx) => {
+    await refreshAvailability(ctx);
+    await updateStatusUI(ctx);
+
+    const policyInstruction = policyInstructionForPrompt();
+    if (!policyInstruction) return undefined;
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${policyInstruction}`,
+    };
   });
 
   // === Tool call interception ===
 
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName !== "write" && event.toolName !== "edit") {
+    let mutating = false;
+    let filePath = "";
+    let command = "";
+
+    if (event.toolName === "write" || event.toolName === "edit") {
+      filePath = normalizeToolPath((event.input as { path?: string }).path);
+      mutating = true;
+    } else if (event.toolName === "bash") {
+      command = (event.input as { command?: string }).command ?? "";
+      mutating = isPotentiallyMutatingBashCommand(command);
+    }
+
+    if (!mutating) {
       return undefined;
     }
 
-    const filePath = (event.input as { path?: string }).path ?? "";
     const config = await loadConfig();
 
-    if (isSensitivePath(filePath, config.sensitivePaths)) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(`[HeadsDown] Sensitive file: ${filePath}. Requires confirmation.`, "warning");
-      }
-      return undefined; // Notify but don't block (user sees the warning)
+    if (filePath && isSensitivePath(filePath, config.sensitivePaths) && ctx.hasUI) {
+      ctx.ui.notify(`[HeadsDown] Sensitive file: ${filePath}. Requires extra care.`, "warning");
     }
 
-    let contract: Contract | null = null;
-    try {
-      const client = await getClient();
-      if (!client) return undefined;
-      const actorClient = withActorContext(client, ctx);
-      const result = await getAvailabilityContext(actorClient);
-      contract = result.contract;
-    } catch {
-      return undefined;
+    const snapshot = await refreshAvailability(ctx, { force: true });
+    if (!snapshot) return undefined;
+
+    const mode = snapshot.contract?.mode ?? "none";
+    const locked = snapshot.contract?.lock === true;
+    const decision = applyTrustPolicy(config.trustLevel, mode, locked, hasApprovedProposal());
+
+    if (decision && event.toolName === "bash") {
+      return {
+        block: true,
+        reason: `${decision.reason} Mutating bash command blocked: ${command}`,
+      };
     }
 
-    const mode = contract?.mode ?? "none";
-    const locked = contract?.lock === true;
-    const trustLevel = config.trustLevel;
-    const decision = applyTrustPolicy(trustLevel, mode, locked, hasApprovedProposal());
-
-    // Show notifications for advisory mode (applyTrustPolicy returns undefined)
-    if (!decision && trustLevel === "advisory" && ctx.hasUI) {
+    if (!decision && config.trustLevel === "advisory" && ctx.hasUI) {
       if (locked) {
-        ctx.ui.notify("[HeadsDown] User status is locked. Confirm before writing.", "warning");
+        ctx.ui.notify(
+          "[HeadsDown] User status is locked. Confirm before mutating files.",
+          "warning",
+        );
       } else if (mode === "offline") {
-        ctx.ui.notify("[HeadsDown] User is offline. Consider deferring.", "warning");
+        ctx.ui.notify("[HeadsDown] User is offline. Consider deferring mutating work.", "warning");
       }
     }
 
     return decision;
+  });
+
+  // Track realized scope from successful tool results.
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.isError) return undefined;
+
+    if (event.toolName !== "write" && event.toolName !== "edit") {
+      return undefined;
+    }
+
+    const activeProposal = getLatestApprovedProposal();
+    if (!activeProposal) return undefined;
+
+    const path = normalizeToolPath((event.input as { path?: string }).path);
+    if (!path) return undefined;
+
+    const scope = getScopeSnapshot(activeProposal.id);
+    if (!scope.modifiedFiles.includes(path)) {
+      scope.modifiedFiles = [...scope.modifiedFiles, path];
+    }
+    scope.updatedAt = new Date().toISOString();
+
+    persistScope(scope);
+    await updateStatusUI(ctx);
+    maybeWarnScopeDrift(ctx, activeProposal, scope);
+
+    return undefined;
   });
 
   // === Custom tools ===
@@ -576,6 +1227,18 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         schedule: availability.schedule,
       });
 
+      availabilitySnapshot = {
+        contract: availability.contract,
+        calendar: availability.calendar,
+        schedule: availability.schedule,
+        summary,
+        wrapUpInstruction,
+        fetchedAt: Date.now(),
+      };
+
+      const activeProposal = getLatestApprovedProposal();
+      const proposalScope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+
       return {
         content: [
           {
@@ -587,6 +1250,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
                 schedule: availability.schedule,
                 summary,
                 wrapUpInstruction,
+                activeProposal,
+                proposalScope,
               },
               null,
               2,
@@ -597,6 +1262,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           contract: availability.contract,
           calendar: availability.calendar,
           schedule: availability.schedule,
+          activeProposal,
+          proposalScope,
         },
       };
     },
@@ -626,7 +1293,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const client = await getClientOrThrow();
       const actorClient = withActorContext(client, _ctx);
       const action = params.action ?? "list";
-
       const presets = await actorClient.listPresets();
 
       if (action === "list") {
@@ -676,6 +1342,20 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const contract = await actorClient.applyPreset(selected.id);
       const availability = await getAvailabilityContext(actorClient);
       const summary = formatSummary(contract, availability.calendar ?? availability.schedule);
+
+      availabilitySnapshot = {
+        contract,
+        calendar: availability.calendar,
+        schedule: availability.schedule,
+        summary,
+        wrapUpInstruction: resolveExecutionInstruction({
+          contract,
+          schedule: availability.schedule,
+        }),
+        fetchedAt: Date.now(),
+      };
+
+      await updateStatusUI(_ctx);
 
       return {
         content: [
@@ -746,18 +1426,34 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       const verdict = await actorClient.submitProposal(input);
 
+      const proposalRecord: ProposalRecord = {
+        id: verdict.proposalId,
+        decision: verdict.decision,
+        description: params.description,
+        evaluatedAt: verdict.evaluatedAt,
+        estimatedFiles: params.estimated_files,
+        estimatedMinutes: params.estimated_minutes,
+        scopeSummary: params.scope_summary,
+        sourceRef: params.source_ref,
+      };
+
+      approvedProposals = [...approvedProposals, proposalRecord];
+      persistProposals();
+
       if (verdict.decision === "approved") {
         lastApprovedProposalId = verdict.proposalId;
-        approvedProposals.push({
-          id: verdict.proposalId,
-          decision: "approved",
-          description: params.description,
-          evaluatedAt: verdict.evaluatedAt,
-        });
-        pi.appendEntry<ProposalState>("headsdown-proposal", {
-          proposals: approvedProposals,
-        });
+
+        const scope: ProposalScopeSnapshot = {
+          proposalId: verdict.proposalId,
+          modifiedFiles: [],
+          warningSent: false,
+          updatedAt: new Date().toISOString(),
+        };
+        proposalScopes.set(verdict.proposalId, scope);
+        persistScope(scope);
       }
+
+      await updateStatusUI(_ctx);
 
       const guidance =
         verdict.decision === "approved"
@@ -796,11 +1492,81 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "headsdown_digest",
+    label: "HeadsDown Digest",
+    description:
+      "View notifications and messages that arrived during focus time. Returns grouped summaries by source and actor.",
+    promptSnippet: "Review digest summaries of what arrived during focus windows",
+    parameters: Type.Object({
+      latest: Type.Optional(
+        Type.Number({ description: "Limit to N most recent summaries (default: 20)." }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const client = await getClientOrThrow();
+      const actorClient = withActorContext(client, _ctx);
+      const latest = typeof params.latest === "number" ? params.latest : 20;
+      const summaries = await actorClient.listDigestSummaries({ latest });
+
+      if (summaries.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  summaries: [],
+                  message: "No digest entries. Nothing arrived during your focus windows.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: { summaries: [] },
+        };
+      }
+
+      const formatted = summaries.map((summary) => ({
+        id: summary.id,
+        source: summary.sourceType,
+        actor: summary.actorLabel,
+        action: summary.action,
+        channel: summary.channelRef,
+        entryCount: summary.entryCount,
+        firstEventAt: summary.firstEventAt,
+        lastEventAt: summary.lastEventAt,
+        events: summary.events.map((event) => ({
+          description: event.description,
+          insertedAt: event.insertedAt,
+        })),
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                summaries: formatted,
+                total: formatted.length,
+                message: `Found ${formatted.length} digest ${formatted.length === 1 ? "summary" : "summaries"}.`,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: { summaries: formatted },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "headsdown_grants",
     label: "HeadsDown Delegation Grants",
     description:
-      "Manage delegation grants for actor-scoped authorization. " +
-      "Supports listing, creating, and revoking grants.",
+      "Manage delegation grants for actor-scoped authorization. Supports listing, creating, and revoking grants.",
     promptSnippet: "Manage HeadsDown delegation grants for the current workspace/session context",
     parameters: Type.Object({
       action: Type.Optional(
@@ -948,8 +1714,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     name: "headsdown_override",
     label: "HeadsDown Availability Override",
     description:
-      "Manage temporary availability overrides. " +
-      "Supports setting, viewing, and cancelling active overrides.",
+      "Manage temporary availability overrides. Supports setting, viewing, and cancelling active overrides.",
     promptSnippet: "Manage temporary HeadsDown availability overrides",
     parameters: Type.Object({
       action: Type.Optional(
@@ -1003,6 +1768,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           source: "pi",
         });
 
+        await refreshAvailability(_ctx, { force: true });
+        await updateStatusUI(_ctx);
+
         return {
           content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
           details: { override },
@@ -1018,9 +1786,142 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       const override = await cancelAvailabilityOverrideCompat(actorClient, targetId, params.reason);
+      await refreshAvailability(_ctx, { force: true });
+      await updateStatusUI(_ctx);
+
       return {
         content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
         details: { override },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "headsdown_continuation",
+    label: "HeadsDown Continuation",
+    description:
+      "Save or load structured continuation artifacts for resumable sessions. Useful when pausing ongoing approved work.",
+    promptSnippet: "Save or load HeadsDown continuation artifacts for resumable work sessions",
+    parameters: Type.Object({
+      action: Type.Union(
+        [Type.Literal("save"), Type.Literal("load"), Type.Literal("check"), Type.Literal("clear")],
+        {
+          description: "Save continuation data, load and consume it, check existence, or clear it.",
+        },
+      ),
+      branch: Type.Optional(Type.String({ description: "Current branch name for save." })),
+      completed_steps: Type.Optional(
+        Type.Array(Type.String(), { description: "Completed steps for save." }),
+      ),
+      pending_steps: Type.Optional(
+        Type.Array(Type.String(), { description: "Pending steps for save." }),
+      ),
+      dirty_files: Type.Optional(
+        Type.Array(Type.String(), { description: "Dirty files for save." }),
+      ),
+      open_decisions: Type.Optional(
+        Type.Array(Type.String(), { description: "Open decisions for save." }),
+      ),
+      resume_instruction: Type.Optional(
+        Type.String({ description: "First instruction for resuming work." }),
+      ),
+      reason: Type.Optional(
+        Type.String({ description: "Optional reason metadata for save/clear." }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      if (params.action === "check") {
+        const exists = await continuationExists();
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ exists, path: CONTINUATION_PATH }, null, 2) },
+          ],
+          details: { exists, path: CONTINUATION_PATH },
+        };
+      }
+
+      if (params.action === "clear") {
+        const cleared = await clearContinuationArtifact();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  cleared,
+                  path: CONTINUATION_PATH,
+                  reason: params.reason ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: { cleared, path: CONTINUATION_PATH },
+        };
+      }
+
+      if (params.action === "load") {
+        const artifact = await loadContinuationArtifact(true);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                artifact
+                  ? { found: true, consumed: true, artifact, path: CONTINUATION_PATH }
+                  : { found: false, consumed: false, path: CONTINUATION_PATH },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: artifact ? { found: true, artifact } : { found: false },
+        };
+      }
+
+      const activeProposal = getLatestApprovedProposal();
+      const activeScope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+
+      const artifact: ContinuationArtifact = {
+        branch: params.branch ?? (await currentBranchName()),
+        approvedProposalId: activeProposal?.id ?? null,
+        approvedProposalDescription: activeProposal?.description ?? null,
+        estimatedFiles: activeProposal?.estimatedFiles ?? null,
+        modifiedFiles: normalizeStringArray(params.dirty_files).length
+          ? normalizeStringArray(params.dirty_files)
+          : (activeScope?.modifiedFiles ?? []),
+        openDecisions: normalizeStringArray(params.open_decisions),
+        pendingSteps: normalizeStringArray(params.pending_steps),
+        completedSteps: normalizeStringArray(params.completed_steps),
+        resumeInstruction:
+          params.resume_instruction ??
+          (activeProposal
+            ? `Resume approved proposal: ${activeProposal.description}`
+            : "Resume by reviewing the previous session context."),
+        wrapUpInstruction: availabilitySnapshot?.wrapUpInstruction ?? null,
+        savedAt: new Date().toISOString(),
+        reason: params.reason ?? "manual-save",
+      };
+
+      await saveContinuationArtifact(artifact);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                saved: true,
+                path: CONTINUATION_PATH,
+                artifact,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        details: { saved: true, path: CONTINUATION_PATH, artifact },
       };
     },
   });
@@ -1030,8 +1931,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     label: "HeadsDown Report Outcome",
     description:
       "Report the outcome of a task that was approved via headsdown_propose. " +
-      "Call this when you've finished or failed a task. Helps HeadsDown " +
-      "calibrate future verdicts for better accuracy.",
+      "Call this when you've finished or failed a task. Helps HeadsDown calibrate future verdicts for better accuracy.",
     promptSnippet: "Report task outcome to HeadsDown after completing work",
     parameters: Type.Object({
       outcome: Type.Union(
@@ -1091,6 +1991,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           testsPassed: params.tests_passed,
         });
 
+        approvedProposals = approvedProposals.map((proposal) =>
+          proposal.id === lastApprovedProposalId
+            ? {
+                ...proposal,
+                reportedAt: new Date().toISOString(),
+              }
+            : proposal,
+        );
+        persistProposals();
+
         return {
           content: [
             {
@@ -1131,7 +2041,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       "tools report authentication errors.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      // Check if already authenticated
       const existing = await getClient();
       if (existing) {
         try {
@@ -1146,7 +2055,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             details: {},
           };
         } catch {
-          cachedClient = null; // Invalid, clear cache
+          cachedClient = null;
         }
       }
 
@@ -1159,7 +2068,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         { label: "Pi Agent Extension" },
       );
 
-      cachedClient = client; // Cache the new client
+      cachedClient = client;
       const profile = await client.getProfile();
 
       return {
@@ -1182,19 +2091,45 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("headsdown", {
     description: "Check your HeadsDown availability status",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
       try {
         const client = await getClient();
         if (!client) {
           ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
           return;
         }
+
+        const normalizedArgs = (args ?? "").trim().toLowerCase();
+
+        if (normalizedArgs === "digest") {
+          const actorClient = withActorContext(client, ctx);
+          const summaries = await actorClient.listDigestSummaries({ latest: 10 });
+          const noun = summaries.length === 1 ? "summary" : "summaries";
+          ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
+          return;
+        }
+
         const actorClient = withActorContext(client, ctx);
         const availability = await getAvailabilityContext(actorClient);
         const summary = formatSummary(
           availability.contract,
           availability.calendar ?? availability.schedule,
         );
+        const wrapUpInstruction = resolveExecutionInstruction({
+          contract: availability.contract,
+          schedule: availability.schedule,
+        });
+
+        availabilitySnapshot = {
+          contract: availability.contract,
+          calendar: availability.calendar,
+          schedule: availability.schedule,
+          summary,
+          wrapUpInstruction,
+          fetchedAt: Date.now(),
+        };
+
+        await updateStatusUI(ctx);
         ctx.ui.notify(`[HeadsDown] ${summary}`, "info");
       } catch (error) {
         ctx.ui.notify(

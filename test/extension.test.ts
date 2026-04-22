@@ -47,7 +47,7 @@ describe("Extension file", () => {
     expect(content).toContain("getAvailabilityContext(actorClient)");
   });
 
-  it("registers delegation grants and override tools", async () => {
+  it("registers delegation, override, digest, and continuation tools", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_grants"');
     expect(content).toContain("listActiveDelegationGrants");
@@ -56,6 +56,10 @@ describe("Extension file", () => {
     expect(content).toContain('name: "headsdown_override"');
     expect(content).toContain("createAvailabilityOverrideCompat");
     expect(content).toContain("cancelAvailabilityOverrideCompat");
+    expect(content).toContain('name: "headsdown_digest"');
+    expect(content).toContain("listDigestSummaries");
+    expect(content).toContain('name: "headsdown_continuation"');
+    expect(content).toContain("CONTINUATION_PATH");
   });
 
   it("supports delivery_mode and returns Wrap-Up guidance in propose responses", async () => {
@@ -75,6 +79,24 @@ describe("Extension file", () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_report"');
     expect(content).toContain("reportOutcome");
+  });
+
+  it("uses lifecycle hooks for continuity and compaction integration", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('pi.on("session_before_compact"');
+    expect(content).toContain('pi.on("session_before_tree"');
+    expect(content).toContain('pi.on("session_before_switch"');
+    expect(content).toContain('pi.on("session_shutdown"');
+    expect(content).toContain("appendContinuityEntry");
+    expect(content).toContain("buildHeadsDownCompaction");
+    expect(content).toContain("return { compaction }");
+  });
+
+  it("injects HeadsDown policy through systemPrompt and tracks scope from tool_result", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("systemPrompt:");
+    expect(content).toContain('pi.on("tool_result"');
+    expect(content).toContain("maybeWarnScopeDrift");
   });
 });
 
@@ -117,12 +139,12 @@ describe("SKILL.md", () => {
 
   it("references native tools, not CLI commands", async () => {
     const content = await readFile(skillPath, "utf-8");
-    // Should reference tool names
     expect(content).toContain("headsdown_status");
     expect(content).toContain("headsdown_presets");
     expect(content).toContain("headsdown_propose");
+    expect(content).toContain("headsdown_digest");
+    expect(content).toContain("headsdown_continuation");
     expect(content).toContain("headsdown_auth");
-    // Should NOT reference the old CLI
     expect(content).not.toContain("dist/cli.js");
     expect(content).not.toContain("SKILL_DIR");
   });
