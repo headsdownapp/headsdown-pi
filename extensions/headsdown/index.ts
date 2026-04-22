@@ -903,6 +903,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   const defaultUITheme: HeadsDownUIThemeName =
     normalizeUITheme(process.env.HEADSDOWN_UI_THEME) ?? "neo";
   let activeUITheme: HeadsDownUIThemeName = defaultUITheme;
+  let detailsWidgetVisible = false;
 
   function getActiveUITheme(): HeadsDownUITheme {
     return HEADSDOWN_UI_THEMES[activeUITheme];
@@ -923,13 +924,23 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return `${hh}:${mm}Z`;
   }
 
+  function formatCompactDuration(totalMinutes: number): string {
+    if (totalMinutes < 60) {
+      return `${totalMinutes}m`;
+    }
+
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`;
+  }
+
   function formatRemainingMinutes(expiresAt: string | null | undefined): string | null {
     if (!expiresAt) return null;
     const expires = new Date(expiresAt);
     if (Number.isNaN(expires.getTime())) return null;
 
     const minutes = Math.round((expires.getTime() - Date.now()) / 60000);
-    return minutes > 0 ? `${minutes}m` : null;
+    return minutes > 0 ? formatCompactDuration(minutes) : null;
   }
 
   function summarizeWrapUpInstruction(instruction: string): string {
@@ -1031,7 +1042,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (schedule?.wrapUpGuidance?.active) {
       const remainingWrapUp =
         typeof schedule.wrapUpGuidance.remainingMinutes === "number"
-          ? `${schedule.wrapUpGuidance.remainingMinutes}m`
+          ? formatCompactDuration(schedule.wrapUpGuidance.remainingMinutes)
           : null;
       badges.push(remainingWrapUp ? `WRAP ${remainingWrapUp}` : "WRAP");
     }
@@ -1105,7 +1116,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     lines.push(
-      `${theme.frame.bottom} /headsdown for full details · /headsdown theme <neo|mono|executive>`,
+      `${theme.frame.bottom} /headsdown for full details · /headsdown details off · /headsdown theme <neo|mono|executive>`,
     );
     return lines;
   }
@@ -1143,7 +1154,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       theme,
     });
 
-    ctx.ui.setWidget("headsdown", detailsWidget.length > 0 ? detailsWidget : undefined);
+    ctx.ui.setWidget(
+      "headsdown",
+      detailsWidgetVisible && detailsWidget.length > 0 ? detailsWidget : undefined,
+    );
   }
 
   async function checkPendingDigestCount(ctx: ExtensionContext): Promise<number> {
@@ -2433,6 +2447,32 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           activeUITheme = parsedTheme;
           await updateStatusUI(ctx);
           ctx.ui.notify(`[HeadsDown] Theme set to ${activeUITheme}.`, "info");
+          return;
+        }
+
+        if (normalizedArgs.startsWith("details")) {
+          const [, detailsArgRaw] = normalizedArgs.split(/\s+/, 2);
+          const detailsArg = detailsArgRaw?.trim();
+
+          if (!detailsArg || detailsArg === "toggle") {
+            detailsWidgetVisible = !detailsWidgetVisible;
+          } else if (detailsArg === "on") {
+            detailsWidgetVisible = true;
+          } else if (detailsArg === "off") {
+            detailsWidgetVisible = false;
+          } else {
+            ctx.ui.notify(
+              "[HeadsDown] Unknown details mode. Use /headsdown details <on|off|toggle>.",
+              "warning",
+            );
+            return;
+          }
+
+          await updateStatusUI(ctx);
+          ctx.ui.notify(
+            `[HeadsDown] Details ${detailsWidgetVisible ? "enabled" : "hidden"}. Use /headsdown details <on|off|toggle>.`,
+            "info",
+          );
           return;
         }
 

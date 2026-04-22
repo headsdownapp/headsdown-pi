@@ -110,6 +110,15 @@ describe("Extension file", () => {
     expect(content).toContain("/headsdown theme <neo|mono|executive>");
     expect(content).toContain('normalizedArgs.startsWith("theme")');
   });
+
+  it("keeps details widget opt-in and supports runtime /headsdown details toggles", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("let detailsWidgetVisible = false");
+    expect(content).toContain('normalizedArgs.startsWith("details")');
+    expect(content).toContain("/headsdown details <on|off|toggle>");
+    expect(content).toContain("detailsWidgetVisible && detailsWidget.length > 0");
+    expect(content).toContain("formatCompactDuration");
+  });
 });
 
 describe("Policy module", () => {
