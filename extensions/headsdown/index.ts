@@ -821,43 +821,329 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
+  type HeadsDownUIThemeName = "neo" | "mono" | "executive";
+
+  type HeadsDownUITheme = {
+    name: string;
+    separator: string;
+    modeIcons: Record<string, string>;
+    frame: { top: string; side: string; bottom: string };
+    glyphs: {
+      policy: string;
+      task: string;
+      scope: string;
+      hours: string;
+      resume: string;
+      lock: string;
+      progressFull: string;
+      progressEmpty: string;
+    };
+  };
+
+  const HEADSDOWN_UI_THEMES: Record<HeadsDownUIThemeName, HeadsDownUITheme> = {
+    neo: {
+      name: "Neo",
+      separator: " │ ",
+      modeIcons: { online: "◉", busy: "◔", limited: "◑", offline: "○", none: "◌" },
+      frame: { top: "╭─", side: "│", bottom: "╰─" },
+      glyphs: {
+        policy: "◈",
+        task: "◎",
+        scope: "◔",
+        hours: "◷",
+        resume: "✦",
+        lock: "🔒",
+        progressFull: "█",
+        progressEmpty: "░",
+      },
+    },
+    mono: {
+      name: "Mono",
+      separator: " | ",
+      modeIcons: { online: "●", busy: "◐", limited: "◒", offline: "○", none: "·" },
+      frame: { top: "+-", side: "|", bottom: "`-" },
+      glyphs: {
+        policy: "*",
+        task: ">",
+        scope: "=",
+        hours: "~",
+        resume: "+",
+        lock: "!",
+        progressFull: "#",
+        progressEmpty: ".",
+      },
+    },
+    executive: {
+      name: "Executive",
+      separator: " · ",
+      modeIcons: { online: "◆", busy: "◈", limited: "◇", offline: "◻", none: "◻" },
+      frame: { top: "┌─", side: "│", bottom: "└─" },
+      glyphs: {
+        policy: "◆",
+        task: "◈",
+        scope: "▣",
+        hours: "◷",
+        resume: "✶",
+        lock: "🔐",
+        progressFull: "▰",
+        progressEmpty: "▱",
+      },
+    },
+  };
+
+  function normalizeUITheme(value: string | null | undefined): HeadsDownUIThemeName | null {
+    if (!value) return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "neo" || normalized === "mono" || normalized === "executive") {
+      return normalized;
+    }
+    return null;
+  }
+
+  const defaultUITheme: HeadsDownUIThemeName =
+    normalizeUITheme(process.env.HEADSDOWN_UI_THEME) ?? "neo";
+  let activeUITheme: HeadsDownUIThemeName = defaultUITheme;
+
+  function getActiveUITheme(): HeadsDownUITheme {
+    return HEADSDOWN_UI_THEMES[activeUITheme];
+  }
+
+  function truncateText(input: string, maxLength: number): string {
+    const trimmed = input.trim();
+    if (trimmed.length <= maxLength) return trimmed;
+    return `${trimmed.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+  }
+
+  function formatClockZ(iso: string | null | undefined): string | null {
+    if (!iso) return null;
+    const parsed = new Date(iso);
+    if (Number.isNaN(parsed.getTime())) return null;
+    const hh = String(parsed.getUTCHours()).padStart(2, "0");
+    const mm = String(parsed.getUTCMinutes()).padStart(2, "0");
+    return `${hh}:${mm}Z`;
+  }
+
+  function formatRemainingMinutes(expiresAt: string | null | undefined): string | null {
+    if (!expiresAt) return null;
+    const expires = new Date(expiresAt);
+    if (Number.isNaN(expires.getTime())) return null;
+
+    const minutes = Math.round((expires.getTime() - Date.now()) / 60000);
+    return minutes > 0 ? `${minutes}m` : null;
+  }
+
+  function summarizeWrapUpInstruction(instruction: string): string {
+    const normalized = instruction.trim().replace(/\s+/g, " ");
+
+    if (normalized.toLowerCase().includes("proceed normally")) {
+      return "Proceed normally";
+    }
+
+    if (normalized.toLowerCase().includes("keep scope minimal")) {
+      return "Wrap-up mode, keep scope tight";
+    }
+
+    if (normalized.toLowerCase().includes("full implementation depth")) {
+      return "Full-depth execution";
+    }
+
+    return truncateText(normalized, 56);
+  }
+
+  function renderScopeMeter(
+    touched: number,
+    estimatedFiles: number | undefined,
+    theme: HeadsDownUITheme,
+  ): string {
+    const slots = 5;
+    const ratio =
+      typeof estimatedFiles === "number" && estimatedFiles > 0
+        ? Math.min(1, touched / estimatedFiles)
+        : Math.min(1, touched / slots);
+    const filled = Math.max(0, Math.min(slots, Math.round(ratio * slots)));
+    const empty = slots - filled;
+    return `${theme.glyphs.progressFull.repeat(filled)}${theme.glyphs.progressEmpty.repeat(empty)}`;
+  }
+
+  function buildModeChip(
+    mode: string | undefined,
+    locked: boolean,
+    theme: HeadsDownUITheme,
+  ): string {
+    const normalizedMode = (mode ?? "none").toLowerCase();
+    const icon = theme.modeIcons[normalizedMode] ?? theme.modeIcons.none;
+    return `${icon} HD ${(mode ?? "unknown").toUpperCase()}${locked ? ` ${theme.glyphs.lock}` : ""}`;
+  }
+
+  function buildStatusLine(input: {
+    snapshot: AvailabilitySnapshot;
+    activeProposal: ProposalRecord | null;
+    proposalScope: ProposalScopeSnapshot | null;
+    hasContinuation: boolean;
+    theme: HeadsDownUITheme;
+  }): string {
+    const { snapshot, activeProposal, proposalScope, hasContinuation, theme } = input;
+    const schedule = snapshot.schedule as
+      | {
+          inReachableHours?: boolean | null;
+          nextTransitionAt?: string | null;
+          wrapUpGuidance?: { active?: boolean | null; remainingMinutes?: number | null } | null;
+        }
+      | null
+      | undefined;
+
+    const mode = snapshot.contract?.mode;
+    const locked = snapshot.contract?.lock === true;
+    const statusText = snapshot.contract?.statusText
+      ? truncateText(snapshot.contract.statusText.replace(/\s+/g, " "), 30)
+      : null;
+    const remaining = formatRemainingMinutes(snapshot.contract?.expiresAt);
+
+    const badges: string[] = [buildModeChip(mode, locked, theme)];
+
+    if (statusText) {
+      badges.push(statusText);
+    }
+
+    if (remaining) {
+      badges.push(remaining);
+    }
+
+    if (activeProposal) {
+      const touched = proposalScope?.modifiedFiles.length ?? 0;
+      const meter = renderScopeMeter(touched, activeProposal.estimatedFiles, theme);
+      const progress =
+        typeof activeProposal.estimatedFiles === "number"
+          ? `${touched}/${activeProposal.estimatedFiles}`
+          : `${touched}`;
+      badges.push(`${theme.glyphs.scope} ${meter} ${progress}`);
+    }
+
+    if (schedule?.inReachableHours === false) {
+      badges.push("OFF HOURS");
+    }
+
+    const nextTransition = formatClockZ(schedule?.nextTransitionAt);
+    if (nextTransition) {
+      badges.push(`NEXT ${nextTransition}`);
+    }
+
+    if (schedule?.wrapUpGuidance?.active) {
+      const remainingWrapUp =
+        typeof schedule.wrapUpGuidance.remainingMinutes === "number"
+          ? `${schedule.wrapUpGuidance.remainingMinutes}m`
+          : null;
+      badges.push(remainingWrapUp ? `WRAP ${remainingWrapUp}` : "WRAP");
+    }
+
+    if (hasContinuation) {
+      badges.push(`${theme.glyphs.resume} RESUME`);
+    }
+
+    return badges.join(theme.separator);
+  }
+
+  function buildDetailsWidget(input: {
+    snapshot: AvailabilitySnapshot;
+    activeProposal: ProposalRecord | null;
+    proposalScope: ProposalScopeSnapshot | null;
+    hasContinuation: boolean;
+    theme: HeadsDownUITheme;
+  }): string[] {
+    const { snapshot, activeProposal, proposalScope, hasContinuation, theme } = input;
+    const schedule = snapshot.schedule as
+      | {
+          inReachableHours?: boolean | null;
+          nextTransitionAt?: string | null;
+        }
+      | null
+      | undefined;
+
+    const lines = [`${theme.frame.top} HeadsDown · ${theme.name}`];
+
+    if (snapshot.wrapUpInstruction) {
+      lines.push(
+        `${theme.frame.side} ${theme.glyphs.policy} policy  ${summarizeWrapUpInstruction(snapshot.wrapUpInstruction)}`,
+      );
+    }
+
+    if (activeProposal) {
+      const touched = proposalScope?.modifiedFiles.length ?? 0;
+      const scopeText =
+        typeof activeProposal.estimatedFiles === "number"
+          ? `${touched}/${activeProposal.estimatedFiles} files`
+          : `${touched} files touched`;
+      const meter = renderScopeMeter(touched, activeProposal.estimatedFiles, theme);
+      lines.push(
+        `${theme.frame.side} ${theme.glyphs.task} task    ${truncateText(activeProposal.description, 52)}`,
+      );
+      lines.push(`${theme.frame.side} ${theme.glyphs.scope} scope   ${meter} ${scopeText}`);
+    }
+
+    if (snapshot.contract?.lock === true) {
+      lines.push(
+        `${theme.frame.side} ${theme.glyphs.lock} lock    Mutating changes require explicit user confirmation`,
+      );
+    }
+
+    if (schedule?.inReachableHours === false) {
+      const nextTransition = formatClockZ(schedule.nextTransitionAt);
+      const hoursText = nextTransition
+        ? `Outside reachable hours, next ${nextTransition}`
+        : "Outside reachable hours";
+      lines.push(`${theme.frame.side} ${theme.glyphs.hours} hours   ${hoursText}`);
+    }
+
+    if (hasContinuation) {
+      lines.push(
+        `${theme.frame.side} ${theme.glyphs.resume} resume  Saved state available via headsdown_continuation action=load`,
+      );
+    }
+
+    if (lines.length === 1) {
+      return [];
+    }
+
+    lines.push(
+      `${theme.frame.bottom} /headsdown for full details · /headsdown theme <neo|mono|executive>`,
+    );
+    return lines;
+  }
+
   async function updateStatusUI(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
 
     const snapshot = await refreshAvailability(ctx);
     const activeProposal = getLatestApprovedProposal();
     const proposalScope = activeProposal ? getScopeSnapshot(activeProposal.id) : null;
+    const hasContinuation = await continuationExists();
+    const theme = getActiveUITheme();
 
     if (!snapshot) {
-      ctx.ui.setStatus("headsdown", "HeadsDown unavailable");
+      ctx.ui.setStatus("headsdown", "○ HD unavailable");
       ctx.ui.setWidget("headsdown", undefined);
       return;
     }
 
-    const statusLine = `[HeadsDown] ${snapshot.summary}`;
+    const statusLine = buildStatusLine({
+      snapshot,
+      activeProposal,
+      proposalScope,
+      hasContinuation,
+      theme,
+    });
+
     ctx.ui.setStatus("headsdown", statusLine);
 
-    const lines = [statusLine];
+    const detailsWidget = buildDetailsWidget({
+      snapshot,
+      activeProposal,
+      proposalScope,
+      hasContinuation,
+      theme,
+    });
 
-    if (snapshot.wrapUpInstruction) {
-      lines.push(`[HeadsDown] Policy: ${snapshot.wrapUpInstruction}`);
-    }
-
-    if (activeProposal) {
-      const estimateText =
-        typeof activeProposal.estimatedFiles === "number"
-          ? `${proposalScope?.modifiedFiles.length ?? 0}/${activeProposal.estimatedFiles} files`
-          : `${proposalScope?.modifiedFiles.length ?? 0} files touched`;
-      lines.push(`[HeadsDown] Active proposal: ${activeProposal.description} (${estimateText})`);
-    }
-
-    if (await continuationExists()) {
-      lines.push(
-        "[HeadsDown] Continuation artifact detected. Use headsdown_continuation action=load.",
-      );
-    }
-
-    ctx.ui.setWidget("headsdown", lines);
+    ctx.ui.setWidget("headsdown", detailsWidget.length > 0 ? detailsWidget : undefined);
   }
 
   async function checkPendingDigestCount(ctx: ExtensionContext): Promise<number> {
@@ -1966,12 +2252,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       const client = await getClientOrThrow();
       const actorClient = withActorContext(client, _ctx);
-      const reportOutcome = (
+      const reportOutcomeMethod = (
         actorClient as unknown as {
           reportOutcome?: (input: Record<string, unknown>) => Promise<unknown>;
         }
       ).reportOutcome;
-      if (typeof reportOutcome !== "function") {
+      if (typeof reportOutcomeMethod !== "function") {
         return {
           content: [
             {
@@ -1982,6 +2268,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           details: { proposalId: lastApprovedProposalId, outcome: params.outcome },
         };
       }
+
+      const reportOutcome = reportOutcomeMethod.bind(actorClient) as (input: {
+        proposalId: string;
+        outcome: string;
+        errorCategory?: string;
+        testsPassed?: boolean;
+      }) => Promise<unknown>;
 
       try {
         await reportOutcome({
@@ -2106,6 +2399,40 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           const summaries = await actorClient.listDigestSummaries({ latest: 10 });
           const noun = summaries.length === 1 ? "summary" : "summaries";
           ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
+          return;
+        }
+
+        if (normalizedArgs.startsWith("theme")) {
+          const [, themeArgRaw] = normalizedArgs.split(/\s+/, 2);
+          const themeArg = themeArgRaw?.trim();
+
+          if (!themeArg || themeArg === "list") {
+            ctx.ui.notify(
+              `[HeadsDown] Themes: neo, mono, executive. Current: ${activeUITheme}.`,
+              "info",
+            );
+            return;
+          }
+
+          if (themeArg === "reset") {
+            activeUITheme = defaultUITheme;
+            await updateStatusUI(ctx);
+            ctx.ui.notify(`[HeadsDown] Theme reset to ${activeUITheme}.`, "info");
+            return;
+          }
+
+          const parsedTheme = normalizeUITheme(themeArg);
+          if (!parsedTheme) {
+            ctx.ui.notify(
+              "[HeadsDown] Unknown theme. Use /headsdown theme <neo|mono|executive|list|reset>.",
+              "warning",
+            );
+            return;
+          }
+
+          activeUITheme = parsedTheme;
+          await updateStatusUI(ctx);
+          ctx.ui.notify(`[HeadsDown] Theme set to ${activeUITheme}.`, "info");
           return;
         }
 

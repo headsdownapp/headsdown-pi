@@ -75,10 +75,11 @@ describe("Extension file", () => {
     expect(content).toContain("unavailable for API-key clients");
   });
 
-  it("keeps headsdown_report and supports modern sdk reportOutcome", async () => {
+  it("keeps headsdown_report and binds modern sdk reportOutcome to actor client", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_report"');
-    expect(content).toContain("reportOutcome");
+    expect(content).toContain("reportOutcomeMethod");
+    expect(content).toContain("reportOutcomeMethod.bind(actorClient)");
   });
 
   it("uses lifecycle hooks for continuity and compaction integration", async () => {
@@ -97,6 +98,17 @@ describe("Extension file", () => {
     expect(content).toContain("systemPrompt:");
     expect(content).toContain('pi.on("tool_result"');
     expect(content).toContain("maybeWarnScopeDrift");
+  });
+
+  it("supports themed status UI and runtime /headsdown theme switching", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("HEADSDOWN_UI_THEMES");
+    expect(content).toContain('name: "Neo"');
+    expect(content).toContain('name: "Mono"');
+    expect(content).toContain('name: "Executive"');
+    expect(content).toContain("HEADSDOWN_UI_THEME");
+    expect(content).toContain("/headsdown theme <neo|mono|executive>");
+    expect(content).toContain('normalizedArgs.startsWith("theme")');
   });
 });
 
