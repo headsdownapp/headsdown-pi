@@ -89,6 +89,78 @@ describe("actor context wiring", () => {
   });
 });
 
+describe("bash mutation classification helpers", () => {
+  it("classifies common read-only commands as read-only", () => {
+    expect(__internal.isReadonlyBashCommand("git status")).toBe(true);
+    expect(__internal.isReadonlyBashCommand("ls -la")).toBe(true);
+    expect(__internal.isPotentiallyMutatingBashCommand("git status")).toBe(false);
+  });
+
+  it("classifies common mutating commands as mutating", () => {
+    expect(__internal.isPotentiallyMutatingBashCommand("touch tmp.txt")).toBe(true);
+    expect(__internal.isPotentiallyMutatingBashCommand("echo hello > notes.txt")).toBe(true);
+    expect(__internal.isPotentiallyMutatingBashCommand("git add . && git commit -m test")).toBe(
+      true,
+    );
+  });
+
+  it("exposes continuation path under user config directory", () => {
+    expect(__internal.CONTINUATION_PATH).toContain(".config/headsdown/continuation.json");
+  });
+});
+
+describe("headsdown compaction helper", () => {
+  it("returns null when there is no HeadsDown continuity context", () => {
+    const compaction = __internal.buildHeadsDownCompaction({
+      availabilitySummary: null,
+      wrapUpInstruction: null,
+      proposal: null,
+      scope: null,
+      firstKeptEntryId: "msg-1",
+      tokensBefore: 1234,
+    });
+
+    expect(compaction).toBeNull();
+  });
+
+  it("returns custom compaction summary with preserved metadata when context exists", () => {
+    const compaction = __internal.buildHeadsDownCompaction({
+      availabilitySummary: "Mode: busy, 12min remaining",
+      wrapUpInstruction: "Execution policy: wrap up current slice.",
+      proposal: {
+        id: "proposal-1",
+        decision: "approved",
+        description: "Refactor auth service",
+        evaluatedAt: "2026-04-22T00:00:00Z",
+        estimatedFiles: 3,
+        estimatedMinutes: 45,
+        scopeSummary: "auth module + tests",
+        sourceRef: "ticket-123",
+      },
+      scope: {
+        proposalId: "proposal-1",
+        modifiedFiles: ["lib/auth.ts", "test/auth.test.ts"],
+        warningSent: true,
+        updatedAt: "2026-04-22T00:05:00Z",
+      },
+      firstKeptEntryId: "msg-42",
+      tokensBefore: 5555,
+    });
+
+    expect(compaction).toBeTruthy();
+    expect(compaction!.firstKeptEntryId).toBe("msg-42");
+    expect(compaction!.tokensBefore).toBe(5555);
+    expect(compaction!.summary).toContain("## HeadsDown continuity");
+    expect(compaction!.summary).toContain("Refactor auth service");
+    expect(compaction!.details.v).toBe(1);
+    expect(compaction!.details.headsdown.proposal?.id).toBe("proposal-1");
+    expect(compaction!.details.headsdown.scope?.modifiedFiles).toEqual([
+      "lib/auth.ts",
+      "test/auth.test.ts",
+    ]);
+  });
+});
+
 describe("availability override compatibility", () => {
   it("uses native SDK override methods when available", async () => {
     const created = await __internal.createAvailabilityOverrideCompat(

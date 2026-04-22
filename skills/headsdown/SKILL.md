@@ -1,91 +1,86 @@
 ---
 name: headsdown
-description: HeadsDown availability awareness. Checks the user's focus mode and availability schedule before starting tasks. Submits task proposals for verdict (approved/deferred). Use before any significant work to respect the user's focus time.
+description: HeadsDown availability awareness. Checks the user's focus mode and schedule before significant work, submits proposals for verdicts, tracks scope drift during execution, and preserves resumable continuity when sessions branch, compact, or pause.
 ---
 
 # HeadsDown Availability Skill
 
-This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of the user's availability before starting work.
+This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of user availability before, during, and after non-trivial work.
 
 ## Available Tools
 
-This package registers seven tools. Use them directly via tool calls:
+Use these tools directly:
 
-- **headsdown_status**: Check current availability (mode, schedule, time remaining)
-- **headsdown_presets**: List saved presets or apply one to change mode quickly
-- **headsdown_propose**: Submit a task proposal for verdict (approved/deferred)
-- **headsdown_grants**: List/create/revoke delegation grants for actor-scoped access
-- **headsdown_override**: Get/set/clear temporary availability overrides
-- **headsdown_report**: Report the outcome of a completed task (completed/failed/etc.)
-- **headsdown_auth**: Authenticate with HeadsDown via Device Flow
+- `headsdown_status`: current mode, schedule context, wrap-up instruction, active proposal scope
+- `headsdown_presets`: list or apply saved availability presets
+- `headsdown_propose`: submit a task proposal for approved/deferred verdict
+- `headsdown_digest`: review notifications/messages that arrived during focus windows
+- `headsdown_grants`: list/create/revoke delegation grants
+- `headsdown_override`: get/set/clear temporary availability override
+- `headsdown_continuation`: save/load/check/clear resumable continuation artifacts
+- `headsdown_report`: report approved task outcome for calibration
+- `headsdown_auth`: authenticate when other tools fail with auth errors
 
-## When to Check
+## Required Flow For Significant Work
 
-**Before starting any non-trivial task**, check the user's availability:
+Before any non-trivial coding task:
 
-1. Call `headsdown_status` to see their current mode and availability schedule.
-2. If they have an active contract (especially busy, limited, or offline), call `headsdown_propose` with a clear description of what you plan to do.
-3. Follow the verdict:
-   - **approved**: Proceed normally.
-   - **deferred**: Tell the user the task was deferred and why. Suggest postponing or reducing scope.
+1. Call `headsdown_status`.
+2. If mode is `busy`, `limited`, or `offline`, call `headsdown_propose` with clear scope and estimates.
+3. Respect the verdict:
+   - `approved`: proceed.
+   - `deferred`: tell the user and offer a reduced-scope slice.
 
-**Skip the check** for trivial tasks like answering a question, reading a file, or running a quick command.
+Skip this flow only for trivial actions like quick reads or simple clarifications.
 
-## Presets
+## Mode Semantics
 
-If the user explicitly asks to change their mode (for example, "set me to deep focus"), use `headsdown_presets`:
+- `online`: proceed normally after status/proposal checks.
+- `busy`: prefer approved scope and avoid unnecessary expansion.
+- `limited`: keep work focused and slice aggressively.
+- `offline`: defer non-trivial work unless explicitly approved.
 
-- `action: "list"` to show available presets
-- `action: "apply"` with `id` or `name` to activate one
+## Time-Aware Slicing
 
-Never apply a preset unless the user clearly asked to change availability.
+Use the schedule and wrap-up guidance from `headsdown_status`:
 
-If the user asks about delegated control for session/workspace operations, use `headsdown_grants`. If the user asks for a one-off temporary mode change (without changing presets), use `headsdown_override`.
+- If the window is tight, propose only a shippable slice.
+- Prefer natural boundaries (module, layer, test pass) over arbitrary partial work.
+- Keep each slice independently valid and reviewable.
 
-## Interpreting Availability
+## Mid-Task Scope Drift
 
-### Modes
+If realized edits exceed the approved estimate, pause and re-propose with updated `estimated_files`, `estimated_minutes`, and `scope_summary`. Do not silently overrun approved scope.
 
-- **online**: User is available. Proceed with tasks normally.
-- **busy**: User is in deep focus. Only proceed with approved proposals. Scope work down if deferred.
-- **limited**: User has reduced availability. Prefer smaller, focused tasks.
-- **offline**: User is away. Defer all non-trivial work.
+## Digest Triage
 
-### Schedule Context
+When a session starts with pending digest summaries, or when the user asks what they missed:
 
-The status returns schedule information from availability:
+1. Call `headsdown_digest`.
+2. Summarize by source and actor.
+3. Prioritize items related to current work.
+4. Offer to convert actionable items into proposals.
 
-- **Within reachable hours**: User is in their normal reachable window.
-- **Outside reachable hours**: User is currently outside their reachable window.
-- **Next transition**: When their schedule is expected to change next.
+## Continuation And Session Boundaries
 
-### Locked Status
+When pausing work, switching sessions, or wrapping up with unfinished approved scope:
 
-If the status shows `lock: true`, the user explicitly does not want their mode changed. Respect this.
+- Save a continuation artifact with `headsdown_continuation` action `save`.
+- On next session, load it with action `load` and resume from the first pending step.
+- Clear stale artifacts with action `clear` when no longer needed.
 
-## Verdict Decisions
+## Outcome Reporting
 
-When you submit a proposal via `headsdown_propose`:
+After finishing approved work, call `headsdown_report` with `completed`, `failed`, `partially_completed`, `cancelled`, or `timed_out`. Include `error_category` for failures and `tests_passed` when known.
 
-- **approved**: The task fits within the user's current availability. Start working.
-- **deferred**: The task should wait. Tell the user what the verdict was and why, then suggest postponing or offer to scope the task down.
+## Presets And Overrides
 
-## Reporting Outcomes
+- Use `headsdown_presets` only when the user explicitly asks to change mode.
+- Use `headsdown_override` for temporary one-off mode changes.
+- Respect locked status and never force mode changes.
 
-After completing work on an approved task, report the outcome:
+## Authentication And Failures
 
-1. Call `headsdown_report` with the outcome: `completed`, `failed`, `partially_completed`, `cancelled`, or `timed_out`.
-2. If the task failed, include an `error_category` (e.g., "test_failure", "compilation_error").
-3. If you ran tests, include `tests_passed: true/false`.
-
-This calibration data helps HeadsDown learn how long tasks actually take and how often they succeed, making future verdicts more accurate.
-
-## Authentication
-
-If any tool returns an authentication error, call `headsdown_auth`. The user will see a URL and code to approve in their browser.
-
-## Error Handling
-
-- **"Not authenticated"**: Call `headsdown_auth` to connect.
-- **"API key is invalid"**: Call `headsdown_auth` to re-authenticate.
-- **Network errors**: Inform the user and proceed without availability data.
+- Auth errors: call `headsdown_auth`.
+- Network/API errors: inform the user and proceed cautiously without availability automation.
+- Session-token-only grant errors: explain that delegation grant management is unavailable for API-key auth paths.
