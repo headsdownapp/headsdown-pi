@@ -62,8 +62,11 @@ describe("Extension file", () => {
     expect(content).toContain("CONTINUATION_PATH");
   });
 
-  it("supports delivery_mode and returns Wrap-Up guidance in propose responses", async () => {
+  it("supports idempotency_key and delivery_mode in propose responses", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("idempotency_key");
+    expect(content).toContain("pi-toolcall-");
+    expect(content).toContain("idempotencyKey = idempotencyKey");
     expect(content).toContain("delivery_mode");
     expect(content).toContain("deliveryMode: params.delivery_mode");
     expect(content).toContain("wrapUpGuidance: verdict.wrapUpGuidance");

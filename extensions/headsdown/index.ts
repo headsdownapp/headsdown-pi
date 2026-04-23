@@ -1703,6 +1703,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       source_ref: Type.Optional(
         Type.String({ description: "Task source: ticket number, PR URL, etc." }),
       ),
+      idempotency_key: Type.Optional(
+        Type.String({
+          description:
+            "Optional idempotency key for retry safety. If omitted, pi uses a stable key per tool call.",
+        }),
+      ),
       delivery_mode: Type.Optional(
         Type.Union([Type.Literal("auto"), Type.Literal("wrap_up"), Type.Literal("full_depth")], {
           description: "Optional Wrap-Up delivery mode override for this task.",
@@ -1712,6 +1718,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
       const actorClient = withActorContext(client, _ctx);
+
+      const idempotencyKey =
+        params.idempotency_key && params.idempotency_key.trim().length > 0
+          ? params.idempotency_key.trim()
+          : `pi-toolcall-${_toolCallId}`;
 
       const input: ProposalInput = {
         agentRef: "pi-agent",
@@ -1723,6 +1734,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         sourceRef: params.source_ref,
         deliveryMode: params.delivery_mode,
       };
+      (input as ProposalInput & { idempotencyKey?: string }).idempotencyKey = idempotencyKey;
 
       const verdict = await actorClient.submitProposal(input);
 
