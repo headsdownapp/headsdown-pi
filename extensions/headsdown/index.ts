@@ -11,6 +11,7 @@
  * - Registers /headsdown command for quick status checks
  */
 
+import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -53,6 +54,16 @@ interface ProposalRecord {
 
 interface ProposalState {
   proposals: ProposalRecord[];
+}
+
+interface ProposeToolParams {
+  description: string;
+  estimated_files?: number;
+  estimated_minutes?: number;
+  scope_summary?: string;
+  source_ref?: string;
+  idempotency_key?: string;
+  delivery_mode?: "auto" | "wrap_up" | "full_depth";
 }
 
 interface ProposalScopeSnapshot {
@@ -472,6 +483,138 @@ function normalizeStringArray(value: unknown): string[] {
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+}
+
+function randomHex(length: number): string {
+  return randomUUID().replace(/-/g, "").slice(0, length);
+}
+
+function stripUndefinedValues(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+export function deriveProposalIdempotencyKey(
+  params: ProposeToolParams,
+  toolCallId?: string,
+): string {
+  const explicit = params.idempotency_key?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const normalizedToolCallId = toolCallId?.trim();
+  if (normalizedToolCallId) {
+    return `pi-toolcall-${normalizedToolCallId}`;
+  }
+
+  return `pi-toolcall-${randomUUID()}`;
+}
+
+export function buildProposalInput(params: ProposeToolParams, toolCallId?: string): ProposalInput {
+  const input: ProposalInput = {
+    agentRef: "pi-agent",
+    framework: "pi",
+    description: params.description,
+    estimatedFiles: params.estimated_files,
+    estimatedMinutes: params.estimated_minutes,
+    scopeSummary: params.scope_summary,
+    sourceRef: params.source_ref,
+    deliveryMode: params.delivery_mode,
+  };
+  (input as ProposalInput & { idempotencyKey?: string }).idempotencyKey =
+    deriveProposalIdempotencyKey(params, toolCallId);
+  return input;
+}
+
+const SUBMIT_PROPOSAL_WITH_IDEMPOTENCY_MUTATION = `
+  mutation SubmitProposalWithIdempotency($input: ProposalInput!) {
+    submitProposal(input: $input) {
+      decision
+      reason
+      proposalId
+      evaluatedAt
+      wrapUpGuidance {
+        active
+        deadlineAt
+        remainingMinutes
+        profile
+        source
+        reason
+        hints
+        thresholdMinutes
+        selectedMode
+      }
+    }
+  }
+`;
+
+function toGraphQLWrapUpMode(
+  mode: "auto" | "wrap_up" | "full_depth" | undefined,
+): string | undefined {
+  if (!mode) return undefined;
+  return mode.toUpperCase();
+}
+
+async function submitProposalCompat(
+  client: HeadsDownClient,
+  input: ProposalInput,
+  idempotencyKey: string,
+): Promise<Verdict> {
+  const normalizedDescription = input.description?.trim();
+  if (!normalizedDescription) {
+    throw new Error("Proposal description is required.");
+  }
+
+  const normalizedAgentRef = input.agentRef?.trim();
+  if (!normalizedAgentRef) {
+    throw new Error("Agent reference is required.");
+  }
+
+  const sourceRef = input.sourceRef ?? `${normalizedAgentRef}-${Date.now()}-${randomHex(6)}`;
+
+  const normalizedInput: ProposalInput = {
+    ...input,
+    agentRef: normalizedAgentRef,
+    description: normalizedDescription,
+    sourceRef,
+  };
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    return client.submitProposal(normalizedInput);
+  }
+
+  const mutationInput = stripUndefinedValues({
+    agentRef: normalizedAgentRef,
+    model: input.model,
+    framework: input.framework,
+    description: normalizedDescription,
+    estimatedFiles: input.estimatedFiles,
+    estimatedMinutes: input.estimatedMinutes,
+    scopeSummary: input.scopeSummary,
+    sourceRef,
+    idempotencyKey,
+    deliveryMode: toGraphQLWrapUpMode(input.deliveryMode),
+  });
+
+  try {
+    const data = await graphql.request(SUBMIT_PROPOSAL_WITH_IDEMPOTENCY_MUTATION, {
+      input: mutationInput,
+    });
+
+    const verdict = (data.submitProposal as Verdict | null | undefined) ?? null;
+    if (!verdict) {
+      throw new Error("HeadsDown API returned no submitProposal data.");
+    }
+
+    return verdict;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('Field "idempotencyKey" is not defined by type "ProposalInput"')) {
+      return client.submitProposal(normalizedInput);
+    }
+    throw error;
+  }
 }
 
 function isReadonlyBashCommand(command: string): boolean {
@@ -1706,7 +1849,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       idempotency_key: Type.Optional(
         Type.String({
           description:
-            "Optional idempotency key for retry safety. If omitted, pi uses a stable key per tool call.",
+            "Optional idempotency key for retry safety. If omitted, pi derives a key from this tool call id.",
         }),
       ),
       delivery_mode: Type.Optional(
@@ -1715,28 +1858,17 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params: ProposeToolParams, _signal, _onUpdate, _ctx) {
       const client = await getClientOrThrow();
       const actorClient = withActorContext(client, _ctx);
 
-      const idempotencyKey =
-        params.idempotency_key && params.idempotency_key.trim().length > 0
-          ? params.idempotency_key.trim()
-          : `pi-toolcall-${_toolCallId}`;
-
-      const input: ProposalInput = {
-        agentRef: "pi-agent",
-        framework: "pi",
-        description: params.description,
-        estimatedFiles: params.estimated_files,
-        estimatedMinutes: params.estimated_minutes,
-        scopeSummary: params.scope_summary,
-        sourceRef: params.source_ref,
-        deliveryMode: params.delivery_mode,
-      };
-      (input as ProposalInput & { idempotencyKey?: string }).idempotencyKey = idempotencyKey;
-
-      const verdict = await actorClient.submitProposal(input);
+      const input = buildProposalInput(params, _toolCallId);
+      const idempotencyKey = (input as ProposalInput & { idempotencyKey?: string }).idempotencyKey;
+      const verdict = await submitProposalCompat(
+        actorClient,
+        input,
+        idempotencyKey ?? deriveProposalIdempotencyKey(params),
+      );
 
       const proposalRecord: ProposalRecord = {
         id: verdict.proposalId,
