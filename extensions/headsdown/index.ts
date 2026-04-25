@@ -73,6 +73,32 @@ interface ProposalScopeSnapshot {
   updatedAt: string;
 }
 
+interface PiRunTelemetry {
+  runId: string;
+  proposalId: string;
+  startedAt: number;
+  sequence: number;
+  toolCallsCount: number;
+  toolReadCount: number;
+  toolWriteCount: number;
+  toolExternalCount: number;
+  failureCount: number;
+  retryCount: number;
+  redirectCount: number;
+  filesRead: Set<string>;
+  filesModified: Set<string>;
+  startedReported: boolean;
+  scopeDriftReported: boolean;
+  completedReported: boolean;
+}
+
+interface PiAgentRunEventContext {
+  runId: string;
+  proposalId?: string;
+  sequence?: number;
+  idempotencyKey?: string;
+}
+
 interface AvailabilitySnapshot {
   contract: Contract | null;
   calendar: unknown | null;
@@ -526,6 +552,370 @@ export function buildProposalInput(params: ProposeToolParams, toolCallId?: strin
   return input;
 }
 
+function safeIdToken(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9_.:-]+/g, "_")
+    .slice(0, 96);
+}
+
+function runIdForProposal(proposalId: string): string {
+  return `run_${safeIdToken(proposalId)}`;
+}
+
+function bucketFileCount(count: number | undefined): string {
+  if (count === undefined || count < 0) return "unknown";
+  if (count === 0) return "0";
+  if (count <= 2) return "1_to_2";
+  if (count <= 5) return "3_to_5";
+  if (count <= 10) return "6_to_10";
+  return "over_10";
+}
+
+function bucketScopeGrowth(count: number | undefined): string {
+  if (count === undefined || count < 0) return "unknown";
+  if (count === 0) return "none";
+  if (count <= 2) return "1_to_2_files";
+  if (count <= 5) return "3_to_5_files";
+  if (count <= 10) return "6_to_10_files";
+  return "over_10_files";
+}
+
+function normalizeSafeReasonCode(value: string | undefined, fallback: string): string {
+  const raw = value?.trim().toLowerCase().replace(/-/g, "_");
+  const normalized = raw
+    ?.replace(/[^a-z0-9_]+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 64);
+  const allowed = new Set([
+    "manual_save",
+    "session_switch",
+    "session_shutdown",
+    "session_compact",
+    "before_switch",
+    "before_tree",
+    "before_compact",
+    "unknown",
+  ]);
+  return normalized && allowed.has(normalized) ? normalized : fallback;
+}
+
+function normalizeFailureCategory(value: string | undefined): string {
+  const normalized = normalizeSafeReasonCode(value, "unknown");
+  const allowed = new Set([
+    "validation_failed",
+    "compilation_error",
+    "test_failure",
+    "auth_error",
+    "external_service_error",
+    "timeout",
+    "cancelled",
+    "unknown",
+  ]);
+  return allowed.has(normalized) ? normalized : "unknown";
+}
+
+function mapTaskOutcomeToAgentRunOutcome(outcome: string): string {
+  switch (outcome) {
+    case "completed":
+      return "succeeded";
+    case "failed":
+    case "timed_out":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    case "partially_completed":
+      return "paused";
+    default:
+      return "failed";
+  }
+}
+
+function bucketMinutes(minutes: number | undefined): string {
+  if (minutes === undefined || minutes < 0) return "unknown";
+  if (minutes < 15) return "under_15";
+  if (minutes <= 30) return "15_to_30";
+  if (minutes <= 60) return "30_to_60";
+  if (minutes <= 120) return "60_to_120";
+  return "over_120";
+}
+
+function basePiAgentRunEvent(context: PiAgentRunEventContext): Record<string, unknown> {
+  return stripUndefinedValues({
+    runId: context.runId,
+    workspaceRef: "unknown",
+    source: "pi_skill",
+    client: { kind: "pi", name: "Pi", version: "0.2.0" },
+    actor: { kind: "agent", ref: "pi" },
+    proposalRef: context.proposalId,
+    correlationId: context.proposalId,
+    sequence: context.sequence,
+    idempotencyKey: context.idempotencyKey,
+  });
+}
+
+function buildStartedEventInput(proposal: ProposalRecord): Record<string, unknown> {
+  const runId = runIdForProposal(proposal.id);
+  return {
+    ...basePiAgentRunEvent({
+      runId,
+      proposalId: proposal.id,
+      sequence: 1,
+      idempotencyKey: `${runId}:agent_run.started:1`,
+    }),
+    eventType: "agent_run.started",
+    payload: {
+      task_category: "coding_agent_change",
+      task_size_bucket:
+        proposal.estimatedMinutes && proposal.estimatedMinutes > 60 ? "medium" : "small",
+      started_by: "agent",
+      initial_call_key: "good_to_run",
+      estimated_minutes_bucket: bucketMinutes(proposal.estimatedMinutes),
+      estimated_files_bucket: bucketFileCount(proposal.estimatedFiles),
+      delivery_mode: "auto",
+    },
+  };
+}
+
+function buildProgressEventInput(
+  telemetry: PiRunTelemetry,
+  scopeChanged: boolean,
+): Record<string, unknown> {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - telemetry.startedAt) / 1000));
+  return {
+    ...basePiAgentRunEvent({
+      runId: telemetry.runId,
+      proposalId: telemetry.proposalId,
+      sequence: telemetry.sequence,
+      idempotencyKey: `${telemetry.runId}:agent_run.progress_reported:${telemetry.sequence}`,
+    }),
+    eventType: "agent_run.progress_reported",
+    progressPayload: {
+      elapsedSeconds,
+      toolCallsCount: telemetry.toolCallsCount,
+      toolReadCount: telemetry.toolReadCount,
+      toolWriteCount: telemetry.toolWriteCount,
+      toolExternalCount: telemetry.toolExternalCount,
+      filesReadBucket: bucketFileCount(telemetry.filesRead.size),
+      filesModifiedBucket: bucketFileCount(telemetry.filesModified.size),
+      validationLevel: "unknown",
+      validationStatus: "unknown",
+      retryCount: telemetry.retryCount,
+      failureCount: telemetry.failureCount,
+      scopeChanged,
+      redirectCount: telemetry.redirectCount,
+      progressState: "working",
+      scopeGrowthBucket: bucketScopeGrowth(telemetry.filesModified.size),
+      confidenceBucket: "medium",
+      spendEstimateBucket: "unknown",
+    },
+  };
+}
+
+function buildScopeDriftEventInput(
+  telemetry: PiRunTelemetry,
+  estimatedFiles: number,
+): Record<string, unknown> {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - telemetry.startedAt) / 1000));
+  return {
+    ...basePiAgentRunEvent({
+      runId: telemetry.runId,
+      proposalId: telemetry.proposalId,
+      sequence: telemetry.sequence,
+      idempotencyKey: `${telemetry.runId}:scope_drift.detected`,
+    }),
+    eventType: "scope_drift.detected",
+    payload: {
+      drift_type: "scope_grew",
+      approved_scope_bucket: bucketScopeGrowth(estimatedFiles),
+      observed_scope_bucket: bucketScopeGrowth(telemetry.filesModified.size),
+      reason_codes: ["modified_files_exceeded_estimate"],
+      files_touched_count: telemetry.filesModified.size,
+      tool_calls_count: telemetry.toolCallsCount,
+      elapsed_seconds: elapsedSeconds,
+    },
+  };
+}
+
+function buildContinuationSavedEventInput(
+  telemetry: PiRunTelemetry,
+  artifact: ContinuationArtifact,
+): Record<string, unknown> {
+  const continuationId = artifact.approvedProposalId
+    ? `cont_${safeIdToken(artifact.approvedProposalId)}`
+    : `cont_${safeIdToken(telemetry.runId)}`;
+  const saveReason = normalizeSafeReasonCode(artifact.reason, "manual_save");
+  return {
+    ...basePiAgentRunEvent({
+      runId: telemetry.runId,
+      proposalId: telemetry.proposalId,
+      sequence: telemetry.sequence,
+      idempotencyKey: `${telemetry.runId}:agent_run.continuation_saved:${saveReason}:${telemetry.sequence}`,
+    }),
+    eventType: "agent_run.continuation_saved",
+    payload: {
+      continuation_id: continuationId,
+      save_reason: saveReason,
+      handoff_quality: artifact.resumeInstruction ? "partial" : "unknown",
+      pending_steps_count: artifact.pendingSteps.length,
+      completed_steps_count: artifact.completedSteps.length,
+      dirty_files_count: artifact.modifiedFiles.length,
+      validation_status: "unknown",
+    },
+  };
+}
+
+function buildResumedEventInput(artifact: ContinuationArtifact): Record<string, unknown> | null {
+  if (!artifact.approvedProposalId) return null;
+  const runId = runIdForProposal(artifact.approvedProposalId);
+  return {
+    ...basePiAgentRunEvent({
+      runId,
+      proposalId: artifact.approvedProposalId,
+      sequence: 1,
+      idempotencyKey: `${runId}:agent_run.resumed`,
+    }),
+    eventType: "agent_run.resumed",
+    payload: {
+      continuation_id: `cont_${safeIdToken(artifact.approvedProposalId)}`,
+      resumed_by: "agent",
+      resume_source: "saved_continuation",
+      validation_status: "unknown",
+      call_key: "ready_to_resume",
+      action_key: "resume_run",
+    },
+  };
+}
+
+function buildQueuedForMorningEventInput(
+  proposal: ProposalRecord,
+  nextWindowStartsAt: string,
+): Record<string, unknown> {
+  const runId = runIdForProposal(proposal.id);
+  return {
+    ...basePiAgentRunEvent({
+      runId,
+      proposalId: proposal.id,
+      sequence: 1,
+      idempotencyKey: `${runId}:agent_run.queued_for_morning`,
+    }),
+    eventType: "agent_run.queued_for_morning",
+    payload: {
+      queue_id: `queue_${safeIdToken(proposal.id)}`,
+      boundary_type: "off_the_clock",
+      next_window_starts_at: nextWindowStartsAt,
+      reason_codes: ["outside_work_window", "non_urgent_ask"],
+      task_category: "coding_agent_change",
+      urgency_bucket: "normal",
+      source_ref_type: proposal.sourceRef ? "ticket" : "unknown",
+      call_key: "off_the_clock",
+      recommended_action_key: "queue_for_morning",
+    },
+  };
+}
+
+function buildTerminalEventInput(
+  telemetry: PiRunTelemetry,
+  outcome: "completed" | "failed" | "partially_completed" | "cancelled" | "timed_out",
+  errorCategory?: string,
+  testsPassed?: boolean,
+): Record<string, unknown> {
+  const durationSeconds = Math.max(0, Math.floor((Date.now() - telemetry.startedAt) / 1000));
+  const validationStatus =
+    testsPassed === true ? "passed" : testsPassed === false ? "failed" : "unknown";
+  const eventType =
+    outcome === "failed" || outcome === "timed_out"
+      ? "agent_run.failed"
+      : outcome === "cancelled"
+        ? "agent_run.cancelled"
+        : "agent_run.completed";
+  const payload =
+    eventType === "agent_run.failed"
+      ? {
+          failure_category: normalizeFailureCategory(
+            errorCategory ?? (outcome === "timed_out" ? "timeout" : "unknown"),
+          ),
+          duration_seconds: durationSeconds,
+          recoverable: true,
+          validation_status: validationStatus,
+          tool_calls_count: telemetry.toolCallsCount,
+          handoff_saved: false,
+        }
+      : eventType === "agent_run.cancelled"
+        ? {
+            cancelled_by: "agent",
+            reason_code: "user_cancelled",
+            duration_seconds: durationSeconds,
+            handoff_saved: false,
+          }
+        : {
+            outcome: mapTaskOutcomeToAgentRunOutcome(outcome),
+            completed_at: new Date().toISOString(),
+            duration_seconds: durationSeconds,
+            validation_status: validationStatus,
+            files_touched_count: telemetry.filesModified.size,
+            tool_calls_count: telemetry.toolCallsCount,
+            failure_category: errorCategory ? normalizeFailureCategory(errorCategory) : undefined,
+          };
+
+  return {
+    ...basePiAgentRunEvent({
+      runId: telemetry.runId,
+      proposalId: telemetry.proposalId,
+      sequence: telemetry.sequence,
+      idempotencyKey: `${telemetry.runId}:${eventType}`,
+    }),
+    eventType,
+    payload: stripUndefinedValues(payload),
+  };
+}
+
+function buildSteeringOutcomeEventInput(
+  telemetry: PiRunTelemetry,
+  outcome: string,
+  errorCategory?: string,
+  testsPassed?: boolean,
+): Record<string, unknown> {
+  const durationSeconds = Math.max(0, Math.floor((Date.now() - telemetry.startedAt) / 1000));
+  return {
+    ...basePiAgentRunEvent({
+      runId: telemetry.runId,
+      proposalId: telemetry.proposalId,
+      sequence: telemetry.sequence,
+      idempotencyKey: `${telemetry.runId}:steering_outcome.reported`,
+    }),
+    eventType: "steering_outcome.reported",
+    payload: stripUndefinedValues({
+      outcome: mapTaskOutcomeToAgentRunOutcome(outcome),
+      call_key: "good_to_run",
+      action_key: "continue",
+      validation_status:
+        testsPassed === true ? "passed" : testsPassed === false ? "failed" : "unknown",
+      validation_kind: testsPassed === undefined ? "unknown" : "targeted_test",
+      error_category: errorCategory ? normalizeFailureCategory(errorCategory) : undefined,
+      duration_seconds: durationSeconds,
+      files_touched_count: telemetry.filesModified.size,
+    }),
+  };
+}
+
+const REPORT_AGENT_RUN_EVENT_MUTATION = `
+  mutation ReportAgentRunEvent($input: ReportAgentRunEventInput!) {
+    reportAgentRunEvent(input: $input) {
+      ok
+      error {
+        code
+        message
+        details
+      }
+      event {
+        eventId
+        eventType
+      }
+    }
+  }
+`;
+
 const SUBMIT_PROPOSAL_WITH_IDEMPOTENCY_MUTATION = `
   mutation SubmitProposalWithIdempotency($input: ProposalInput!) {
     submitProposal(input: $input) {
@@ -553,6 +943,42 @@ function toGraphQLWrapUpMode(
 ): string | undefined {
   if (!mode) return undefined;
   return mode.toUpperCase();
+}
+
+function toAgentRunGraphQLEnum(value: string): string {
+  return /^\d/.test(value) ? `_${value.toUpperCase()}` : value.toUpperCase();
+}
+
+function serializeAgentRunEventForGraphQL(input: Record<string, unknown>): Record<string, unknown> {
+  const progressPayload = input.progressPayload as Record<string, unknown> | undefined;
+  const serializedProgress = progressPayload
+    ? stripUndefinedValues({
+        ...progressPayload,
+        filesReadBucket: toAgentRunGraphQLEnum(String(progressPayload.filesReadBucket)),
+        filesModifiedBucket: toAgentRunGraphQLEnum(String(progressPayload.filesModifiedBucket)),
+        validationLevel: String(progressPayload.validationLevel).toUpperCase(),
+        validationStatus: String(progressPayload.validationStatus).toUpperCase(),
+        progressState: String(progressPayload.progressState).toUpperCase(),
+        scopeGrowthBucket: progressPayload.scopeGrowthBucket
+          ? toAgentRunGraphQLEnum(String(progressPayload.scopeGrowthBucket))
+          : undefined,
+        confidenceBucket: progressPayload.confidenceBucket
+          ? String(progressPayload.confidenceBucket).toUpperCase()
+          : undefined,
+        spendEstimateBucket: progressPayload.spendEstimateBucket
+          ? toAgentRunGraphQLEnum(String(progressPayload.spendEstimateBucket))
+          : undefined,
+      })
+    : undefined;
+
+  return stripUndefinedValues({
+    eventId: input.eventId ?? randomUUID(),
+    schemaVersion: input.schemaVersion ?? 1,
+    occurredAt: input.occurredAt ?? new Date().toISOString(),
+    ...input,
+    privacyMode: "METADATA_ONLY",
+    progressPayload: serializedProgress,
+  });
 }
 
 async function submitProposalCompat(
@@ -791,6 +1217,17 @@ export const __internal = {
   isPotentiallyMutatingBashCommand,
   isReadonlyBashCommand,
   buildHeadsDownCompaction,
+  buildStartedEventInput,
+  buildProgressEventInput,
+  buildScopeDriftEventInput,
+  buildContinuationSavedEventInput,
+  buildResumedEventInput,
+  buildQueuedForMorningEventInput,
+  buildTerminalEventInput,
+  buildSteeringOutcomeEventInput,
+  serializeAgentRunEventForGraphQL,
+  mapTaskOutcomeToAgentRunOutcome,
+  runIdForProposal,
   CONTINUATION_PATH,
 };
 
@@ -801,6 +1238,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let cachedClient: HeadsDownClient | null = null;
   let lastApprovedProposalId: string | null = null;
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
+  const runTelemetry = new Map<string, PiRunTelemetry>();
 
   function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
@@ -886,6 +1324,72 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   function persistScope(snapshot: ProposalScopeSnapshot) {
     pi.appendEntry<ProposalScopeSnapshot>("headsdown-scope", snapshot);
+  }
+
+  function getTelemetryForProposal(proposal: ProposalRecord): PiRunTelemetry {
+    const existing = runTelemetry.get(proposal.id);
+    if (existing) return existing;
+
+    const telemetry: PiRunTelemetry = {
+      runId: runIdForProposal(proposal.id),
+      proposalId: proposal.id,
+      startedAt: new Date(proposal.evaluatedAt).getTime() || Date.now(),
+      sequence: 1,
+      toolCallsCount: 0,
+      toolReadCount: 0,
+      toolWriteCount: 0,
+      toolExternalCount: 0,
+      failureCount: 0,
+      retryCount: 0,
+      redirectCount: 0,
+      filesRead: new Set(),
+      filesModified: new Set(getScopeSnapshot(proposal.id).modifiedFiles),
+      startedReported: false,
+      scopeDriftReported: false,
+      completedReported: false,
+    };
+    runTelemetry.set(proposal.id, telemetry);
+    return telemetry;
+  }
+
+  async function reportPiAgentRunEvent(_ctx: ExtensionContext, input: Record<string, unknown>) {
+    try {
+      const client = await getClient();
+      if (!client) return;
+      const eventClient = client as unknown as {
+        reportAgentRunEvent?: (input: Record<string, unknown>) => Promise<unknown>;
+      };
+      if (typeof eventClient.reportAgentRunEvent === "function") {
+        await eventClient.reportAgentRunEvent(input);
+        return;
+      }
+
+      const graphql = getLowLevelGraphQLClient(client);
+      if (!graphql) return;
+      await graphql.request(REPORT_AGENT_RUN_EVENT_MUTATION, {
+        input: serializeAgentRunEventForGraphQL(input),
+      });
+    } catch {
+      // Event telemetry must never interrupt the agent run.
+    }
+  }
+
+  async function reportStartedIfNeeded(ctx: ExtensionContext, proposal: ProposalRecord) {
+    const telemetry = getTelemetryForProposal(proposal);
+    if (telemetry.startedReported) return;
+    telemetry.startedReported = true;
+    telemetry.sequence += 1;
+    await reportPiAgentRunEvent(ctx, buildStartedEventInput(proposal));
+  }
+
+  async function reportProgress(ctx: ExtensionContext, proposal: ProposalRecord) {
+    const telemetry = getTelemetryForProposal(proposal);
+    telemetry.sequence += 1;
+    const scope = getScopeSnapshot(proposal.id);
+    await reportPiAgentRunEvent(
+      ctx,
+      buildProgressEventInput(telemetry, scope.warningSent || telemetry.scopeDriftReported),
+    );
   }
 
   async function loadConfig(): Promise<HeadsDownConfig> {
@@ -1355,12 +1859,18 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     };
   }
 
-  async function saveAutomaticContinuation(reason: string) {
+  async function saveAutomaticContinuation(reason: string, ctx?: ExtensionContext) {
     const artifact = await createContinuationArtifact(reason);
     if (!artifact) return;
 
     try {
       await saveContinuationArtifact(artifact);
+      const proposal = getLatestApprovedProposal();
+      if (ctx && proposal) {
+        const telemetry = getTelemetryForProposal(proposal);
+        telemetry.sequence += 1;
+        await reportPiAgentRunEvent(ctx, buildContinuationSavedEventInput(telemetry, artifact));
+      }
     } catch {
       // Ignore persistence failures for automatic lifecycle saves.
     }
@@ -1415,7 +1925,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return policyLines.join("\n");
   }
 
-  function maybeWarnScopeDrift(
+  async function maybeWarnScopeDrift(
     ctx: ExtensionContext,
     activeProposal: ProposalRecord,
     scope: ProposalScopeSnapshot,
@@ -1454,6 +1964,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       },
       { deliverAs: "steer" },
     );
+
+    const telemetry = getTelemetryForProposal(activeProposal);
+    if (!telemetry.scopeDriftReported) {
+      telemetry.scopeDriftReported = true;
+      telemetry.sequence += 1;
+      await reportPiAgentRunEvent(
+        ctx,
+        buildScopeDriftEventInput(telemetry, activeProposal.estimatedFiles),
+      );
+    }
   }
 
   // === Session events ===
@@ -1494,7 +2014,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (!hasApprovedProposal()) return undefined;
 
     appendContinuityEntry("before_switch", { switchReason: event.reason });
-    await saveAutomaticContinuation("session-switch");
+    await saveAutomaticContinuation("session-switch", ctx);
 
     if (ctx.hasUI) {
       ctx.ui.notify("[HeadsDown] Saved continuation snapshot before session switch.", "info");
@@ -1541,7 +2061,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     const shutdownReason = (event as { reason?: string }).reason;
     appendContinuityEntry("shutdown", { shutdownReason });
-    await saveAutomaticContinuation("session-shutdown");
+    await saveAutomaticContinuation("session-shutdown", ctx);
 
     const latest = getLatestApprovedProposal();
     if (!latest || latest.reportedAt) return;
@@ -1559,6 +2079,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     await refreshAvailability(ctx);
     await updateStatusUI(ctx);
 
+    const activeProposal = getLatestApprovedProposal();
+    if (activeProposal) {
+      await reportStartedIfNeeded(ctx, activeProposal);
+    }
+
     const policyInstruction = policyInstructionForPrompt();
     if (!policyInstruction) return undefined;
 
@@ -1570,6 +2095,21 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   // === Tool call interception ===
 
   pi.on("tool_call", async (event, ctx) => {
+    const activeProposal = getLatestApprovedProposal();
+    if (activeProposal) {
+      const telemetry = getTelemetryForProposal(activeProposal);
+      telemetry.toolCallsCount += 1;
+      if (event.toolName === "read") {
+        telemetry.toolReadCount += 1;
+        const readPath = normalizeToolPath((event.input as { path?: string }).path);
+        if (readPath) telemetry.filesRead.add(readPath);
+      } else if (event.toolName === "write" || event.toolName === "edit") {
+        telemetry.toolWriteCount += 1;
+      } else if (event.toolName === "bash") {
+        telemetry.toolExternalCount += 1;
+      }
+    }
+
     let mutating = false;
     let filePath = "";
     let command = "";
@@ -1622,6 +2162,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   // Track realized scope from successful tool results.
   pi.on("tool_result", async (event, ctx) => {
+    const activeProposalForTelemetry = getLatestApprovedProposal();
+    if (activeProposalForTelemetry) {
+      const telemetry = getTelemetryForProposal(activeProposalForTelemetry);
+      if (event.isError) {
+        telemetry.failureCount += 1;
+      }
+    }
+
     if (event.isError) return undefined;
 
     if (event.toolName !== "write" && event.toolName !== "edit") {
@@ -1642,7 +2190,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     persistScope(scope);
     await updateStatusUI(ctx);
-    maybeWarnScopeDrift(ctx, activeProposal, scope);
+    const telemetry = getTelemetryForProposal(activeProposal);
+    telemetry.filesModified.add(path);
+
+    await maybeWarnScopeDrift(ctx, activeProposal, scope);
+    await reportProgress(ctx, activeProposal);
 
     return undefined;
   });
@@ -1895,6 +2447,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         };
         proposalScopes.set(verdict.proposalId, scope);
         persistScope(scope);
+        await reportStartedIfNeeded(_ctx, proposalRecord);
+      } else {
+        const snapshot = await refreshAvailability(_ctx, { force: true });
+        const nextWindowStartsAt = snapshot?.schedule?.nextTransitionAt ?? null;
+        if (nextWindowStartsAt) {
+          await reportPiAgentRunEvent(
+            _ctx,
+            buildQueuedForMorningEventInput(proposalRecord, nextWindowStartsAt),
+          );
+        }
       }
 
       await updateStatusUI(_ctx);
@@ -2307,6 +2869,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       if (params.action === "load") {
         const artifact = await loadContinuationArtifact(true);
+        if (artifact) {
+          const eventInput = buildResumedEventInput(artifact);
+          if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
+        }
         return {
           content: [
             {
@@ -2349,6 +2915,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       };
 
       await saveContinuationArtifact(artifact);
+      if (activeProposal) {
+        const telemetry = getTelemetryForProposal(activeProposal);
+        telemetry.sequence += 1;
+        await reportPiAgentRunEvent(_ctx, buildContinuationSavedEventInput(telemetry, artifact));
+      }
 
       return {
         content: [
@@ -2441,6 +3012,34 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           errorCategory: params.error_category,
           testsPassed: params.tests_passed,
         });
+
+        const proposal = approvedProposals.find((entry) => entry.id === lastApprovedProposalId);
+        if (proposal) {
+          const telemetry = getTelemetryForProposal(proposal);
+          telemetry.sequence += 1;
+          if (!telemetry.completedReported) {
+            await reportPiAgentRunEvent(
+              _ctx,
+              buildTerminalEventInput(
+                telemetry,
+                params.outcome,
+                params.error_category,
+                params.tests_passed,
+              ),
+            );
+            telemetry.completedReported = true;
+          }
+          telemetry.sequence += 1;
+          await reportPiAgentRunEvent(
+            _ctx,
+            buildSteeringOutcomeEventInput(
+              telemetry,
+              params.outcome,
+              params.error_category,
+              params.tests_passed,
+            ),
+          );
+        }
 
         approvedProposals = approvedProposals.map((proposal) =>
           proposal.id === lastApprovedProposalId
