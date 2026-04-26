@@ -234,3 +234,299 @@ describe("availability override compatibility", () => {
     expect(calls[2]!.variables).toEqual({ id: "ovr-2", reason: "done", source: "pi" });
   });
 });
+
+describe("agent control off-clock queue flow", () => {
+  it("selects off-the-clock queue_for_morning run candidates and builds queue handoff artifact", () => {
+    const selected = __internal.pickQueueForMorningRun([
+      {
+        runId: "run-not-off-clock",
+        callKey: "needs_your_yes",
+        actionState: "awaiting_action",
+        allowedActionKeys: ["queue_for_morning", "keep_queued"],
+        safeTitle: "Different call",
+        clientLabel: "Pi",
+        resumeEligibleAt: null,
+        nextWorkWindowStartsAt: null,
+        handoffAvailable: false,
+        handoffState: "missing",
+      },
+      {
+        runId: "run-1",
+        callKey: "off_the_clock",
+        actionState: "queued",
+        allowedActionKeys: ["keep_queued"],
+        safeTitle: "Old run",
+        clientLabel: "Pi",
+        resumeEligibleAt: null,
+        nextWorkWindowStartsAt: null,
+        handoffAvailable: false,
+        handoffState: "missing",
+      },
+      {
+        runId: "run-2",
+        callKey: "off_the_clock",
+        actionState: "awaiting_action",
+        allowedActionKeys: ["queue_for_morning", "keep_queued"],
+        safeTitle: "Bug fix",
+        clientLabel: "Pi",
+        resumeEligibleAt: null,
+        nextWorkWindowStartsAt: "2026-04-27T15:00:00Z",
+        handoffAvailable: false,
+        handoffState: "missing",
+      },
+    ]);
+
+    expect(selected?.runId).toBe("run-2");
+
+    const artifact = __internal.buildQueuedForMorningContinuationArtifact(selected!, "main");
+    expect(artifact.reason).toBe("queue-for-morning");
+    expect(artifact.completedSteps).toContain("Queued for morning.");
+    expect(artifact.resumeInstruction).toBe("Ready to resume. Resume approved work.");
+    expect(artifact.wrapUpInstruction).toContain("Your night stays yours");
+  });
+
+  it("normalizes uppercase enum payloads before queue and resume comparisons", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      headsdownCall: {
+        key: "OFF_THE_CLOCK",
+        title: "Off the clock",
+        body: "Body",
+        recommendedActionKey: "QUEUE_FOR_MORNING",
+        allowedActionKeys: ["QUEUE_FOR_MORNING", "KEEP_QUEUED"],
+        reasonCodes: ["OFF_CLOCK"],
+      },
+      runSummaries: [
+        {
+          runId: "run-upper",
+          callKey: "OFF_THE_CLOCK",
+          actionState: "READY_TO_RESUME",
+          allowedActionKeys: ["QUEUE_FOR_MORNING", "KEEP_QUEUED", "RESUME_RUN"],
+          safeTitle: "Nightly ask",
+          clientLabel: "Pi",
+          resumeEligibleAt: "2026-04-27T15:00:00Z",
+          nextWorkWindowStartsAt: "2026-04-27T15:00:00Z",
+          handoffAvailable: true,
+          handoffState: "SAVED",
+        },
+      ],
+    });
+
+    expect(normalized?.headsdownCall?.key).toBe("off_the_clock");
+    expect(normalized?.headsdownCall?.recommendedActionKey).toBe("queue_for_morning");
+    expect(normalized?.headsdownCall?.allowedActionKeys).toEqual([
+      "queue_for_morning",
+      "keep_queued",
+    ]);
+
+    const run = normalized?.runSummaries[0];
+    expect(run?.actionState).toBe("ready_to_resume");
+    expect(run?.allowedActionKeys).toContain("resume_run");
+    expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
+    expect(__internal.isAlreadyQueuedForMorning(run as any)).toBe(true);
+  });
+
+  it("preserves native SDK method receivers for agent-control compat calls", async () => {
+    const client = {
+      async getAgentControlOverview() {
+        expect(this).toBe(client);
+        return {
+          headsdownCall: { key: "READY_TO_RESUME" },
+          runSummaries: [],
+        };
+      },
+      async applyHeadsDownAction(input: Record<string, unknown>) {
+        expect(this).toBe(client);
+        expect(input).toEqual({ runId: "run-native", actionKey: "resume_run" });
+        return {
+          ok: true,
+          runSummary: {
+            runId: "run-native",
+            callKey: "READY_TO_RESUME",
+            actionState: "READY_TO_RESUME",
+            allowedActionKeys: ["RESUME_RUN"],
+            handoffAvailable: true,
+            handoffState: "SAVED",
+          },
+        };
+      },
+    };
+
+    const overview = await __internal.getAgentControlOverviewCompat(client as any);
+    expect(overview?.headsdownCall?.key).toBe("ready_to_resume");
+
+    const result = await __internal.applyHeadsDownActionCompat(client as any, {
+      runId: "run-native",
+      actionKey: "resume_run",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
+  });
+
+  it("does not auto-queue queue_for_morning on non-off-clock runs", () => {
+    const run = {
+      runId: "run-needs-yes",
+      callKey: "needs_your_yes",
+      actionState: "awaiting_action",
+      allowedActionKeys: ["queue_for_morning", "keep_queued"],
+      safeTitle: "Needs yes",
+      clientLabel: "Pi",
+      resumeEligibleAt: null,
+      nextWorkWindowStartsAt: null,
+      handoffAvailable: false,
+      handoffState: "missing",
+    };
+
+    expect(__internal.pickQueueForMorningRun([run as any])).toBeNull();
+    expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
+  });
+
+  it("skips auto queue side effects when run is already queued or handoff is saved", () => {
+    const alreadyQueued = {
+      runId: "run-queued",
+      callKey: "off_the_clock",
+      actionState: "queued_for_morning",
+      allowedActionKeys: ["queue_for_morning", "keep_queued"],
+      safeTitle: "Queued run",
+      clientLabel: "Pi",
+      resumeEligibleAt: null,
+      nextWorkWindowStartsAt: null,
+      handoffAvailable: true,
+      handoffState: "saved",
+    };
+
+    const queuedRunIds = new Set<string>(["run-memoized"]);
+
+    expect(__internal.isAlreadyQueuedForMorning(alreadyQueued as any)).toBe(true);
+    expect(__internal.shouldAutoQueueForMorning(alreadyQueued as any, new Set<string>())).toBe(
+      false,
+    );
+
+    const memoizedRun = {
+      ...alreadyQueued,
+      runId: "run-memoized",
+      actionState: "awaiting_action",
+      handoffAvailable: false,
+      handoffState: "missing",
+    };
+
+    expect(__internal.shouldAutoQueueForMorning(memoizedRun as any, queuedRunIds)).toBe(false);
+  });
+
+  it("saves continuation before reporting saved handoff to the backend", async () => {
+    const actionCalls: Array<Record<string, unknown>> = [];
+    const client = {
+      graphql: {
+        async request(query: string, variables?: Record<string, unknown>) {
+          if (query.includes("mutation ApplyHeadsDownActionForPi")) {
+            actionCalls.push({ query, variables });
+            return {
+              applyHeadsdownAction: {
+                ok: true,
+                runSummary: {
+                  runId: "run-queue",
+                  callKey: "ready_to_resume",
+                  actionState: "queued_for_morning",
+                  allowedActionKeys: ["resume_run", "keep_queued"],
+                  safeTitle: "Nightly ask",
+                  clientLabel: "Pi",
+                  resumeEligibleAt: "2026-04-27T15:00:00Z",
+                  nextWorkWindowStartsAt: "2026-04-27T15:00:00Z",
+                  handoffAvailable: true,
+                  handoffState: "saved",
+                },
+              },
+            };
+          }
+
+          throw new Error(`unexpected query: ${query}`);
+        },
+      },
+    };
+
+    const savedArtifacts: Array<Record<string, unknown>> = [];
+    const result = await __internal.queueForMorningWithHandoff({
+      actorClient: client as any,
+      runSummary: {
+        runId: "run-queue",
+        callKey: "off_the_clock",
+        actionState: "awaiting_action",
+        allowedActionKeys: ["queue_for_morning", "keep_queued"],
+        safeTitle: "Nightly ask",
+        clientLabel: "Pi",
+        resumeEligibleAt: null,
+        nextWorkWindowStartsAt: "2026-04-27T15:00:00Z",
+        handoffAvailable: false,
+        handoffState: "missing",
+      },
+      branch: "feature/off-clock",
+      saveContinuation: async (artifact: any) => {
+        savedArtifacts.push(artifact);
+      },
+    });
+
+    expect(result.queued).toBe(true);
+    expect(result.handoffSaved).toBe(true);
+    expect(result.message).toContain("Queued for morning");
+    expect(actionCalls).toHaveLength(1);
+    expect(actionCalls[0]!.variables).toEqual({
+      input: {
+        runId: "run-queue",
+        actionKey: "queue_for_morning",
+        reason: "Off the clock. Queued for morning. Your night stays yours.",
+        source: "pi",
+        client: "pi",
+        nextWorkWindowStartsAt: "2026-04-27T15:00:00Z",
+        handoffAvailable: true,
+        handoffState: "SAVED",
+        handoffSource: "pi",
+        handoffKind: "continuation",
+        handoffCapturedAt: expect.any(String),
+      },
+    });
+    expect(savedArtifacts).toHaveLength(1);
+    expect(savedArtifacts[0]!.resumeInstruction).toBe("Ready to resume. Resume approved work.");
+  });
+
+  it("serializes GraphQL enum inputs with backend-compatible casing", () => {
+    expect(__internal.toGraphQLEnumValue("saved")).toBe("SAVED");
+    expect(__internal.toGraphQLEnumValue("READY_TO_RESUME")).toBe("READY_TO_RESUME");
+    expect(__internal.toGraphQLEnumValue("readyToResume")).toBe("READY_TO_RESUME");
+    expect(__internal.toGraphQLEnumValue(null)).toBeUndefined();
+  });
+
+  it("does not report a saved handoff if continuation persistence fails", async () => {
+    const actionCalls: Array<Record<string, unknown>> = [];
+    const client = {
+      graphql: {
+        async request(query: string, variables?: Record<string, unknown>) {
+          actionCalls.push({ query, variables });
+          return { applyHeadsdownAction: { ok: true, runSummary: null } };
+        },
+      },
+    };
+
+    await expect(
+      __internal.queueForMorningWithHandoff({
+        actorClient: client as any,
+        runSummary: {
+          runId: "run-queue",
+          callKey: "off_the_clock",
+          actionState: "awaiting_action",
+          allowedActionKeys: ["queue_for_morning", "keep_queued"],
+          safeTitle: "Nightly ask",
+          clientLabel: "Pi",
+          resumeEligibleAt: null,
+          nextWorkWindowStartsAt: null,
+          handoffAvailable: false,
+          handoffState: "missing",
+        },
+        branch: "feature/off-clock",
+        saveContinuation: async () => {
+          throw new Error("disk full");
+        },
+      }),
+    ).rejects.toThrow("disk full");
+
+    expect(actionCalls).toHaveLength(0);
+  });
+});
