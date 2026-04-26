@@ -10,6 +10,7 @@ When installed, Pi will:
 5. **Preserve continuity** across compaction, tree navigation, and session shutdown/switch
 6. **Support resumable work** with continuation artifacts and digest triage for missed updates
 7. **Contain rabbit holes** by pausing/summarizing detected drift and allowing explicit duration overrides when approved
+8. **Optionally tune pi thinking level** before each turn with a configurable HeadsDown-aware auto-thinking policy
 
 ## Install
 
@@ -67,6 +68,14 @@ During approved runs, Pi reports privacy-safe progress metadata (counts, buckets
 
 Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing.
 
+### Auto-Thinking Policy
+
+Auto-thinking is an optional policy that lets the extension choose a pi thinking level before each agent turn. It uses the current prompt, active HeadsDown availability context, and approved proposal state that the extension already has locally. It does not make extra telemetry calls.
+
+The feature is off by default. When enabled, it can raise thinking for complex implementation, debugging, design, busy, unavailable, or full-depth contexts. By default it does not aggressively lower a higher current thinking level, and it preserves manual user changes after the extension has applied an automatic level.
+
+When `showStatus` is enabled, the footer shows the current automatic decision, for example `thinking:auto high` or `thinking:manual medium`.
+
 ### Continuity Hooks
 
 The extension records HeadsDown continuity snapshots on:
@@ -110,7 +119,14 @@ The package also registers `/headsdown` for quick status checks.
 ```json
 {
   "trustLevel": "advisory",
-  "sensitivePaths": [".env*", ".ssh/*", "package.json", "Dockerfile*", ".github/**"]
+  "sensitivePaths": [".env*", ".ssh/*", "package.json", "Dockerfile*", ".github/**"],
+  "autoThinking": {
+    "enabled": false,
+    "maxLevel": "high",
+    "respectManualChanges": true,
+    "showStatus": true,
+    "allowDowngrade": false
+  }
 }
 ```
 
@@ -118,12 +134,17 @@ The package also registers `/headsdown` for quick status checks.
 |---------|---------|-------------|
 | `trustLevel` | `"advisory"` | `advisory`, `active`, or `guarded` |
 | `sensitivePaths` | built-in defaults + config | Glob patterns that always warn |
+| `autoThinking.enabled` | `false` | Enables HeadsDown-aware automatic pi thinking-level selection before each turn |
+| `autoThinking.maxLevel` | `"high"` | Caps the automatic selection to control cost and latency; valid values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh` |
+| `autoThinking.respectManualChanges` | `true` | Preserves a later manual thinking-level change instead of immediately overriding it |
+| `autoThinking.showStatus` | `true` | Shows the automatic or preserved manual thinking decision in the pi status footer |
+| `autoThinking.allowDowngrade` | `false` | Allows the policy to lower the current thinking level when the task looks simpler |
 
 ## Data Transparency
 
 This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). Requests go only to HeadsDown APIs.
 
-**Sent:** task descriptions and estimates (for proposals), auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`).
+**Sent:** task descriptions and estimates (for proposals), auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`). Auto-thinking does not send additional data.
 
 **Received:** availability state, schedule context, verdicts, digest summaries.
 

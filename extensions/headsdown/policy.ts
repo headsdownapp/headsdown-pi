@@ -33,6 +33,179 @@ function isScheduleContext(context: AvailabilityContext): context is ScheduleCon
   return Boolean(context && typeof context === "object" && "inReachableHours" in context);
 }
 
+// === Auto-Thinking Policy ===
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface AutoThinkingConfig {
+  enabled: boolean;
+  maxLevel: ThinkingLevel;
+  respectManualChanges: boolean;
+  showStatus: boolean;
+  allowDowngrade: boolean;
+}
+
+export interface AutoThinkingContext {
+  prompt: string;
+  currentLevel: ThinkingLevel;
+  lastAutoLevel?: ThinkingLevel | null;
+  config: AutoThinkingConfig;
+  mode?: string | null;
+  inReachableHours?: boolean | null;
+  wrapUpSelectedMode?: "auto" | "wrap_up" | "full_depth" | string | null;
+  hasActiveProposal?: boolean;
+}
+
+export interface AutoThinkingDecision {
+  level: ThinkingLevel | null;
+  reason: string;
+  status: string | null;
+}
+
+export const DEFAULT_AUTO_THINKING_CONFIG: AutoThinkingConfig = {
+  enabled: false,
+  maxLevel: "high",
+  respectManualChanges: true,
+  showStatus: true,
+  allowDowngrade: false,
+};
+
+const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
+}
+
+function rankThinkingLevel(level: ThinkingLevel): number {
+  return THINKING_LEVELS.indexOf(level);
+}
+
+function maxThinkingLevel(left: ThinkingLevel, right: ThinkingLevel): ThinkingLevel {
+  return rankThinkingLevel(left) >= rankThinkingLevel(right) ? left : right;
+}
+
+function minThinkingLevel(left: ThinkingLevel, right: ThinkingLevel): ThinkingLevel {
+  return rankThinkingLevel(left) <= rankThinkingLevel(right) ? left : right;
+}
+
+export function normalizeAutoThinkingConfig(value: unknown): AutoThinkingConfig {
+  if (!value || typeof value !== "object") return { ...DEFAULT_AUTO_THINKING_CONFIG };
+
+  const raw = value as Record<string, unknown>;
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_AUTO_THINKING_CONFIG.enabled,
+    maxLevel: isThinkingLevel(raw.maxLevel) ? raw.maxLevel : DEFAULT_AUTO_THINKING_CONFIG.maxLevel,
+    respectManualChanges:
+      typeof raw.respectManualChanges === "boolean"
+        ? raw.respectManualChanges
+        : DEFAULT_AUTO_THINKING_CONFIG.respectManualChanges,
+    showStatus:
+      typeof raw.showStatus === "boolean"
+        ? raw.showStatus
+        : DEFAULT_AUTO_THINKING_CONFIG.showStatus,
+    allowDowngrade:
+      typeof raw.allowDowngrade === "boolean"
+        ? raw.allowDowngrade
+        : DEFAULT_AUTO_THINKING_CONFIG.allowDowngrade,
+  };
+}
+
+function classifyPromptForThinking(prompt: string): ThinkingLevel {
+  const normalized = prompt.toLowerCase();
+
+  if (
+    /\b(architecture|design|refactor|migration|security|performance|concurrency|race condition|deadlock|debug|investigate|root cause|incident|flaky|failing test|test failure)\b/.test(
+      normalized,
+    )
+  ) {
+    return "high";
+  }
+
+  if (
+    /\b(implement|build|fix|add|update|write tests?|integration|api|database|multi-file)\b/.test(
+      normalized,
+    )
+  ) {
+    return "medium";
+  }
+
+  if (/\b(explain|summarize|review|rename|format|docs?|quick)\b/.test(normalized)) {
+    return "low";
+  }
+
+  return normalized.trim().length < 120 ? "minimal" : "medium";
+}
+
+function availabilityFloor(input: AutoThinkingContext): ThinkingLevel {
+  let floor: ThinkingLevel = "off";
+  const mode = input.mode?.toLowerCase();
+
+  if (mode === "offline" || input.inReachableHours === false) {
+    floor = maxThinkingLevel(floor, "high");
+  } else if (mode === "busy") {
+    floor = maxThinkingLevel(floor, "high");
+  } else if (mode === "limited") {
+    floor = maxThinkingLevel(floor, "medium");
+  }
+
+  if (input.hasActiveProposal) {
+    floor = maxThinkingLevel(floor, "medium");
+  }
+
+  if (input.wrapUpSelectedMode === "full_depth") {
+    floor = maxThinkingLevel(floor, "high");
+  }
+
+  return floor;
+}
+
+export function decideAutoThinking(input: AutoThinkingContext): AutoThinkingDecision {
+  const config = input.config;
+
+  if (!config.enabled) {
+    return { level: null, reason: "disabled", status: null };
+  }
+
+  const manualChangeDetected =
+    config.respectManualChanges &&
+    input.lastAutoLevel !== null &&
+    input.lastAutoLevel !== undefined &&
+    input.currentLevel !== input.lastAutoLevel;
+
+  if (manualChangeDetected) {
+    return {
+      level: null,
+      reason: "manual_preserved",
+      status: config.showStatus ? `thinking:manual ${input.currentLevel}` : null,
+    };
+  }
+
+  let target = maxThinkingLevel(classifyPromptForThinking(input.prompt), availabilityFloor(input));
+  target = minThinkingLevel(target, config.maxLevel);
+
+  if (!config.allowDowngrade && rankThinkingLevel(target) < rankThinkingLevel(input.currentLevel)) {
+    return {
+      level: null,
+      reason: "downgrade_skipped",
+      status: config.showStatus ? `thinking:auto ${input.currentLevel}` : null,
+    };
+  }
+
+  if (target === input.currentLevel) {
+    return {
+      level: null,
+      reason: "already_selected",
+      status: config.showStatus ? `thinking:auto ${target}` : null,
+    };
+  }
+
+  return {
+    level: target,
+    reason: "auto_selected",
+    status: config.showStatus ? `thinking:auto ${target}` : null,
+  };
+}
+
 // === Trust Policy ===
 
 export interface PolicyDecision {

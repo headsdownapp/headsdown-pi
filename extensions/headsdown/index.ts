@@ -38,9 +38,13 @@ import type {
 } from "@headsdown/sdk";
 import {
   applyTrustPolicy,
+  decideAutoThinking,
   formatSummary,
   formatWrapUpInstruction,
   isSensitivePath,
+  normalizeAutoThinkingConfig,
+  type AutoThinkingConfig,
+  type ThinkingLevel,
 } from "./policy.js";
 import {
   formatHeadsDownCallForPrompt,
@@ -242,6 +246,10 @@ interface HeadsDownCompactionInput {
   scope: ProposalScopeSnapshot | null;
   firstKeptEntryId: string;
   tokensBefore: number;
+}
+
+interface HeadsDownPiConfig extends HeadsDownConfig {
+  autoThinking: AutoThinkingConfig;
 }
 
 const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
@@ -1773,9 +1781,10 @@ export const __internal = {
 export default function headsdownExtension(pi: ExtensionAPI) {
   let approvedProposals: ProposalRecord[] = [];
   let proposalScopes = new Map<string, ProposalScopeSnapshot>();
-  let cachedConfig: HeadsDownConfig | null = null;
+  let cachedConfig: HeadsDownPiConfig | null = null;
   let cachedClient: HeadsDownClient | null = null;
   let lastApprovedProposalId: string | null = null;
+  let lastAutoThinkingLevel: ThinkingLevel | null = null;
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
@@ -2128,10 +2137,26 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     await maybeHandleRabbitHoleDetected(ctx, proposal);
   }
 
-  async function loadConfig(): Promise<HeadsDownConfig> {
+  async function loadConfig(): Promise<HeadsDownPiConfig> {
     if (!cachedConfig) {
       const store = new ConfigStore();
-      cachedConfig = await store.load();
+      const baseConfig = await store.load();
+      let rawAutoThinking: unknown;
+
+      try {
+        const rawConfig = JSON.parse(await readFile(store.filePath, "utf-8")) as Record<
+          string,
+          unknown
+        >;
+        rawAutoThinking = rawConfig.autoThinking;
+      } catch {
+        rawAutoThinking = undefined;
+      }
+
+      cachedConfig = {
+        ...baseConfig,
+        autoThinking: normalizeAutoThinkingConfig(rawAutoThinking),
+      };
     }
     return cachedConfig;
   }
@@ -2634,6 +2659,53 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     });
   }
 
+  function maybeUpdateAutoThinkingStatus(ctx: ExtensionContext, status: string | null) {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus("headsdown-auto-thinking", status ?? undefined);
+  }
+
+  async function applyAutoThinkingForTurn(ctx: ExtensionContext, prompt: string) {
+    const config = await loadConfig();
+    const autoThinking = config.autoThinking;
+
+    if (!autoThinking.enabled) {
+      maybeUpdateAutoThinkingStatus(ctx, null);
+      return;
+    }
+
+    const schedule = availabilitySnapshot?.schedule as
+      | {
+          inReachableHours?: boolean | null;
+          wrapUpGuidance?: { selectedMode?: string | null } | null;
+        }
+      | null
+      | undefined;
+    const currentLevel = pi.getThinkingLevel() as ThinkingLevel;
+    const decision = decideAutoThinking({
+      prompt,
+      currentLevel,
+      lastAutoLevel: lastAutoThinkingLevel,
+      config: autoThinking,
+      mode: availabilitySnapshot?.contract?.mode ?? null,
+      inReachableHours: schedule?.inReachableHours ?? null,
+      wrapUpSelectedMode: schedule?.wrapUpGuidance?.selectedMode ?? null,
+      hasActiveProposal: hasApprovedProposal(),
+    });
+
+    let status = decision.status;
+
+    if (decision.level) {
+      pi.setThinkingLevel(decision.level);
+      const effectiveLevel = pi.getThinkingLevel() as ThinkingLevel;
+      lastAutoThinkingLevel = effectiveLevel;
+      status = autoThinking.showStatus ? `thinking:auto ${effectiveLevel}` : null;
+    } else if (decision.reason === "already_selected" || decision.reason === "downgrade_skipped") {
+      lastAutoThinkingLevel = currentLevel;
+    }
+
+    maybeUpdateAutoThinkingStatus(ctx, autoThinking.showStatus ? status : null);
+  }
+
   function policyInstructionForPrompt(): string | null {
     if (!availabilitySnapshot) return null;
 
@@ -2815,6 +2887,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     await refreshAvailability(ctx);
     await updateStatusUI(ctx);
+    await applyAutoThinkingForTurn(ctx, event.prompt);
 
     const activeProposal = getLatestApprovedProposal();
     if (activeProposal) {

@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   applyTrustPolicy,
+  decideAutoThinking,
   isSensitivePath,
   matchGlob,
   formatSummary,
   formatWrapUpInstruction,
+  normalizeAutoThinkingConfig,
+  type AutoThinkingConfig,
 } from "../extensions/headsdown/policy.js";
 import type { Contract } from "@headsdown/sdk";
 
@@ -169,6 +172,191 @@ describe("applyTrustPolicy", () => {
       expect(result).toBeTruthy();
       expect(result!.reason).toMatch(/^\[HeadsDown\]/);
     }
+  });
+});
+
+// === Auto-thinking policy ===
+
+describe("normalizeAutoThinkingConfig", () => {
+  it("defaults to disabled and conservative options", () => {
+    expect(normalizeAutoThinkingConfig(undefined)).toEqual({
+      enabled: false,
+      maxLevel: "high",
+      respectManualChanges: true,
+      showStatus: true,
+      allowDowngrade: false,
+    });
+  });
+
+  it("accepts valid user options", () => {
+    expect(
+      normalizeAutoThinkingConfig({
+        enabled: true,
+        maxLevel: "medium",
+        respectManualChanges: false,
+        showStatus: false,
+        allowDowngrade: true,
+      }),
+    ).toEqual({
+      enabled: true,
+      maxLevel: "medium",
+      respectManualChanges: false,
+      showStatus: false,
+      allowDowngrade: true,
+    });
+  });
+
+  it("falls back for invalid values without rejecting the whole config", () => {
+    expect(
+      normalizeAutoThinkingConfig({
+        enabled: true,
+        maxLevel: "expensive",
+        respectManualChanges: "yes",
+        showStatus: false,
+        allowDowngrade: "no",
+      }),
+    ).toEqual({
+      enabled: true,
+      maxLevel: "high",
+      respectManualChanges: true,
+      showStatus: false,
+      allowDowngrade: false,
+    });
+  });
+});
+
+describe("decideAutoThinking", () => {
+  const enabledConfig: AutoThinkingConfig = {
+    enabled: true,
+    maxLevel: "high",
+    respectManualChanges: true,
+    showStatus: true,
+    allowDowngrade: false,
+  };
+
+  it("returns no change when auto-thinking is disabled", () => {
+    const decision = decideAutoThinking({
+      prompt: "Debug this failure",
+      currentLevel: "minimal",
+      config: { ...enabledConfig, enabled: false },
+      mode: "offline",
+    });
+
+    expect(decision).toEqual({ level: null, reason: "disabled", status: null });
+  });
+
+  it.each([
+    ["quick explain this", "minimal", null, null, false, "low"],
+    ["Implement this API change", "minimal", null, null, false, "medium"],
+    ["Investigate this flaky concurrency failure", "minimal", null, null, false, "high"],
+    ["quick summary", "minimal", "busy", null, false, "high"],
+    ["quick summary", "minimal", "limited", null, false, "medium"],
+    ["quick summary", "minimal", "offline", null, false, "high"],
+    ["quick summary", "minimal", null, false, false, "high"],
+    ["quick summary", "minimal", null, true, true, "medium"],
+    ["quick summary", "minimal", null, true, false, "low"],
+  ])(
+    "selects %s with current=%s mode=%s reachable=%s proposal=%s",
+    (prompt, currentLevel, mode, inReachableHours, hasActiveProposal, expectedLevel) => {
+      const decision = decideAutoThinking({
+        prompt,
+        currentLevel: currentLevel as never,
+        config: enabledConfig,
+        mode,
+        inReachableHours,
+        hasActiveProposal,
+      });
+
+      expect(decision.level).toBe(expectedLevel);
+      expect(decision.status).toBe(`thinking:auto ${expectedLevel}`);
+    },
+  );
+
+  it("caps the selected level at maxLevel", () => {
+    const decision = decideAutoThinking({
+      prompt: "Investigate this flaky concurrency failure",
+      currentLevel: "minimal",
+      config: { ...enabledConfig, maxLevel: "medium" },
+    });
+
+    expect(decision.level).toBe("medium");
+    expect(decision.status).toBe("thinking:auto medium");
+  });
+
+  it("preserves a manual thinking change when configured", () => {
+    const decision = decideAutoThinking({
+      prompt: "Implement this API change",
+      currentLevel: "high",
+      lastAutoLevel: "low",
+      config: enabledConfig,
+    });
+
+    expect(decision).toEqual({
+      level: null,
+      reason: "manual_preserved",
+      status: "thinking:manual high",
+    });
+  });
+
+  it("overrides a manual thinking change when respectManualChanges is disabled", () => {
+    const decision = decideAutoThinking({
+      prompt: "Implement this API change",
+      currentLevel: "high",
+      lastAutoLevel: "low",
+      config: { ...enabledConfig, respectManualChanges: false, allowDowngrade: true },
+    });
+
+    expect(decision.level).toBe("medium");
+  });
+
+  it("does not downgrade by default", () => {
+    const decision = decideAutoThinking({
+      prompt: "quick summary",
+      currentLevel: "high",
+      config: enabledConfig,
+    });
+
+    expect(decision).toEqual({
+      level: null,
+      reason: "downgrade_skipped",
+      status: "thinking:auto high",
+    });
+  });
+
+  it("does not request a change when the selected level already matches", () => {
+    const decision = decideAutoThinking({
+      prompt: "Implement this API change",
+      currentLevel: "medium",
+      config: enabledConfig,
+    });
+
+    expect(decision).toEqual({
+      level: null,
+      reason: "already_selected",
+      status: "thinking:auto medium",
+    });
+  });
+
+  it("omits status feedback when showStatus is disabled", () => {
+    const decision = decideAutoThinking({
+      prompt: "Investigate this flaky concurrency failure",
+      currentLevel: "minimal",
+      config: { ...enabledConfig, showStatus: false },
+    });
+
+    expect(decision.level).toBe("high");
+    expect(decision.status).toBeNull();
+  });
+
+  it("uses full-depth wrap-up guidance as a high-thinking signal", () => {
+    const decision = decideAutoThinking({
+      prompt: "quick summary",
+      currentLevel: "minimal",
+      config: enabledConfig,
+      wrapUpSelectedMode: "full_depth",
+    });
+
+    expect(decision.level).toBe("high");
   });
 });
 
