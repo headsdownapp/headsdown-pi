@@ -48,6 +48,15 @@ describe("renderHeadsDownCallCopy", () => {
     expect(rendered.primaryActionKey).toBe("resume_run");
   });
 
+  it("renders off_the_clock with queue_for_morning and approved off-clock copy", () => {
+    const rendered = renderHeadsDownCallCopy({ key: "off_the_clock" });
+
+    expect(rendered.title).toBe("Off the clock");
+    expect(rendered.primaryLabel).toBe("Queued for morning");
+    expect(rendered.primaryActionKey).toBe("queue_for_morning");
+    expect(rendered.body).toContain("Your night stays yours");
+  });
+
   it("falls back to needs_your_yes for unknown action/risk/boundary signals", () => {
     const rendered = renderHeadsDownCallCopy({
       key: "future_call_key",

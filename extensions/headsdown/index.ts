@@ -37,6 +37,11 @@ import {
   formatWrapUpInstruction,
   isSensitivePath,
 } from "./policy.js";
+import {
+  formatHeadsDownCallForPrompt,
+  renderHeadsDownCallCopy,
+  type HeadsDownActionKey,
+} from "./call-renderer.js";
 
 // === State ===
 
@@ -126,6 +131,60 @@ interface AvailabilityOverride {
   cancelledById: string | null;
   insertedAt: string;
   updatedAt: string;
+}
+
+interface HeadsDownCallPayload {
+  key: string | null;
+  title: string | null;
+  body: string | null;
+  recommendedActionKey: string | null;
+  allowedActionKeys: string[];
+  reasonCodes: string[];
+}
+
+interface AgentRunSummaryPayload {
+  runId: string;
+  callKey: string | null;
+  actionState: string | null;
+  allowedActionKeys: string[];
+  safeTitle: string | null;
+  clientLabel: string | null;
+  resumeEligibleAt: string | null;
+  nextWorkWindowStartsAt: string | null;
+  handoffAvailable: boolean;
+  handoffState: string | null;
+}
+
+interface AgentControlOverviewPayload {
+  headsdownCall: HeadsDownCallPayload | null;
+  runSummaries: AgentRunSummaryPayload[];
+}
+
+interface ApplyHeadsDownActionInput {
+  runId: string;
+  actionKey: HeadsDownActionKey | string;
+  sourceState?: string;
+  reason?: string;
+  source?: string;
+  client?: string;
+  nextWorkWindowStartsAt?: string;
+  handoffAvailable?: boolean;
+  handoffState?: string;
+  handoffSource?: string;
+  handoffKind?: string;
+  handoffCapturedAt?: string;
+}
+
+interface ApplyHeadsDownActionPayload {
+  ok: boolean;
+  runSummary: AgentRunSummaryPayload | null;
+}
+
+interface QueueForMorningResult {
+  queued: boolean;
+  runId: string | null;
+  handoffSaved: boolean;
+  message: string;
 }
 
 interface ContinuationArtifact {
@@ -292,6 +351,53 @@ const CANCEL_AVAILABILITY_OVERRIDE_MUTATION = `
       cancelledById
       insertedAt
       updatedAt
+    }
+  }
+`;
+
+const AGENT_CONTROL_OVERVIEW_QUERY = `
+  query AgentControlOverviewForPi {
+    agentControlOverview {
+      headsdownCall {
+        key
+        title
+        body
+        recommendedActionKey
+        allowedActionKeys
+        reasonCodes
+      }
+      runSummaries {
+        runId
+        callKey
+        actionState
+        allowedActionKeys
+        safeTitle
+        clientLabel
+        resumeEligibleAt
+        nextWorkWindowStartsAt
+        handoffAvailable
+        handoffState
+      }
+    }
+  }
+`;
+
+const APPLY_HEADSDOWN_ACTION_MUTATION = `
+  mutation ApplyHeadsDownActionForPi($input: ApplyHeadsdownActionInput!) {
+    applyHeadsdownAction(input: $input) {
+      ok
+      runSummary {
+        runId
+        callKey
+        actionState
+        allowedActionKeys
+        safeTitle
+        clientLabel
+        resumeEligibleAt
+        nextWorkWindowStartsAt
+        handoffAvailable
+        handoffState
+      }
     }
   }
 `;
@@ -495,6 +601,295 @@ async function cancelAvailabilityOverrideCompat(
   }
 
   return override;
+}
+
+function toStringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeEnumKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const snakeCase = trimmed
+    .replace(/([a-z\d])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .replace(/__+/g, "_")
+    .toLowerCase();
+
+  return snakeCase.length > 0 ? snakeCase : null;
+}
+
+function normalizeCallKey(value: unknown): string | null {
+  return normalizeEnumKey(value);
+}
+
+function normalizeActionKey(value: unknown): string | null {
+  return normalizeEnumKey(value);
+}
+
+function normalizeRunState(value: unknown): string | null {
+  return normalizeEnumKey(value);
+}
+
+function toGraphQLEnumValue(value: unknown): string | undefined {
+  const normalized = normalizeEnumKey(value);
+  return normalized ? normalized.toUpperCase() : undefined;
+}
+
+function normalizeActionKeyList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => normalizeActionKey(item))
+    .filter((item): item is string => item !== null);
+}
+
+function normalizeHeadsDownCallPayload(value: unknown): HeadsDownCallPayload | null {
+  if (!value || typeof value !== "object") return null;
+
+  const payload = value as Record<string, unknown>;
+  return {
+    key: normalizeCallKey(payload.key),
+    title: toStringOrNull(payload.title),
+    body: toStringOrNull(payload.body),
+    recommendedActionKey: normalizeActionKey(payload.recommendedActionKey),
+    allowedActionKeys: normalizeActionKeyList(payload.allowedActionKeys),
+    reasonCodes: normalizeActionKeyList(payload.reasonCodes),
+  };
+}
+
+function normalizeRunSummaryPayload(value: unknown): AgentRunSummaryPayload | null {
+  if (!value || typeof value !== "object") return null;
+
+  const summary = value as Record<string, unknown>;
+  const runId = toStringOrNull(summary.runId);
+  if (!runId) return null;
+
+  return {
+    runId,
+    callKey: normalizeCallKey(summary.callKey),
+    actionState: normalizeRunState(summary.actionState),
+    allowedActionKeys: normalizeActionKeyList(summary.allowedActionKeys),
+    safeTitle: toStringOrNull(summary.safeTitle),
+    clientLabel: toStringOrNull(summary.clientLabel),
+    resumeEligibleAt: toStringOrNull(summary.resumeEligibleAt),
+    nextWorkWindowStartsAt: toStringOrNull(summary.nextWorkWindowStartsAt),
+    handoffAvailable: summary.handoffAvailable === true,
+    handoffState: normalizeRunState(summary.handoffState),
+  };
+}
+
+function normalizeAgentControlOverviewPayload(value: unknown): AgentControlOverviewPayload | null {
+  if (!value || typeof value !== "object") return null;
+
+  const payload = value as Record<string, unknown>;
+  const runSummaries = Array.isArray(payload.runSummaries)
+    ? payload.runSummaries
+        .map((item) => normalizeRunSummaryPayload(item))
+        .filter((item): item is AgentRunSummaryPayload => item !== null)
+    : [];
+
+  return {
+    headsdownCall: normalizeHeadsDownCallPayload(payload.headsdownCall),
+    runSummaries,
+  };
+}
+
+async function getAgentControlOverviewCompat(
+  client: HeadsDownClient,
+): Promise<AgentControlOverviewPayload | null> {
+  const nativeMethod = (
+    client as unknown as {
+      getAgentControlOverview?: () => Promise<unknown>;
+    }
+  ).getAgentControlOverview;
+
+  if (typeof nativeMethod === "function") {
+    const nativePayload = await nativeMethod.call(client);
+    return normalizeAgentControlOverviewPayload(nativePayload);
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    return null;
+  }
+
+  try {
+    const data = await graphql.request(AGENT_CONTROL_OVERVIEW_QUERY);
+    return normalizeAgentControlOverviewPayload(data.agentControlOverview);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("agentControlOverview") || message.includes("headsdownCall")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function applyHeadsDownActionCompat(
+  client: HeadsDownClient,
+  input: ApplyHeadsDownActionInput,
+): Promise<ApplyHeadsDownActionPayload> {
+  const nativeMethod = (
+    client as unknown as {
+      applyHeadsDownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+    }
+  ).applyHeadsDownAction;
+
+  if (typeof nativeMethod === "function") {
+    const result = (await nativeMethod.call(client, input)) as Record<string, unknown>;
+    return {
+      ok: result.ok === true,
+      runSummary: normalizeRunSummaryPayload(result.runSummary),
+    };
+  }
+
+  const fallbackNativeMethod = (
+    client as unknown as {
+      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+    }
+  ).applyHeadsdownAction;
+
+  if (typeof fallbackNativeMethod === "function") {
+    const result = (await fallbackNativeMethod.call(client, input)) as Record<string, unknown>;
+    return {
+      ok: result.ok === true,
+      runSummary: normalizeRunSummaryPayload(result.runSummary),
+    };
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    throw new Error("HeadsDown action APIs are unavailable in this @headsdown/sdk version.");
+  }
+
+  const payload = await graphql.request(APPLY_HEADSDOWN_ACTION_MUTATION, {
+    input: stripUndefinedValues({
+      runId: input.runId,
+      actionKey: input.actionKey,
+      sourceState: input.sourceState,
+      reason: input.reason,
+      source: input.source,
+      client: input.client,
+      nextWorkWindowStartsAt: input.nextWorkWindowStartsAt,
+      handoffAvailable: input.handoffAvailable,
+      handoffState: toGraphQLEnumValue(input.handoffState),
+      handoffSource: input.handoffSource,
+      handoffKind: input.handoffKind,
+      handoffCapturedAt: input.handoffCapturedAt,
+    }),
+  });
+
+  const result =
+    (payload.applyHeadsdownAction as Record<string, unknown> | null | undefined) ?? null;
+  if (!result) {
+    throw new Error("HeadsDown API returned no applyHeadsdownAction payload.");
+  }
+
+  return {
+    ok: result.ok === true,
+    runSummary: normalizeRunSummaryPayload(result.runSummary),
+  };
+}
+
+function pickQueueForMorningRun(
+  runSummaries: AgentRunSummaryPayload[],
+): AgentRunSummaryPayload | null {
+  const candidate = runSummaries.find(
+    (summary) =>
+      summary.callKey === "off_the_clock" &&
+      summary.allowedActionKeys.includes("queue_for_morning"),
+  );
+
+  return candidate ?? null;
+}
+
+function isAlreadyQueuedForMorning(summary: AgentRunSummaryPayload): boolean {
+  const actionState = (summary.actionState ?? "").toLowerCase();
+  const handoffState = (summary.handoffState ?? "").toLowerCase();
+
+  return (
+    actionState === "queued_for_morning" ||
+    actionState === "queued" ||
+    actionState === "ready_to_resume" ||
+    (summary.handoffAvailable && handoffState === "saved")
+  );
+}
+
+function shouldAutoQueueForMorning(
+  summary: AgentRunSummaryPayload,
+  queuedRunIds: Set<string>,
+): boolean {
+  if (summary.callKey !== "off_the_clock") return false;
+  if (!summary.allowedActionKeys.includes("queue_for_morning")) return false;
+  if (queuedRunIds.has(summary.runId)) return false;
+  if (isAlreadyQueuedForMorning(summary)) return false;
+  return true;
+}
+
+function buildQueuedForMorningContinuationArtifact(
+  runSummary: AgentRunSummaryPayload,
+  branch: string | null,
+): ContinuationArtifact {
+  const safeTitle = runSummary.safeTitle ?? "approved run";
+  return {
+    branch,
+    approvedProposalId: null,
+    approvedProposalDescription: safeTitle,
+    estimatedFiles: null,
+    modifiedFiles: [],
+    openDecisions: ["Resume approved work when the next work window starts."],
+    pendingSteps: ["Resume approved work."],
+    completedSteps: ["Queued for morning."],
+    resumeInstruction: "Ready to resume. Resume approved work.",
+    wrapUpInstruction: "Off the clock. Queued for morning. Your night stays yours.",
+    savedAt: new Date().toISOString(),
+    reason: "queue-for-morning",
+  };
+}
+
+async function queueForMorningWithHandoff(input: {
+  actorClient: HeadsDownClient;
+  runSummary: AgentRunSummaryPayload;
+  branch: string | null;
+  saveContinuation: (artifact: ContinuationArtifact) => Promise<void>;
+}): Promise<QueueForMorningResult> {
+  const artifact = buildQueuedForMorningContinuationArtifact(input.runSummary, input.branch);
+  await input.saveContinuation(artifact);
+
+  const result = await applyHeadsDownActionCompat(input.actorClient, {
+    runId: input.runSummary.runId,
+    actionKey: "queue_for_morning",
+    source: "pi",
+    client: "pi",
+    reason: "Off the clock. Queued for morning. Your night stays yours.",
+    nextWorkWindowStartsAt: input.runSummary.nextWorkWindowStartsAt ?? undefined,
+    handoffAvailable: true,
+    handoffState: "saved",
+    handoffSource: "pi",
+    handoffKind: "continuation",
+    handoffCapturedAt: new Date().toISOString(),
+  });
+
+  if (!result.ok) {
+    return {
+      queued: false,
+      runId: input.runSummary.runId,
+      handoffSaved: false,
+      message: "Off the clock call received, but queue_for_morning did not complete.",
+    };
+  }
+
+  return {
+    queued: true,
+    runId: input.runSummary.runId,
+    handoffSaved: true,
+    message: "Off the clock. Queued for morning. Your night stays yours.",
+  };
 }
 
 function normalizeToolPath(input: string | undefined): string {
@@ -1206,14 +1601,30 @@ export const __internal = {
   ACTIVE_AVAILABILITY_OVERRIDE_QUERY,
   CREATE_AVAILABILITY_OVERRIDE_MUTATION,
   CANCEL_AVAILABILITY_OVERRIDE_MUTATION,
+  AGENT_CONTROL_OVERVIEW_QUERY,
+  APPLY_HEADSDOWN_ACTION_MUTATION,
   getLowLevelGraphQLClient,
   getAvailabilityContext,
+  getAgentControlOverviewCompat,
+  applyHeadsDownActionCompat,
   buildActorContext,
   withActorContext,
   createAvailabilityOverrideCompat,
   getActiveAvailabilityOverrideCompat,
   cancelAvailabilityOverrideCompat,
   normalizeToolPath,
+  normalizeCallKey,
+  normalizeActionKey,
+  normalizeRunState,
+  toGraphQLEnumValue,
+  normalizeHeadsDownCallPayload,
+  normalizeRunSummaryPayload,
+  normalizeAgentControlOverviewPayload,
+  pickQueueForMorningRun,
+  isAlreadyQueuedForMorning,
+  shouldAutoQueueForMorning,
+  buildQueuedForMorningContinuationArtifact,
+  queueForMorningWithHandoff,
   isPotentiallyMutatingBashCommand,
   isReadonlyBashCommand,
   buildHeadsDownCompaction,
@@ -1239,6 +1650,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let lastApprovedProposalId: string | null = null;
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
   const runTelemetry = new Map<string, PiRunTelemetry>();
+  let autoQueuedRunIds = new Set<string>();
 
   function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
@@ -1984,6 +2396,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     cachedConfig = null;
     cachedClient = null;
     availabilitySnapshot = null;
+    autoQueuedRunIds = new Set<string>();
 
     await refreshAvailability(ctx, { force: true });
     await updateStatusUI(ctx);
@@ -2074,7 +2487,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Inject availability and policy context into the turn system prompt.
+  // Inject availability and HeadsDown call context into the turn system prompt.
   pi.on("before_agent_start", async (event, ctx) => {
     await refreshAvailability(ctx);
     await updateStatusUI(ctx);
@@ -2084,11 +2497,69 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       await reportStartedIfNeeded(ctx, activeProposal);
     }
 
+    const instructionBlocks: string[] = [];
     const policyInstruction = policyInstructionForPrompt();
-    if (!policyInstruction) return undefined;
+    if (policyInstruction) {
+      instructionBlocks.push(policyInstruction);
+    }
+
+    const client = await getClient();
+    if (client) {
+      try {
+        const actorClient = withActorContext(client, ctx);
+        const overview = await getAgentControlOverviewCompat(actorClient);
+        if (overview?.headsdownCall) {
+          const renderedCall = renderHeadsDownCallCopy({
+            key: overview.headsdownCall.key,
+            title: overview.headsdownCall.title,
+            body: overview.headsdownCall.body,
+          });
+          instructionBlocks.push(formatHeadsDownCallForPrompt(renderedCall));
+
+          if (renderedCall.key === "off_the_clock") {
+            const queueTarget = pickQueueForMorningRun(overview.runSummaries);
+            if (queueTarget) {
+              if (shouldAutoQueueForMorning(queueTarget, autoQueuedRunIds)) {
+                const queueResult = await queueForMorningWithHandoff({
+                  actorClient,
+                  runSummary: queueTarget,
+                  branch: await currentBranchName(),
+                  saveContinuation: saveContinuationArtifact,
+                });
+
+                instructionBlocks.push(`[HeadsDown] ${queueResult.message}`);
+                if (queueResult.queued) {
+                  autoQueuedRunIds.add(queueTarget.runId);
+                }
+                if (ctx.hasUI) {
+                  ctx.ui.notify(`[HeadsDown] ${queueResult.message}`, "info");
+                }
+              } else {
+                instructionBlocks.push(
+                  "[HeadsDown] Off the clock. Keep queued. Ready to resume guidance is active when work windows reopen.",
+                );
+              }
+            }
+          }
+
+          if (renderedCall.key === "ready_to_resume") {
+            instructionBlocks.push(
+              "[HeadsDown] Ready to resume. Resume approved work. Load saved context with headsdown_continuation action=load.",
+            );
+          }
+        }
+      } catch (error) {
+        if (ctx.hasUI) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`[HeadsDown] Unable to load agent-control call: ${message}`, "warning");
+        }
+      }
+    }
+
+    if (instructionBlocks.length === 0) return undefined;
 
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${policyInstruction}`,
+      systemPrompt: `${event.systemPrompt}\n\n${instructionBlocks.join("\n\n")}`,
     };
   });
 

@@ -109,9 +109,9 @@ const CANONICAL_CALL_COPY: Record<CanonicalHeadsDownCallKey, RenderLabels> = {
   },
   off_the_clock: {
     title: "Off the clock",
-    body: "Non-urgent agent decisions wait until the next work window. Safe continuation can stay contained, but new asks should queue.",
-    primaryLabel: "Queue for later",
-    primaryActionKey: "queue_for_later",
+    body: "Queued for morning keeps this ask from interrupting your evening. Your night stays yours.",
+    primaryLabel: "Queued for morning",
+    primaryActionKey: "queue_for_morning",
     primaryUiIntent: null,
     secondaryLabel: "Why this call?",
     secondaryActionKey: null,
