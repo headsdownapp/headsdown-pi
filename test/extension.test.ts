@@ -104,6 +104,16 @@ describe("Extension file", () => {
     expect(content).toContain("maybeWarnScopeDrift");
   });
 
+  it("handles rabbit_hole_detected with pause/summarize and allow-for-duration override", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("maybeHandleRabbitHoleDetected");
+    expect(content).toContain("pauseAndSummarize");
+    expect(content).toContain("allowForDuration");
+    expect(content).toContain("rabbitHoleInterventions");
+    expect(content).toContain('normalizedArgs.startsWith("pause")');
+    expect(content).toContain('normalizedArgs.startsWith("allow")');
+  });
+
   it("supports themed status UI and runtime /headsdown theme switching", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain("HEADSDOWN_UI_THEMES");
