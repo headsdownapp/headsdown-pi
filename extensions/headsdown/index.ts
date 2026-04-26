@@ -11,7 +11,7 @@
  * - Registers /headsdown command for quick status checks
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,11 +21,16 @@ import * as HeadsDownSDK from "@headsdown/sdk";
 import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
 import type {
   ActorContext,
+  AgentControlOverview,
+  AgentRunSummary,
+  AllowForDurationActionOptions,
   Contract,
   DelegationGrantFilterInput,
   DelegationGrantInput,
   DelegationGrantPermission,
   DelegationGrantScope,
+  HeadsDownActionOptions,
+  HeadsDownCall,
   HeadsDownConfig,
   ProposalInput,
   ScheduleResolution,
@@ -111,6 +116,12 @@ interface AvailabilitySnapshot {
   summary: string;
   wrapUpInstruction: string | null;
   fetchedAt: number;
+}
+
+interface RabbitHoleDetection {
+  detected: boolean;
+  call: HeadsDownCall | null;
+  runSummary: AgentRunSummary | null;
 }
 
 interface AvailabilityContext {
@@ -459,13 +470,23 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
     : undefined;
 }
 
+function toOpaqueWorkspaceRef(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) {
+    return "workspace_unknown";
+  }
+
+  const digest = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+  return `workspace_${digest}`;
+}
+
 function buildActorContext(ctx: ExtensionContext): ActorContext {
   const sessionId = getSessionId(ctx);
   return {
     source: "pi",
     agentId: "pi-agent",
     sessionId,
-    workspaceRef: ctx.cwd,
+    workspaceRef: toOpaqueWorkspaceRef(ctx.cwd),
   };
 }
 
@@ -1035,6 +1056,95 @@ function bucketMinutes(minutes: number | undefined): string {
   return "over_120";
 }
 
+function normalizeGraphQLEnumOutput(value: string | null | undefined): string | null {
+  return value ? value.toLowerCase() : null;
+}
+
+function detectRabbitHoleFromOverview(
+  overview: AgentControlOverview | null | undefined,
+  runIds: string | string[],
+): RabbitHoleDetection {
+  if (!overview) {
+    return { detected: false, call: null, runSummary: null };
+  }
+
+  const candidateRunIds = Array.isArray(runIds) ? runIds : [runIds];
+  const runSummary =
+    overview.runSummaries.find((entry) => candidateRunIds.includes(entry.runId)) ?? null;
+  const call = overview.headsdownCall ?? null;
+
+  const runCallKey = normalizeGraphQLEnumOutput(runSummary?.callKey ?? null);
+  if (runSummary) {
+    return {
+      detected: runCallKey === "rabbit_hole_detected",
+      call,
+      runSummary,
+    };
+  }
+
+  const callKey = normalizeGraphQLEnumOutput(call?.knownKey ?? call?.key ?? null);
+  return { detected: callKey === "rabbit_hole_detected", call, runSummary };
+}
+
+function buildRabbitHoleNarrative(input: {
+  call: HeadsDownCall | null;
+  runSummary: AgentRunSummary | null;
+  activeCallKey?: string;
+}): string {
+  const activeCallKey =
+    normalizeGraphQLEnumOutput(input.activeCallKey) ??
+    normalizeGraphQLEnumOutput(input.runSummary?.callKey ?? null) ??
+    "rabbit_hole_detected";
+  const callKey = normalizeGraphQLEnumOutput(input.call?.knownKey ?? input.call?.key ?? null);
+  const useCallCopy = callKey === activeCallKey;
+  const renderedCall = renderHeadsDownCallCopy({
+    key: activeCallKey,
+    title: useCallCopy ? input.call?.title : undefined,
+    body: useCallCopy ? input.call?.body : undefined,
+    fallbackSignals: { limitSignal: true },
+  });
+  const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
+  const reasonLine =
+    reasonCodes.length > 0
+      ? `Reason codes: ${reasonCodes.join(", ")}.`
+      : "Reason codes: scope drift or low-progress loop signals crossed the approved slice.";
+
+  return [
+    "HEADSDOWN INTERVENTION",
+    `Call: ${renderedCall.title}`,
+    `Trap: ${reasonLine}`,
+    `Play: ${renderedCall.primaryLabel ?? "Pause and summarize"}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`,
+    "Escalation: If the seam is still unclear, request an explicit allow-for-duration override before continuing deeper.",
+    "",
+    formatHeadsDownCallForPrompt(renderedCall),
+  ].join("\n");
+}
+
+function buildPauseAndSummarizeActionInput(runId: string, reason: string): HeadsDownActionOptions {
+  return {
+    runId,
+    reason,
+    sourceState: "rabbit_hole_detected",
+    source: "pi",
+    client: "headsdown-pi",
+  };
+}
+
+function buildAllowForDurationInput(
+  runId: string,
+  durationMinutes: number,
+  reason: string,
+): AllowForDurationActionOptions {
+  return {
+    runId,
+    durationMinutes,
+    reason,
+    sourceState: "rabbit_hole_detected",
+    source: "pi",
+    client: "headsdown-pi",
+  };
+}
+
 function basePiAgentRunEvent(context: PiAgentRunEventContext): Record<string, unknown> {
   return stripUndefinedValues({
     runId: context.runId,
@@ -1307,6 +1417,19 @@ const REPORT_AGENT_RUN_EVENT_MUTATION = `
         eventId
         eventType
       }
+    }
+  }
+`;
+
+const RABBIT_HOLE_EVENT_QUERY = `
+  query RabbitHoleEvents($proposalRef: String!, $eventType: String!, $limit: Int) {
+    agentRunEvents(proposalRef: $proposalRef, eventType: $eventType, limit: $limit) {
+      eventId
+      eventType
+      runId
+      proposalRef
+      payload
+      insertedAt
     }
   }
 `;
@@ -1639,6 +1762,11 @@ export const __internal = {
   serializeAgentRunEventForGraphQL,
   mapTaskOutcomeToAgentRunOutcome,
   runIdForProposal,
+  detectRabbitHoleFromOverview,
+  buildRabbitHoleNarrative,
+  buildPauseAndSummarizeActionInput,
+  buildAllowForDurationInput,
+  toOpaqueWorkspaceRef,
   CONTINUATION_PATH,
 };
 
@@ -1651,6 +1779,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
+  const rabbitHoleInterventions = new Map<
+    string,
+    {
+      contained: boolean;
+      sourceState: "rabbit_hole_detected";
+      allowedUntil?: number;
+      pausedAt?: number;
+    }
+  >();
 
   function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
@@ -1764,6 +1901,191 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return telemetry;
   }
 
+  async function getAgentControlOverviewSafe(
+    ctx: ExtensionContext,
+  ): Promise<AgentControlOverview | null> {
+    try {
+      const client = await getClient();
+      if (!client) return null;
+      const actorClient = withActorContext(client, ctx);
+      const method = (
+        actorClient as unknown as {
+          getAgentControlOverview?: () => Promise<AgentControlOverview>;
+        }
+      ).getAgentControlOverview;
+      if (typeof method !== "function") return null;
+      return await method.call(actorClient);
+    } catch {
+      return null;
+    }
+  }
+
+  async function getLatestAgentRunEventSafe(
+    ctx: ExtensionContext,
+    proposalId: string,
+    eventType: string,
+  ): Promise<Record<string, unknown> | null> {
+    try {
+      const client = await getClient();
+      if (!client) return null;
+      const actorClient = withActorContext(client, ctx);
+      const graphql = getLowLevelGraphQLClient(actorClient);
+      if (!graphql) return null;
+      const data = await graphql.request(RABBIT_HOLE_EVENT_QUERY, {
+        proposalRef: proposalId,
+        eventType,
+        limit: 1,
+      });
+      const events = (data.agentRunEvents as Record<string, unknown>[] | undefined) ?? [];
+      return events[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function eventInsertedAt(event: Record<string, unknown> | null): number {
+    const insertedAt = typeof event?.insertedAt === "string" ? event.insertedAt : "";
+    const timestamp = Date.parse(insertedAt);
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+
+  function unresolvedRabbitHoleEvent(
+    rabbitHoleEvent: Record<string, unknown> | null,
+    resolvedEvent: Record<string, unknown> | null,
+  ): boolean {
+    if (!rabbitHoleEvent) return false;
+    return eventInsertedAt(resolvedEvent) < eventInsertedAt(rabbitHoleEvent);
+  }
+
+  function runSummaryResolvedRabbitHole(runSummary: AgentRunSummary | null): boolean {
+    const callKey = normalizeGraphQLEnumOutput(runSummary?.callKey ?? null);
+    return (
+      callKey === "ready_to_resume" || callKey === "all_contained" || callKey === "off_the_clock"
+    );
+  }
+
+  async function applyPauseAndSummarize(
+    ctx: ExtensionContext,
+    proposalId: string,
+  ): Promise<boolean> {
+    try {
+      const client = await getClient();
+      if (!client) return false;
+      const actorClient = withActorContext(client, ctx);
+      const payload = await actorClient.pauseAndSummarize(
+        buildPauseAndSummarizeActionInput(proposalId, "rabbit_hole_detected"),
+      );
+      return payload.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function allowRunForDuration(
+    ctx: ExtensionContext,
+    proposalId: string,
+    eventRunId: string,
+    durationMinutes: number,
+  ): Promise<boolean> {
+    try {
+      const client = await getClient();
+      if (!client) return false;
+      const actorClient = withActorContext(client, ctx);
+      const payload = await actorClient.allowForDuration(
+        buildAllowForDurationInput(proposalId, durationMinutes, "manual_override"),
+      );
+      const allowed = payload.ok === true;
+      if (allowed) {
+        rabbitHoleInterventions.set(eventRunId, {
+          contained: false,
+          sourceState: "rabbit_hole_detected",
+          allowedUntil: Date.now() + durationMinutes * 60_000,
+        });
+      }
+      return allowed;
+    } catch {
+      return false;
+    }
+  }
+
+  async function maybeHandleRabbitHoleDetected(ctx: ExtensionContext, proposal: ProposalRecord) {
+    const telemetry = getTelemetryForProposal(proposal);
+    const runId = telemetry.runId;
+
+    const existingIntervention = rabbitHoleInterventions.get(runId);
+    if (existingIntervention?.allowedUntil) {
+      if (Date.now() < existingIntervention.allowedUntil) {
+        return;
+      }
+
+      rabbitHoleInterventions.delete(runId);
+    } else if (existingIntervention?.contained) {
+      return;
+    }
+
+    const rabbitHoleEvent = await getLatestAgentRunEventSafe(
+      ctx,
+      proposal.id,
+      "agent_run.rabbit_hole_detected",
+    );
+    const resolvedEvent = await getLatestAgentRunEventSafe(
+      ctx,
+      proposal.id,
+      "intervention.resolved",
+    );
+    const overview = await getAgentControlOverviewSafe(ctx);
+    const detection = detectRabbitHoleFromOverview(overview, [runId, proposal.id]);
+
+    const activeRabbitHole =
+      detection.detected ||
+      (unresolvedRabbitHoleEvent(rabbitHoleEvent, resolvedEvent) &&
+        !runSummaryResolvedRabbitHole(detection.runSummary));
+
+    if (!activeRabbitHole) {
+      return;
+    }
+
+    const activeCallKey = "rabbit_hole_detected";
+
+    rabbitHoleInterventions.set(runId, {
+      contained: true,
+      sourceState: "rabbit_hole_detected",
+    });
+
+    const narrative = buildRabbitHoleNarrative({
+      call: detection.call,
+      runSummary: detection.runSummary,
+      activeCallKey,
+    });
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing.",
+        "warning",
+      );
+    }
+
+    pi.sendMessage(
+      {
+        customType: "headsdown-rabbit-hole",
+        content: narrative,
+        display: false,
+        details: {
+          runId,
+          callKey: activeCallKey,
+          reasonCodes: detection.runSummary?.reasonCodes ?? detection.call?.reasonCodes ?? [],
+        },
+      },
+      { deliverAs: "steer" },
+    );
+
+    await saveAutomaticContinuation("rabbit_hole_detected", ctx);
+
+    const escalation =
+      "HeadsDown call: rabbit_hole_detected. Pause this run locally, summarize current progress, and stop further file edits. To continue instead, ask for an explicit allow-for-duration override before applying pause_and_summarize.";
+    pi.sendUserMessage(escalation, { deliverAs: "steer" });
+  }
+
   async function reportPiAgentRunEvent(_ctx: ExtensionContext, input: Record<string, unknown>) {
     try {
       const client = await getClient();
@@ -1802,6 +2124,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       ctx,
       buildProgressEventInput(telemetry, scope.warningSent || telemetry.scopeDriftReported),
     );
+
+    await maybeHandleRabbitHoleDetected(ctx, proposal);
   }
 
   async function loadConfig(): Promise<HeadsDownConfig> {
@@ -2584,6 +2908,41 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     let mutating = false;
     let filePath = "";
     let command = "";
+
+    if (activeProposal) {
+      const runId = getTelemetryForProposal(activeProposal).runId;
+      const attemptedTool = event.toolName;
+      const isMutatingAttempt =
+        attemptedTool === "write" ||
+        attemptedTool === "edit" ||
+        (attemptedTool === "bash" &&
+          isPotentiallyMutatingBashCommand((event.input as { command?: string }).command ?? ""));
+
+      if (isMutatingAttempt) {
+        const intervention = rabbitHoleInterventions.get(runId);
+
+        if (intervention?.allowedUntil && Date.now() >= intervention.allowedUntil) {
+          rabbitHoleInterventions.set(runId, {
+            contained: true,
+            sourceState: "rabbit_hole_detected",
+          });
+
+          return {
+            block: true,
+            reason:
+              "[HeadsDown] The allow-for-duration window expired. Run is contained again; re-check the rabbit-hole call before additional edits.",
+          };
+        }
+
+        if (intervention?.contained) {
+          return {
+            block: true,
+            reason:
+              "[HeadsDown] Rabbit hole detected. Run is paused for summarize/handoff. Ask for allow-for-duration before additional edits.",
+          };
+        }
+      }
+    }
 
     if (event.toolName === "write" || event.toolName === "edit") {
       filePath = normalizeToolPath((event.input as { path?: string }).path);
@@ -3510,6 +3869,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               params.tests_passed,
             ),
           );
+
+          rabbitHoleInterventions.delete(telemetry.runId);
         }
 
         approvedProposals = approvedProposals.map((proposal) =>
@@ -3627,6 +3988,89 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           const summaries = await actorClient.listDigestSummaries({ latest: 10 });
           const noun = summaries.length === 1 ? "summary" : "summaries";
           ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
+          return;
+        }
+
+        if (normalizedArgs.startsWith("pause")) {
+          const proposal = getLatestApprovedProposal();
+          if (!proposal) {
+            ctx.ui.notify("[HeadsDown] No active approved run found to pause.", "warning");
+            return;
+          }
+
+          const runId = getTelemetryForProposal(proposal).runId;
+          const paused = await applyPauseAndSummarize(ctx, proposal.id);
+
+          await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
+          rabbitHoleInterventions.set(runId, {
+            contained: true,
+            sourceState: "rabbit_hole_detected",
+            pausedAt: Date.now(),
+          });
+
+          if (!paused) {
+            ctx.ui.notify(
+              "[HeadsDown] Could not apply pause-and-summarize through the API. Run remains locally contained.",
+              "warning",
+            );
+            return;
+          }
+
+          ctx.ui.notify(
+            "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice.",
+            "info",
+          );
+          return;
+        }
+
+        if (normalizedArgs.startsWith("allow")) {
+          const [, minutesArg] = normalizedArgs.split(/\s+/, 2);
+          const parsedMinutes = Number(minutesArg ?? "15");
+          const durationMinutes = Number.isFinite(parsedMinutes)
+            ? Math.max(1, Math.min(240, Math.floor(parsedMinutes)))
+            : 15;
+
+          const proposal = getLatestApprovedProposal();
+          if (!proposal) {
+            ctx.ui.notify(
+              "[HeadsDown] No active approved run found for allow-for-duration.",
+              "warning",
+            );
+            return;
+          }
+
+          const runId = getTelemetryForProposal(proposal).runId;
+          const intervention = rabbitHoleInterventions.get(runId);
+          if (!intervention?.contained) {
+            ctx.ui.notify(
+              "[HeadsDown] No active rabbit-hole intervention is waiting for an allow-for-duration decision.",
+              "warning",
+            );
+            return;
+          }
+
+          if (intervention.pausedAt) {
+            ctx.ui.notify(
+              "[HeadsDown] This run has already been paused. Use a ready-to-resume action instead of allow-for-duration.",
+              "warning",
+            );
+            return;
+          }
+
+          const allowed = await allowRunForDuration(ctx, proposal.id, runId, durationMinutes);
+
+          if (!allowed) {
+            ctx.ui.notify(
+              "[HeadsDown] Could not apply allow-for-duration. Keep run paused or retry when API support is available.",
+              "warning",
+            );
+            return;
+          }
+
+          ctx.ui.notify(
+            `[HeadsDown] Allowed run ${runId} for ${durationMinutes}m. Keep scope tight and re-check before expanding.`,
+            "info",
+          );
           return;
         }
 

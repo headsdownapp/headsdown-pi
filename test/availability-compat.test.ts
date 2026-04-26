@@ -61,7 +61,7 @@ describe("actor context wiring", () => {
       source: "pi",
       agentId: "pi-agent",
       sessionId: "session-123",
-      workspaceRef: "/repo/headsdown-pi",
+      workspaceRef: __internal.toOpaqueWorkspaceRef("/repo/headsdown-pi"),
     });
   });
 
@@ -83,7 +83,7 @@ describe("actor context wiring", () => {
         source: "pi",
         agentId: "pi-agent",
         sessionId: "session-abc",
-        workspaceRef: "/repo/headsdown-pi",
+        workspaceRef: __internal.toOpaqueWorkspaceRef("/repo/headsdown-pi"),
       },
     });
   });

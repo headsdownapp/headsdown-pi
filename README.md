@@ -9,6 +9,7 @@ When installed, Pi will:
 4. **Track realized scope drift** from successful file mutations against approved proposal estimates
 5. **Preserve continuity** across compaction, tree navigation, and session shutdown/switch
 6. **Support resumable work** with continuation artifacts and digest triage for missed updates
+7. **Contain rabbit holes** by pausing/summarizing detected drift and allowing explicit duration overrides when approved
 
 ## Install
 
@@ -59,6 +60,12 @@ Sensitive paths (`.env*`, `.ssh/*`, `package.json`, `Dockerfile*`, `.github/**`,
 ### Scope Drift Tracking
 
 On `tool_result`, successful `write`/`edit` operations are tracked as realized modified files for the active approved proposal. If touched files exceed the approved estimate by more than 50%, Pi emits a scope-drift warning and prompts re-proposal.
+
+### Rabbit-Hole Containment
+
+During approved runs, Pi reports privacy-safe progress metadata (counts, buckets, validation state, and timing only). If HeadsDown raises `rabbit_hole_detected`, Pi emits Call/Trap/Play/Escalation guidance, saves a continuation handoff, and locally blocks further mutating edits while the backend call is still available for the next action.
+
+Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing.
 
 ### Continuity Hooks
 
