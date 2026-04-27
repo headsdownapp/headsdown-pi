@@ -104,6 +104,14 @@ describe("Extension file", () => {
     expect(content).toContain("maybeWarnScopeDrift");
   });
 
+  it("starts progress telemetry from the active run epoch instead of proposal approval time", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain("startedAt: Date.now()");
+    expect(content).not.toContain(
+      "startedAt: new Date(proposal.evaluatedAt).getTime() || Date.now()",
+    );
+  });
+
   it("handles rabbit_hole_detected with pause/summarize and allow-for-duration override", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain("maybeHandleRabbitHoleDetected");
