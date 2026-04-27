@@ -16,6 +16,7 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import * as HeadsDownSDK from "@headsdown/sdk";
 import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
@@ -3354,7 +3355,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     promptSnippet: "List or apply availability presets when user asks to change mode",
     parameters: Type.Object({
       action: Type.Optional(
-        Type.Union([Type.Literal("list"), Type.Literal("apply")], {
+        StringEnum(["list", "apply"] as const, {
           description: "Use 'list' to view presets (default), or 'apply' to activate one.",
         }),
       ),
@@ -3486,7 +3487,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         }),
       ),
       delivery_mode: Type.Optional(
-        Type.Union([Type.Literal("auto"), Type.Literal("wrap_up"), Type.Literal("full_depth")], {
+        StringEnum(["auto", "wrap_up", "full_depth"] as const, {
           description: "Optional Wrap-Up delivery mode override for this task.",
         }),
       ),
@@ -3657,23 +3658,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     promptSnippet: "Manage HeadsDown delegation grants for the current workspace/session context",
     parameters: Type.Object({
       action: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("list"),
-            Type.Literal("list_active"),
-            Type.Literal("create"),
-            Type.Literal("revoke"),
-            Type.Literal("revoke_many"),
-          ],
-          {
-            description:
-              "Action to run: list/list_active/create/revoke/revoke_many (default: list_active).",
-          },
-        ),
+        StringEnum(["list", "list_active", "create", "revoke", "revoke_many"] as const, {
+          description:
+            "Action to run: list/list_active/create/revoke/revoke_many (default: list_active).",
+        }),
       ),
       id: Type.Optional(Type.String({ description: "Delegation grant id (for revoke)." })),
       scope: Type.Optional(
-        Type.Union([Type.Literal("session"), Type.Literal("workspace"), Type.Literal("agent")], {
+        StringEnum(["session", "workspace", "agent"] as const, {
           description: "Grant scope for create/filter operations.",
         }),
       ),
@@ -3684,11 +3676,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       agent_id: Type.Optional(Type.String({ description: "Agent id for agent scope." })),
       permissions: Type.Optional(
         Type.Array(
-          Type.Union([
-            Type.Literal("availability_override_create"),
-            Type.Literal("availability_override_cancel"),
-            Type.Literal("preset_apply"),
-          ]),
+          StringEnum([
+            "availability_override_create",
+            "availability_override_cancel",
+            "preset_apply",
+          ] as const),
         ),
       ),
       duration_minutes: Type.Optional(
@@ -3805,21 +3797,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     promptSnippet: "Manage temporary HeadsDown availability overrides",
     parameters: Type.Object({
       action: Type.Optional(
-        Type.Union([Type.Literal("get"), Type.Literal("set"), Type.Literal("clear")], {
+        StringEnum(["get", "set", "clear"] as const, {
           description: "Action to run: get/set/clear (default: get).",
         }),
       ),
       id: Type.Optional(Type.String({ description: "Override id for clear (optional)." })),
       mode: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("online"),
-            Type.Literal("busy"),
-            Type.Literal("limited"),
-            Type.Literal("offline"),
-          ],
-          { description: "Override mode for action='set'." },
-        ),
+        StringEnum(["online", "busy", "limited", "offline"] as const, {
+          description: "Override mode for action='set'.",
+        }),
       ),
       duration_minutes: Type.Optional(
         Type.Number({ description: "Duration in minutes for action='set'." }),
@@ -3890,12 +3876,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       "Save or load structured continuation artifacts for resumable sessions. Useful when pausing ongoing approved work.",
     promptSnippet: "Save or load HeadsDown continuation artifacts for resumable work sessions",
     parameters: Type.Object({
-      action: Type.Union(
-        [Type.Literal("save"), Type.Literal("load"), Type.Literal("check"), Type.Literal("clear")],
-        {
-          description: "Save continuation data, load and consume it, check existence, or clear it.",
-        },
-      ),
+      action: StringEnum(["save", "load", "check", "clear"] as const, {
+        description: "Save continuation data, load and consume it, check existence, or clear it.",
+      }),
       branch: Type.Optional(Type.String({ description: "Current branch name for save." })),
       completed_steps: Type.Optional(
         Type.Array(Type.String(), { description: "Completed steps for save." }),
@@ -4030,14 +4013,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       "Call this when you've finished or failed a task. Helps HeadsDown calibrate future verdicts for better accuracy.",
     promptSnippet: "Report task outcome to HeadsDown after completing work",
     parameters: Type.Object({
-      outcome: Type.Union(
-        [
-          Type.Literal("completed"),
-          Type.Literal("failed"),
-          Type.Literal("partially_completed"),
-          Type.Literal("cancelled"),
-          Type.Literal("timed_out"),
-        ],
+      outcome: StringEnum(
+        ["completed", "failed", "partially_completed", "cancelled", "timed_out"] as const,
         { description: "What happened with the task." },
       ),
       error_category: Type.Optional(
