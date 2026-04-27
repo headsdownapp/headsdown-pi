@@ -154,4 +154,79 @@ describe("rabbit-hole detection helpers", () => {
     expect(opaque).not.toContain("private-repo");
     expect(opaque).not.toContain("/Users/name");
   });
+
+  it("normalizes rabbit-hole session override command modes", () => {
+    expect(__internal.normalizeRabbitHoleSessionMode("on")).toBe("on");
+    expect(__internal.normalizeRabbitHoleSessionMode("normal")).toBe("on");
+    expect(__internal.normalizeRabbitHoleSessionMode("off")).toBe("off");
+    expect(__internal.normalizeRabbitHoleSessionMode("soft")).toBe("off");
+    expect(__internal.normalizeRabbitHoleSessionMode("quiet")).toBe("quiet");
+    expect(__internal.normalizeRabbitHoleSessionMode("mute")).toBe("quiet");
+    expect(__internal.normalizeRabbitHoleSessionMode("unknown")).toBeNull();
+  });
+
+  it("reports rabbit-hole session override status without requiring backend state", () => {
+    expect(__internal.formatRabbitHoleSessionStatus("on")).toContain(
+      "normal hard stops and guidance",
+    );
+    expect(__internal.formatRabbitHoleSessionStatus("off", "run_1")).toContain(
+      "hard stops disabled, soft guidance remains",
+    );
+    expect(
+      __internal.formatRabbitHoleSessionStatus("quiet", "run_1", {
+        contained: true,
+        sourceState: "rabbit_hole_detected",
+      }),
+    ).toContain("hard stops and rabbit-hole guidance disabled");
+    expect(__internal.formatRabbitHoleSessionStatus("quiet", "run_1")).toContain(
+      "Telemetry reporting stays enabled",
+    );
+  });
+
+  it("blocks contained rabbit-hole mutations only in normal session mode", () => {
+    const intervention = {
+      contained: true,
+      sourceState: "rabbit_hole_detected" as const,
+    };
+
+    expect(__internal.shouldBlockRabbitHoleMutation("on", intervention, 1_000)).toMatchObject({
+      block: true,
+      expiredAllowance: false,
+    });
+    expect(__internal.shouldBlockRabbitHoleMutation("off", intervention, 1_000)).toEqual({
+      block: false,
+      expiredAllowance: false,
+    });
+    expect(__internal.shouldBlockRabbitHoleMutation("quiet", intervention, 1_000)).toEqual({
+      block: false,
+      expiredAllowance: false,
+    });
+  });
+
+  it("contains expired allow-for-duration windows only in normal session mode", () => {
+    const intervention = {
+      contained: false,
+      sourceState: "rabbit_hole_detected" as const,
+      allowedUntil: 900,
+    };
+
+    expect(__internal.shouldBlockRabbitHoleMutation("on", intervention, 1_000)).toMatchObject({
+      block: true,
+      expiredAllowance: true,
+    });
+    expect(__internal.shouldBlockRabbitHoleMutation("off", intervention, 1_000)).toEqual({
+      block: false,
+      expiredAllowance: false,
+    });
+    expect(__internal.shouldBlockRabbitHoleMutation("quiet", intervention, 1_000)).toEqual({
+      block: false,
+      expiredAllowance: false,
+    });
+  });
+
+  it("suppresses rabbit-hole guidance only in quiet session mode", () => {
+    expect(__internal.shouldEmitRabbitHoleGuidance("on")).toBe(true);
+    expect(__internal.shouldEmitRabbitHoleGuidance("off")).toBe(true);
+    expect(__internal.shouldEmitRabbitHoleGuidance("quiet")).toBe(false);
+  });
 });

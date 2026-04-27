@@ -128,6 +128,15 @@ interface RabbitHoleDetection {
   runSummary: AgentRunSummary | null;
 }
 
+type RabbitHoleSessionMode = "on" | "off" | "quiet";
+
+type RabbitHoleInterventionState = {
+  contained: boolean;
+  sourceState: "rabbit_hole_detected";
+  allowedUntil?: number;
+  pausedAt?: number;
+};
+
 interface AvailabilityContext {
   contract: Contract | null;
   calendar: unknown | null;
@@ -1136,6 +1145,94 @@ function buildRabbitHoleNarrative(input: {
   ].join("\n");
 }
 
+function buildRabbitHoleSoftNarrative(input: {
+  call: HeadsDownCall | null;
+  runSummary: AgentRunSummary | null;
+}): string {
+  const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
+  const reasonLine =
+    reasonCodes.length > 0
+      ? `Reason codes: ${reasonCodes.join(", ")}.`
+      : "Reason codes: scope drift or low-progress loop signals crossed the approved slice.";
+
+  return [
+    "HEADSDOWN RABBIT-HOLE GUIDANCE",
+    "Rabbit-hole hard stops are disabled for this Pi session.",
+    reasonLine,
+    "Keep the run tight: finish the smallest useful slice, validate before expanding, and re-enable hard stops with /headsdown rabbit-hole on when ready.",
+  ].join("\n");
+}
+
+function normalizeRabbitHoleSessionMode(value: string | undefined): RabbitHoleSessionMode | null {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "on" || normalized === "normal" || normalized === "enable") return "on";
+  if (normalized === "off" || normalized === "soft" || normalized === "disable") return "off";
+  if (normalized === "quiet" || normalized === "silent" || normalized === "mute") {
+    return "quiet";
+  }
+  return null;
+}
+
+function formatRabbitHoleSessionStatus(
+  mode: RabbitHoleSessionMode,
+  runId?: string | null,
+  intervention?: RabbitHoleInterventionState | null,
+): string {
+  const modeLabel =
+    mode === "on"
+      ? "on: normal hard stops and guidance"
+      : mode === "off"
+        ? "off: hard stops disabled, soft guidance remains"
+        : "quiet: hard stops and rabbit-hole guidance disabled";
+  const runLine = runId ? `Active run: ${runId}.` : "Active run: none.";
+  const interventionLine = intervention?.contained
+    ? intervention.allowedUntil
+      ? `Rabbit-hole containment: allowed until ${new Date(intervention.allowedUntil).toISOString()}.`
+      : "Rabbit-hole containment: active locally."
+    : "Rabbit-hole containment: inactive locally.";
+
+  return [
+    `[HeadsDown] Rabbit-hole session mode is ${modeLabel}.`,
+    runLine,
+    interventionLine,
+    "Telemetry reporting stays enabled in all modes.",
+  ].join("\n");
+}
+
+function shouldBlockRabbitHoleMutation(
+  mode: RabbitHoleSessionMode,
+  intervention: RabbitHoleInterventionState | null | undefined,
+  now: number,
+): { block: boolean; expiredAllowance: boolean; reason?: string } {
+  if (mode !== "on" || !intervention) {
+    return { block: false, expiredAllowance: false };
+  }
+
+  if (intervention.allowedUntil && now >= intervention.allowedUntil) {
+    return {
+      block: true,
+      expiredAllowance: true,
+      reason:
+        "[HeadsDown] The allow-for-duration window expired. Run is contained again; re-check the rabbit-hole call before additional edits.",
+    };
+  }
+
+  if (intervention.contained) {
+    return {
+      block: true,
+      expiredAllowance: false,
+      reason:
+        "[HeadsDown] Rabbit hole detected. Run is paused for summarize/handoff. Ask for allow-for-duration before additional edits.",
+    };
+  }
+
+  return { block: false, expiredAllowance: false };
+}
+
+function shouldEmitRabbitHoleGuidance(mode: RabbitHoleSessionMode): boolean {
+  return mode !== "quiet";
+}
+
 function buildPauseAndSummarizeActionInput(runId: string, reason: string): HeadsDownActionOptions {
   return {
     runId,
@@ -1818,6 +1915,11 @@ export const __internal = {
   runIdForProposal,
   detectRabbitHoleFromOverview,
   buildRabbitHoleNarrative,
+  buildRabbitHoleSoftNarrative,
+  normalizeRabbitHoleSessionMode,
+  formatRabbitHoleSessionStatus,
+  shouldBlockRabbitHoleMutation,
+  shouldEmitRabbitHoleGuidance,
   buildPauseAndSummarizeActionInput,
   buildAllowForDurationInput,
   toOpaqueWorkspaceRef,
@@ -1834,15 +1936,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
-  const rabbitHoleInterventions = new Map<
-    string,
-    {
-      contained: boolean;
-      sourceState: "rabbit_hole_detected";
-      allowedUntil?: number;
-      pausedAt?: number;
-    }
-  >();
+  let rabbitHoleSessionMode: RabbitHoleSessionMode = "on";
+  const rabbitHoleInterventions = new Map<string, RabbitHoleInterventionState>();
 
   function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
@@ -2106,6 +2201,40 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       contained: true,
       sourceState: "rabbit_hole_detected",
     });
+
+    if (!shouldEmitRabbitHoleGuidance(rabbitHoleSessionMode)) {
+      return;
+    }
+
+    if (rabbitHoleSessionMode === "off") {
+      const softNarrative = buildRabbitHoleSoftNarrative({
+        call: detection.call,
+        runSummary: detection.runSummary,
+      });
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          "[HeadsDown] Rabbit-hole hard stops are disabled for this session. Keep scope tight.",
+          "info",
+        );
+      }
+
+      pi.sendMessage(
+        {
+          customType: "headsdown-rabbit-hole-soft",
+          content: softNarrative,
+          display: false,
+          details: {
+            runId,
+            callKey: activeCallKey,
+            sessionMode: rabbitHoleSessionMode,
+            reasonCodes: detection.runSummary?.reasonCodes ?? detection.call?.reasonCodes ?? [],
+          },
+        },
+        { deliverAs: "steer" },
+      );
+      return;
+    }
 
     const narrative = buildRabbitHoleNarrative({
       call: detection.call,
@@ -3044,25 +3173,23 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       if (isMutatingAttempt) {
         const intervention = rabbitHoleInterventions.get(runId);
+        const decision = shouldBlockRabbitHoleMutation(
+          rabbitHoleSessionMode,
+          intervention,
+          Date.now(),
+        );
 
-        if (intervention?.allowedUntil && Date.now() >= intervention.allowedUntil) {
+        if (decision.expiredAllowance) {
           rabbitHoleInterventions.set(runId, {
             contained: true,
             sourceState: "rabbit_hole_detected",
           });
-
-          return {
-            block: true,
-            reason:
-              "[HeadsDown] The allow-for-duration window expired. Run is contained again; re-check the rabbit-hole call before additional edits.",
-          };
         }
 
-        if (intervention?.contained) {
+        if (decision.block) {
           return {
             block: true,
-            reason:
-              "[HeadsDown] Rabbit hole detected. Run is paused for summarize/handoff. Ask for allow-for-duration before additional edits.",
+            reason: decision.reason,
           };
         }
       }
@@ -4099,13 +4226,50 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     description: "Check your HeadsDown availability status",
     handler: async (args, ctx) => {
       try {
+        const normalizedArgs = (args ?? "").trim().toLowerCase();
+
+        if (
+          normalizedArgs === "rabbit-hole" ||
+          normalizedArgs === "rabbit" ||
+          normalizedArgs.startsWith("rabbit-hole ") ||
+          normalizedArgs.startsWith("rabbit ")
+        ) {
+          const [, modeArgRaw] = normalizedArgs.split(/\s+/, 2);
+          const modeArg = modeArgRaw?.trim() || "status";
+          const proposal = getLatestApprovedProposal();
+          const runId = proposal ? getTelemetryForProposal(proposal).runId : null;
+          const intervention = runId ? rabbitHoleInterventions.get(runId) : null;
+
+          if (modeArg === "status") {
+            ctx.ui.notify(
+              formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
+              "info",
+            );
+            return;
+          }
+
+          const parsedMode = normalizeRabbitHoleSessionMode(modeArg);
+          if (!parsedMode) {
+            ctx.ui.notify(
+              "[HeadsDown] Unknown rabbit-hole mode. Use /headsdown rabbit-hole <status|off|quiet|on>.",
+              "warning",
+            );
+            return;
+          }
+
+          rabbitHoleSessionMode = parsedMode;
+          ctx.ui.notify(
+            formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
+            "info",
+          );
+          return;
+        }
+
         const client = await getClient();
         if (!client) {
           ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
           return;
         }
-
-        const normalizedArgs = (args ?? "").trim().toLowerCase();
 
         if (normalizedArgs === "digest") {
           const actorClient = withActorContext(client, ctx);
