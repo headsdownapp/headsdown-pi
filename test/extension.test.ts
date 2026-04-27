@@ -34,8 +34,7 @@ describe("Extension file", () => {
   it("registers headsdown_presets tool with list/apply actions", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain('name: "headsdown_presets"');
-    expect(content).toContain('Type.Literal("list")');
-    expect(content).toContain('Type.Literal("apply")');
+    expect(content).toContain('StringEnum(["list", "apply"] as const');
     expect(content).toContain("actorClient.listPresets()");
     expect(content).toContain("actorClient.applyPreset(selected.id)");
   });
@@ -84,6 +83,10 @@ describe("Extension file", () => {
     expect(content).toContain('name: "headsdown_report"');
     expect(content).toContain("reportOutcomeMethod");
     expect(content).toContain("reportOutcomeMethod.bind(actorClient)");
+    expect(content).toContain("outcome: StringEnum(");
+    expect(content).toContain(
+      '["completed", "failed", "partially_completed", "cancelled", "timed_out"] as const',
+    );
   });
 
   it("uses lifecycle hooks for continuity and compaction integration", async () => {
@@ -102,6 +105,13 @@ describe("Extension file", () => {
     expect(content).toContain("systemPrompt:");
     expect(content).toContain('pi.on("tool_result"');
     expect(content).toContain("maybeWarnScopeDrift");
+  });
+
+  it("uses StringEnum for tool string choices instead of literal unions", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('import { StringEnum } from "@mariozechner/pi-ai"');
+    expect(content).not.toContain("Type.Union(");
+    expect(content).not.toContain("Type.Literal(");
   });
 
   it("starts progress telemetry from the active run epoch instead of proposal approval time", async () => {
