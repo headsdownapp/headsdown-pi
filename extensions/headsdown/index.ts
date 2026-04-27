@@ -1198,11 +1198,48 @@ function buildStartedEventInput(proposal: ProposalRecord): Record<string, unknow
   };
 }
 
+function progressConfidenceBucket(input: {
+  elapsedSeconds: number;
+  estimatedMinutes?: number;
+  scopeGrowth: number | undefined;
+  retryCount: number;
+  failureCount: number;
+}): string {
+  if (typeof input.scopeGrowth === "number" && input.scopeGrowth > 0) return "medium";
+  if (input.retryCount >= 3 || input.failureCount >= 3) return "medium";
+
+  const estimatedSeconds =
+    typeof input.estimatedMinutes === "number" && input.estimatedMinutes > 0
+      ? input.estimatedMinutes * 60
+      : null;
+  if (estimatedSeconds) {
+    const threshold = Math.max(Math.round(estimatedSeconds * 1.25), estimatedSeconds + 300);
+    if (input.elapsedSeconds >= threshold) return "medium";
+  }
+
+  return "low";
+}
+
 function buildProgressEventInput(
   telemetry: PiRunTelemetry,
   scopeChanged: boolean,
+  estimatedFiles?: number,
+  estimatedMinutes?: number,
 ): Record<string, unknown> {
   const elapsedSeconds = Math.max(0, Math.floor((Date.now() - telemetry.startedAt) / 1000));
+  const filesModified = telemetry.filesModified.size;
+  const scopeGrowth =
+    typeof estimatedFiles === "number" && estimatedFiles >= 0
+      ? Math.max(filesModified - estimatedFiles, 0)
+      : undefined;
+  const confidenceBucket = progressConfidenceBucket({
+    elapsedSeconds,
+    estimatedMinutes,
+    scopeGrowth,
+    retryCount: telemetry.retryCount,
+    failureCount: telemetry.failureCount,
+  });
+
   return {
     ...basePiAgentRunEvent({
       runId: telemetry.runId,
@@ -1218,7 +1255,7 @@ function buildProgressEventInput(
       toolWriteCount: telemetry.toolWriteCount,
       toolExternalCount: telemetry.toolExternalCount,
       filesReadBucket: bucketFileCount(telemetry.filesRead.size),
-      filesModifiedBucket: bucketFileCount(telemetry.filesModified.size),
+      filesModifiedBucket: bucketFileCount(filesModified),
       validationLevel: "unknown",
       validationStatus: "unknown",
       retryCount: telemetry.retryCount,
@@ -1226,8 +1263,8 @@ function buildProgressEventInput(
       scopeChanged,
       redirectCount: telemetry.redirectCount,
       progressState: "working",
-      scopeGrowthBucket: bucketScopeGrowth(telemetry.filesModified.size),
-      confidenceBucket: "medium",
+      scopeGrowthBucket: bucketScopeGrowth(scopeGrowth),
+      confidenceBucket,
       spendEstimateBucket: "unknown",
     },
   };
@@ -1768,6 +1805,7 @@ export const __internal = {
   isReadonlyBashCommand,
   buildHeadsDownCompaction,
   buildStartedEventInput,
+  progressConfidenceBucket,
   buildProgressEventInput,
   buildScopeDriftEventInput,
   buildContinuationSavedEventInput,
@@ -1897,9 +1935,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (existing) return existing;
 
     const telemetry: PiRunTelemetry = {
-      runId: runIdForProposal(proposal.id),
+      runId: `${runIdForProposal(proposal.id)}_${randomHex(8)}`,
       proposalId: proposal.id,
-      startedAt: new Date(proposal.evaluatedAt).getTime() || Date.now(),
+      startedAt: Date.now(),
       sequence: 1,
       toolCallsCount: 0,
       toolReadCount: 0,
@@ -2139,7 +2177,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const scope = getScopeSnapshot(proposal.id);
     await reportPiAgentRunEvent(
       ctx,
-      buildProgressEventInput(telemetry, scope.warningSent || telemetry.scopeDriftReported),
+      buildProgressEventInput(
+        telemetry,
+        scope.warningSent || telemetry.scopeDriftReported,
+        proposal.estimatedFiles,
+        proposal.estimatedMinutes,
+      ),
     );
 
     await maybeHandleRabbitHoleDetected(ctx, proposal);

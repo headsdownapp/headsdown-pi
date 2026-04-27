@@ -61,7 +61,7 @@ describe("Pi agent run event payloads", () => {
       completedReported: false,
     };
 
-    const progress = __internal.buildProgressEventInput(telemetry, true);
+    const progress = __internal.buildProgressEventInput(telemetry, false, 2, 20);
     const drift = __internal.buildScopeDriftEventInput(telemetry, 1);
     const graphqlInput = __internal.serializeAgentRunEventForGraphQL(progress);
     const serialized = stringify({ progress, drift });
@@ -74,8 +74,10 @@ describe("Pi agent run event payloads", () => {
         toolWriteCount: 2,
         filesReadBucket: "1_to_2",
         filesModifiedBucket: "1_to_2",
-        scopeChanged: true,
+        scopeChanged: false,
         progressState: "working",
+        scopeGrowthBucket: "none",
+        confidenceBucket: "low",
       },
     });
     expect(drift).toMatchObject({
@@ -93,14 +95,95 @@ describe("Pi agent run event payloads", () => {
       progressPayload: {
         filesReadBucket: "_1_TO_2",
         filesModifiedBucket: "_1_TO_2",
-        scopeGrowthBucket: "_1_TO_2_FILES",
+        scopeGrowthBucket: "NONE",
         validationStatus: "UNKNOWN",
+        confidenceBucket: "LOW",
       },
     });
     expect(graphqlInput.eventId).toMatch(/^[0-9a-f-]{36}$/);
     expect(new Date(String(graphqlInput.occurredAt)).toString()).not.toBe("Invalid Date");
     expect(serialized).not.toContain("/private/repo");
     expect(serialized).not.toContain("auth.ts");
+  });
+
+  it("reports only growth beyond the approved file estimate", () => {
+    const telemetry = {
+      runId: __internal.runIdForProposal("proposal-1"),
+      proposalId: "proposal-1",
+      startedAt: Date.now() - 10_000,
+      sequence: 2,
+      toolCallsCount: 4,
+      toolReadCount: 1,
+      toolWriteCount: 3,
+      toolExternalCount: 0,
+      failureCount: 0,
+      retryCount: 0,
+      redirectCount: 0,
+      filesRead: new Set<string>(),
+      filesModified: new Set(["one.ts", "two.ts", "three.ts"]),
+      startedReported: true,
+      scopeDriftReported: false,
+      completedReported: false,
+    };
+
+    const withinEstimate = __internal.buildProgressEventInput(telemetry, false, 3, 20);
+    const overEstimate = __internal.buildProgressEventInput(telemetry, true, 1, 20);
+
+    expect(withinEstimate).toMatchObject({
+      progressPayload: {
+        filesModifiedBucket: "3_to_5",
+        scopeChanged: false,
+        scopeGrowthBucket: "none",
+        confidenceBucket: "low",
+      },
+    });
+    expect(overEstimate).toMatchObject({
+      progressPayload: {
+        filesModifiedBucket: "3_to_5",
+        scopeChanged: true,
+        scopeGrowthBucket: "1_to_2_files",
+        confidenceBucket: "medium",
+      },
+    });
+  });
+
+  it("uses medium confidence when concrete progress risk signals are present", () => {
+    expect(
+      __internal.progressConfidenceBucket({
+        elapsedSeconds: 30,
+        estimatedMinutes: 20,
+        scopeGrowth: undefined,
+        retryCount: 0,
+        failureCount: 0,
+      }),
+    ).toBe("low");
+    expect(
+      __internal.progressConfidenceBucket({
+        elapsedSeconds: 30,
+        estimatedMinutes: 20,
+        scopeGrowth: 1,
+        retryCount: 0,
+        failureCount: 0,
+      }),
+    ).toBe("medium");
+    expect(
+      __internal.progressConfidenceBucket({
+        elapsedSeconds: 30,
+        estimatedMinutes: 20,
+        scopeGrowth: 0,
+        retryCount: 0,
+        failureCount: 3,
+      }),
+    ).toBe("medium");
+    expect(
+      __internal.progressConfidenceBucket({
+        elapsedSeconds: 1_600,
+        estimatedMinutes: 20,
+        scopeGrowth: 0,
+        retryCount: 0,
+        failureCount: 0,
+      }),
+    ).toBe("medium");
   });
 
   it("builds continuation, resumed, queued, terminal, and outcome events without raw continuation text", () => {
