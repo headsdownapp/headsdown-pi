@@ -229,7 +229,7 @@ describe("availability override compatibility", () => {
 
     expect(calls[0]!.query).toContain("ActiveAvailabilityOverride");
     expect(calls[1]!.variables).toEqual({
-      input: { mode: "limited", durationMinutes: 20, source: "pi" },
+      input: { mode: "LIMITED", durationMinutes: 20, source: "pi" },
     });
     expect(calls[2]!.variables).toEqual({ id: "ovr-2", reason: "done", source: "pi" });
   });

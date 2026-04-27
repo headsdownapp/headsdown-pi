@@ -562,8 +562,16 @@ async function createAvailabilityOverrideCompat(
     throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
   }
 
+  const graphQLMode = toGraphQLEnumValue(input.mode);
+  if (!graphQLMode) {
+    throw new Error("Invalid availability override mode.");
+  }
+
   const data = await graphql.request(CREATE_AVAILABILITY_OVERRIDE_MUTATION, {
-    input,
+    input: stripUndefinedValues({
+      ...input,
+      mode: graphQLMode,
+    }),
   });
 
   const override =
