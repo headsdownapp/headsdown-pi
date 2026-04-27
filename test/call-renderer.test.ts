@@ -48,6 +48,18 @@ describe("renderHeadsDownCallCopy", () => {
     expect(rendered.primaryActionKey).toBe("resume_run");
   });
 
+  it("renders finish_line_friction with delivery-specific copy", () => {
+    const rendered = renderHeadsDownCallCopy({ key: "finish_line_friction" });
+
+    expect(rendered.key).toBe("finish_line_friction");
+    expect(rendered.fallbackApplied).toBe(false);
+    expect(rendered.title).toBe("Finish-line friction");
+    expect(rendered.body).toContain("validation or delivery is stuck");
+    expect(rendered.body).not.toContain("growing past the size");
+    expect(rendered.primaryActionKey).toBe("pause_and_summarize");
+    expect(rendered.secondaryActionKey).toBe("allow_for_duration");
+  });
+
   it("renders off_the_clock with queue_for_morning and approved off-clock copy", () => {
     const rendered = renderHeadsDownCallCopy({ key: "off_the_clock" });
 
