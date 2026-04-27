@@ -122,6 +122,16 @@ describe("Extension file", () => {
     expect(content).toContain('normalizedArgs.startsWith("allow")');
   });
 
+  it("supports session-scoped rabbit-hole override controls", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('type RabbitHoleSessionMode = "on" | "off" | "quiet"');
+    expect(content).toContain("rabbitHoleSessionMode");
+    expect(content).toContain('normalizedArgs.startsWith("rabbit-hole ")');
+    expect(content).toContain("/headsdown rabbit-hole <status|off|quiet|on>");
+    expect(content).toContain("shouldBlockRabbitHoleMutation");
+    expect(content).toContain("shouldEmitRabbitHoleGuidance");
+  });
+
   it("supports themed status UI and runtime /headsdown theme switching", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
     expect(content).toContain("HEADSDOWN_UI_THEMES");
