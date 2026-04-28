@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { __internal } from "../extensions/headsdown/index.js";
 
@@ -576,6 +579,168 @@ describe("agent control off-clock queue flow", () => {
     expect(__internal.toGraphQLEnumValue("READY_TO_RESUME")).toBe("READY_TO_RESUME");
     expect(__internal.toGraphQLEnumValue("readyToResume")).toBe("READY_TO_RESUME");
     expect(__internal.toGraphQLEnumValue(null)).toBeUndefined();
+  });
+
+  it("normalizes legacy continuation artifacts and reports parse failures", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headsdown-continuation-"));
+    const legacyPath = join(dir, "legacy.json");
+    await writeFile(
+      legacyPath,
+      JSON.stringify({
+        branch: "main",
+        approvedProposalId: "proposal-1",
+        approvedProposalDescription: "Resume work",
+        estimatedFiles: 1,
+        modifiedFiles: ["src/index.ts"],
+        openDecisions: [],
+        pendingSteps: ["finish"],
+        completedSteps: ["started"],
+        resumeInstruction: "resume",
+        wrapUpInstruction: null,
+        savedAt: "2026-04-27T00:00:00Z",
+        reason: "manual-save",
+      }),
+    );
+
+    const legacy = await __internal.loadContinuationArtifactFromPath(legacyPath, false);
+    expect(legacy.error).toBeNull();
+    expect(legacy.artifact?.runId).toBeNull();
+    expect(legacy.artifact?.pendingSteps).toEqual(["finish"]);
+
+    const badPath = join(dir, "bad.json");
+    await writeFile(badPath, "{not-json");
+
+    const bad = await __internal.loadContinuationArtifactFromPath(badPath, false);
+    expect(bad.artifact).toBeNull();
+    expect(bad.error?.reason).toBe("parse_failed");
+  });
+
+  it("loads continuation by applying resume_run only for the matched backend-allowed run", async () => {
+    const artifact = __internal.normalizeContinuationArtifact({
+      branch: "main",
+      runId: "saved-run",
+      approvedProposalId: "proposal-1",
+      approvedProposalDescription: "Resume work",
+      estimatedFiles: 1,
+      modifiedFiles: [],
+      openDecisions: [],
+      pendingSteps: [],
+      completedSteps: [],
+      resumeInstruction: "resume",
+      wrapUpInstruction: null,
+      savedAt: "2026-04-27T00:00:00Z",
+      reason: "manual-save",
+    })!;
+    const applied: Array<Record<string, unknown>> = [];
+    let cleared = false;
+    let reported = false;
+
+    const result = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({
+        ok: true,
+        overview: __internal.normalizeAgentControlOverviewPayload({
+          runSummaries: [
+            {
+              runId: "saved-run",
+              callKey: "READY_TO_RESUME",
+              allowedActionKeys: ["RESUME_RUN"],
+            },
+          ],
+        }),
+      }),
+      applyAction: async (_client: any, input: any) => {
+        applied.push(input);
+        return { ok: true, runSummary: null };
+      },
+      clearContinuation: async () => {
+        cleared = true;
+        return true;
+      },
+      reportResumed: async () => {
+        reported = true;
+      },
+    });
+
+    expect(result).toEqual({
+      consumed: true,
+      resumeAction: { attempted: true, ok: true, runId: "saved-run" },
+    });
+    expect(applied).toEqual([
+      expect.objectContaining({ runId: "saved-run", actionKey: "resume_run" }),
+    ]);
+    expect(cleared).toBe(true);
+    expect(reported).toBe(true);
+  });
+
+  it("keeps continuation artifacts when overview or resume apply fails", async () => {
+    const artifact = __internal.normalizeContinuationArtifact({
+      branch: "main",
+      runId: "saved-run",
+      approvedProposalId: null,
+      approvedProposalDescription: "Resume work",
+      estimatedFiles: null,
+      modifiedFiles: [],
+      openDecisions: [],
+      pendingSteps: [],
+      completedSteps: [],
+      resumeInstruction: "resume",
+      wrapUpInstruction: null,
+      savedAt: "2026-04-27T00:00:00Z",
+      reason: "manual-save",
+    })!;
+
+    const overviewFailure = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({ ok: false, reason: "overview_failed", message: "network down" }),
+      applyAction: async () => {
+        throw new Error("should not apply");
+      },
+      clearContinuation: async () => true,
+      reportResumed: async () => {},
+    });
+    expect(overviewFailure.consumed).toBe(false);
+    expect(overviewFailure.resumeAction).toMatchObject({
+      attempted: false,
+      reason: "overview_failed",
+      message: "network down",
+    });
+
+    const applyFailure = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({
+        ok: true,
+        overview: __internal.normalizeAgentControlOverviewPayload({
+          runSummaries: [
+            {
+              runId: "saved-run",
+              callKey: "READY_TO_RESUME",
+              allowedActionKeys: ["RESUME_RUN"],
+            },
+          ],
+        }),
+      }),
+      applyAction: async () => {
+        throw new Error("timeout");
+      },
+      clearContinuation: async () => {
+        throw new Error("should not clear");
+      },
+      reportResumed: async () => {
+        throw new Error("should not report");
+      },
+    });
+    expect(applyFailure.consumed).toBe(false);
+    expect(applyFailure.resumeAction).toMatchObject({
+      attempted: true,
+      ok: false,
+      runId: "saved-run",
+      reason: "apply_failed",
+      message: "timeout",
+    });
   });
 
   it("does not report a saved handoff if continuation persistence fails", async () => {
