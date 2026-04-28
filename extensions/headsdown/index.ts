@@ -57,6 +57,13 @@ import {
   type RenderedHeadsDownCallCopy,
 } from "./call-renderer.js";
 import { runLocalReferee } from "./referee/local-runner.js";
+import {
+  buildLocalRefereeOutcomeSummaryPayload,
+  renderLocalRefereeOutcomeSharePreview,
+  shouldShareLocalRefereeOutcomeSummary,
+  type LocalRefereeOutcomeShareChoice,
+  type LocalRefereeOutcomeSharingPreference,
+} from "./referee/outcome-sharing.js";
 
 // === State ===
 
@@ -88,6 +95,9 @@ interface ProposeToolParams {
 
 interface LocalRefereeToolParams {
   contract_path?: string;
+  share_outcome?: LocalRefereeOutcomeShareChoice;
+  confirm_share_preview?: boolean;
+  share_preview_token?: string;
   evidence?: {
     files_touched?: number;
     tool_calls?: number;
@@ -280,9 +290,20 @@ interface HeadsDownCompactionInput {
   tokensBefore: number;
 }
 
+interface LocalRefereeOutcomeSharingState {
+  privacyBoundaryVersion: string;
+  payloadSchemaVersion: 1;
+  workspaces: Record<string, LocalRefereeOutcomeSharingPreference>;
+}
+
 interface HeadsDownPiConfig extends HeadsDownConfig {
   autoThinking: AutoThinkingConfig;
+  localRefereeOutcomeSharing: LocalRefereeOutcomeSharingState;
 }
+
+const HEADSDOWN_PI_CLIENT_VERSION = "0.2.0";
+const LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION = "local_referee_outcome_v1";
+const OPAQUE_WORKSPACE_REF_PATTERN = /^workspace_[0-9a-f]{16}$/;
 
 const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
 const AVAILABILITY_CACHE_TTL_MS = 90 * 1000; // 90 seconds
@@ -1901,6 +1922,18 @@ const REPORT_AGENT_RUN_EVENT_MUTATION = `
   }
 `;
 
+const SHARE_LOCAL_REFEREE_OUTCOME_SUMMARY_MUTATION = `
+  mutation ShareLocalRefereeOutcomeSummary($input: ShareLocalRefereeOutcomeSummaryInput!) {
+    shareLocalRefereeOutcomeSummary(input: $input) {
+      ok
+      error {
+        code
+        message
+      }
+    }
+  }
+`;
+
 const RABBIT_HOLE_EVENT_QUERY = `
   query RabbitHoleEvents($proposalRef: String!, $eventType: String!, $limit: Int) {
     agentRunEvents(proposalRef: $proposalRef, eventType: $eventType, limit: $limit) {
@@ -2563,6 +2596,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let autoQueuedRunIds = new Set<string>();
   let rabbitHoleSessionMode: RabbitHoleSessionMode = "on";
   const rabbitHoleInterventions = new Map<string, RabbitHoleInterventionState>();
+  const pendingOutcomeSharePreviews = new Map<
+    string,
+    {
+      workspaceRef: string;
+      payloadHash: string;
+      createdAt: number;
+    }
+  >();
 
   function getLatestApprovedProposal(): ProposalRecord | null {
     const now = Date.now();
@@ -2964,11 +3005,46 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     await maybeHandleRabbitHoleDetected(ctx, proposal);
   }
 
+  function defaultLocalRefereeOutcomeSharingState(): LocalRefereeOutcomeSharingState {
+    return {
+      privacyBoundaryVersion: LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION,
+      payloadSchemaVersion: 1,
+      workspaces: {},
+    };
+  }
+
+  function normalizeLocalRefereeOutcomeSharingState(raw: unknown): LocalRefereeOutcomeSharingState {
+    const defaults = defaultLocalRefereeOutcomeSharingState();
+    if (!raw || typeof raw !== "object") return defaults;
+
+    const value = raw as Record<string, unknown>;
+    if (value.privacyBoundaryVersion !== LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION) {
+      return defaults;
+    }
+    if (value.payloadSchemaVersion !== 1) return defaults;
+    if (!value.workspaces || typeof value.workspaces !== "object") return defaults;
+
+    const workspaces = Object.fromEntries(
+      Object.entries(value.workspaces as Record<string, unknown>).filter(
+        ([key, preference]) =>
+          OPAQUE_WORKSPACE_REF_PATTERN.test(key) &&
+          (preference === "local_only" || preference === "always_share"),
+      ),
+    ) as Record<string, LocalRefereeOutcomeSharingPreference>;
+
+    return {
+      privacyBoundaryVersion: value.privacyBoundaryVersion,
+      payloadSchemaVersion: 1,
+      workspaces,
+    };
+  }
+
   async function loadConfig(): Promise<HeadsDownPiConfig> {
     if (!cachedConfig) {
       const store = new ConfigStore();
       const baseConfig = await store.load();
       let rawAutoThinking: unknown;
+      let rawLocalRefereeOutcomeSharing: unknown;
 
       try {
         const rawConfig = JSON.parse(await readFile(store.filePath, "utf-8")) as Record<
@@ -2976,16 +3052,170 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           unknown
         >;
         rawAutoThinking = rawConfig.autoThinking;
+        rawLocalRefereeOutcomeSharing = rawConfig.localRefereeOutcomeSharing;
       } catch {
         rawAutoThinking = undefined;
+        rawLocalRefereeOutcomeSharing = undefined;
       }
 
       cachedConfig = {
         ...baseConfig,
         autoThinking: normalizeAutoThinkingConfig(rawAutoThinking),
+        localRefereeOutcomeSharing: normalizeLocalRefereeOutcomeSharingState(
+          rawLocalRefereeOutcomeSharing,
+        ),
       };
     }
     return cachedConfig;
+  }
+
+  function workspaceOutcomeSharingPreference(
+    config: HeadsDownPiConfig,
+    workspaceRef: string,
+  ): LocalRefereeOutcomeSharingPreference {
+    if (
+      config.localRefereeOutcomeSharing.privacyBoundaryVersion !==
+      LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION
+    ) {
+      return "local_only";
+    }
+
+    if (config.localRefereeOutcomeSharing.payloadSchemaVersion !== 1) {
+      return "local_only";
+    }
+
+    return config.localRefereeOutcomeSharing.workspaces[workspaceRef] ?? "local_only";
+  }
+
+  async function updateLocalRefereeOutcomeSharingPreference(
+    ctx: ExtensionContext,
+    preference: LocalRefereeOutcomeSharingPreference,
+  ): Promise<void> {
+    const workspaceRef = toOpaqueWorkspaceRef(ctx.cwd);
+    const store = new ConfigStore();
+    const baseConfig = await store.load();
+    let rawConfig: Record<string, unknown> = {};
+
+    try {
+      rawConfig = JSON.parse(await readFile(store.filePath, "utf-8")) as Record<string, unknown>;
+    } catch {
+      rawConfig = {};
+    }
+
+    const currentState = normalizeLocalRefereeOutcomeSharingState(
+      rawConfig.localRefereeOutcomeSharing,
+    );
+    const nextWorkspaces = { ...currentState.workspaces };
+
+    if (preference === "always_share") {
+      nextWorkspaces[workspaceRef] = "always_share";
+    } else {
+      delete nextWorkspaces[workspaceRef];
+    }
+
+    const nextState: LocalRefereeOutcomeSharingState = {
+      privacyBoundaryVersion: LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION,
+      payloadSchemaVersion: 1,
+      workspaces: nextWorkspaces,
+    };
+
+    const updated = {
+      ...rawConfig,
+      ...baseConfig,
+      localRefereeOutcomeSharing: nextState,
+    };
+
+    await mkdir(dirname(store.filePath), { recursive: true });
+    await writeFile(store.filePath, `${JSON.stringify(updated, null, 2)}\n`, "utf-8");
+
+    cachedConfig = {
+      ...(cachedConfig ?? (await loadConfig())),
+      localRefereeOutcomeSharing: nextState,
+    };
+  }
+
+  function isHighSignalOutcomeSummary(
+    result: Awaited<ReturnType<typeof runLocalReferee>>,
+  ): boolean {
+    return result.evaluation.verdict !== "passed" || result.evidence.outcome !== "unknown";
+  }
+
+  function issueOutcomeSharePreviewToken(workspaceRef: string, payloadHash: string): string {
+    const now = Date.now();
+    for (const [token, pending] of pendingOutcomeSharePreviews.entries()) {
+      if (now - pending.createdAt > 15 * 60 * 1000) {
+        pendingOutcomeSharePreviews.delete(token);
+      }
+    }
+
+    const token = randomUUID();
+    pendingOutcomeSharePreviews.set(token, { workspaceRef, payloadHash, createdAt: now });
+    return token;
+  }
+
+  function consumeOutcomeSharePreviewToken(
+    token: string | undefined,
+    workspaceRef: string,
+    payloadHash: string,
+  ): boolean {
+    if (!token) return false;
+
+    const pending = pendingOutcomeSharePreviews.get(token);
+    if (!pending) return false;
+
+    pendingOutcomeSharePreviews.delete(token);
+    return pending.workspaceRef === workspaceRef && pending.payloadHash === payloadHash;
+  }
+
+  function normalizeOutcomeShareFailureReason(code: unknown): string {
+    const normalized = typeof code === "string" ? normalizeEnumKey(code) : null;
+    if (normalized === "not_authenticated") return "not_authenticated";
+    return "hosted_sync_unavailable";
+  }
+
+  async function shareLocalRefereeOutcomeSummary(
+    payload: ReturnType<typeof buildLocalRefereeOutcomeSummaryPayload>,
+  ): Promise<{ shared: boolean; reason: string }> {
+    const client = await getClient();
+    if (!client) {
+      return { shared: false, reason: "not_authenticated" };
+    }
+
+    const graphql = getLowLevelGraphQLClient(client);
+    if (!graphql) {
+      return { shared: false, reason: "hosted_sync_unavailable" };
+    }
+
+    try {
+      const data = await graphql.request(SHARE_LOCAL_REFEREE_OUTCOME_SUMMARY_MUTATION, {
+        input: {
+          summary: payload,
+        },
+      });
+      const response = (data as Record<string, unknown>).shareLocalRefereeOutcomeSummary as
+        | { ok?: boolean; error?: { code?: string | null } | null }
+        | null
+        | undefined;
+
+      if (response?.ok) {
+        return { shared: true, reason: "shared" };
+      }
+
+      return {
+        shared: false,
+        reason: normalizeOutcomeShareFailureReason(response?.error?.code),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message.includes("shareLocalRefereeOutcomeSummary") ||
+        message.includes("ShareLocalRefereeOutcomeSummaryInput")
+      ) {
+        return { shared: false, reason: "hosted_sync_unavailable" };
+      }
+
+      return { shared: false, reason: "submit_failed" };
+    }
   }
 
   async function getClient(): Promise<HeadsDownClient | null> {
@@ -3972,6 +4202,24 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             "Optional path to the local Referee JSON contract. Defaults to .headsdown/referee.json.",
         }),
       ),
+      share_outcome: Type.Optional(
+        StringEnum(["preview", "share_once", "always_share", "keep_local"] as const, {
+          description:
+            "Optional outcome sharing action. Use preview to show the summary, share_once to share this run, always_share to persist workspace preference, or keep_local to disable persistent sharing.",
+        }),
+      ),
+      confirm_share_preview: Type.Optional(
+        Type.Boolean({
+          description:
+            "Confirm that you reviewed the preview and privacy boundary before sharing or persisting always_share.",
+        }),
+      ),
+      share_preview_token: Type.Optional(
+        Type.String({
+          description:
+            "Preview token from a prior headsdown_referee call. Required with confirm_share_preview=true before sharing occurs.",
+        }),
+      ),
       evidence: Type.Optional(
         Type.Object({
           files_touched: Type.Optional(
@@ -4015,9 +4263,117 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         },
       });
 
+      const config = await loadConfig();
+      const workspaceRef = toOpaqueWorkspaceRef(ctx.cwd);
+      const currentPreference = workspaceOutcomeSharingPreference(config, workspaceRef);
+      const outcomePayload = buildLocalRefereeOutcomeSummaryPayload({
+        receipt: result.receipt,
+        clientVersion: HEADSDOWN_PI_CLIENT_VERSION,
+        executionMode: "local_only",
+      });
+      const previewText = renderLocalRefereeOutcomeSharePreview(outcomePayload);
+      const highSignalSummary = isHighSignalOutcomeSummary(result);
+      const payloadHash = createHash("sha256").update(JSON.stringify(outcomePayload)).digest("hex");
+      const requestedChoice = params.share_outcome;
+      const shouldShare = shouldShareLocalRefereeOutcomeSummary({
+        choice: requestedChoice,
+        config: { preference: currentPreference },
+      });
+      const shouldShowSharePreview =
+        highSignalSummary || requestedChoice !== undefined || currentPreference === "always_share";
+      const requiresPreviewConfirmation =
+        requestedChoice === "share_once" || requestedChoice === "always_share";
+      const hasPreviewConfirmation = params.confirm_share_preview === true;
+      const hasValidPreviewToken =
+        requiresPreviewConfirmation && hasPreviewConfirmation
+          ? consumeOutcomeSharePreviewToken(params.share_preview_token, workspaceRef, payloadHash)
+          : false;
+      const previewToken =
+        shouldShowSharePreview && !hasValidPreviewToken
+          ? issueOutcomeSharePreviewToken(workspaceRef, payloadHash)
+          : null;
+
+      let persistedPreference = currentPreference;
+      let shareResult: { shared: boolean; reason: string } = {
+        shared: false,
+        reason: "kept_local",
+      };
+
+      if (requestedChoice === "keep_local" && currentPreference !== "local_only") {
+        await updateLocalRefereeOutcomeSharingPreference(ctx, "local_only");
+        persistedPreference = "local_only";
+      }
+
+      if (shouldShare) {
+        if (requiresPreviewConfirmation && !hasPreviewConfirmation) {
+          shareResult = { shared: false, reason: "preview_confirmation_required" };
+        } else if (requiresPreviewConfirmation && !hasValidPreviewToken) {
+          shareResult = { shared: false, reason: "preview_token_required" };
+        } else {
+          shareResult = await shareLocalRefereeOutcomeSummary(outcomePayload);
+          if (shareResult.shared && requestedChoice === "always_share") {
+            await updateLocalRefereeOutcomeSharingPreference(ctx, "always_share");
+            persistedPreference = "always_share";
+          }
+        }
+      }
+
+      const lines = [result.renderedReceipt];
+
+      if (shouldShowSharePreview) {
+        lines.push("");
+        lines.push(previewText);
+        if (previewToken) {
+          lines.push("");
+          lines.push(`Preview token: ${previewToken}`);
+        }
+      }
+
+      lines.push("");
+      lines.push(`Workspace sharing preference: ${persistedPreference}.`);
+
+      if (shareResult.shared) {
+        lines.push("Outcome summary shared successfully.");
+      } else if (shareResult.reason === "preview_confirmation_required") {
+        lines.push(
+          "Preview confirmation required. Re-run with share_outcome and confirm_share_preview=true after reviewing the summary above.",
+        );
+      } else if (shareResult.reason === "preview_token_required") {
+        lines.push(
+          "Preview token required. Re-run with share_outcome, confirm_share_preview=true, and share_preview_token from a previous preview call.",
+        );
+      } else if (shareResult.reason === "not_authenticated") {
+        lines.push("Sharing unavailable: not signed in. Run stays local.");
+      } else if (shareResult.reason === "hosted_sync_unavailable") {
+        lines.push("Sharing unavailable: hosted sync endpoint is not available. Run stays local.");
+      } else if (shareResult.reason === "submit_failed") {
+        lines.push("Sharing unavailable: hosted submission failed. Run stays local.");
+      } else if (highSignalSummary && requestedChoice === undefined) {
+        lines.push(
+          "To share this run summary, first run headsdown_referee to get a preview token, then re-run with share_outcome=share_once (or always_share), confirm_share_preview=true, and share_preview_token.",
+        );
+      } else {
+        lines.push("Run summary kept local.");
+      }
+
       return {
-        content: [{ type: "text", text: result.renderedReceipt }],
-        details: { receipt: result.receipt, evaluation: result.evaluation },
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {
+          receipt: result.receipt,
+          evaluation: result.evaluation,
+          outcomeSharing: {
+            suggested: highSignalSummary,
+            choice: requestedChoice ?? null,
+            shared: shareResult.shared,
+            reason: shareResult.reason,
+            preference: persistedPreference,
+            privacyBoundaryVersion: LOCAL_REFEREE_OUTCOME_PRIVACY_BOUNDARY_VERSION,
+            payloadSchemaVersion: 1,
+            preview: previewText,
+            previewToken,
+            payload: outcomePayload,
+          },
+        },
       };
     },
   });
