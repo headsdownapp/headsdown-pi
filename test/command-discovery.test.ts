@@ -1,7 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
 

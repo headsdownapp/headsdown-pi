@@ -1,7 +1,6 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtemp } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import headsdownExtension from "../extensions/headsdown/index.js";
 import {
@@ -48,6 +47,8 @@ describe("Local Referee contract", () => {
       { version: 1, checks: [] },
       { version: 1, checks: [{ type: "raw_log_contains", required: "secret" }] },
       { version: 1, checks: [{ type: "max_files_touched", max: -1 }] },
+      { version: 1, checks: [{ type: "max_tool_calls", max: 1.5 }] },
+      { version: 1, checks: [{ type: "network_required" }] },
       { version: 1, checks: [{ type: "network_required", required: "false" }] },
     ];
 
@@ -83,6 +84,13 @@ describe("Local Referee evaluation", () => {
       networkRequired: false,
       elapsedMinutesBucket: "15_to_30",
       outcome: "completed",
+    });
+  });
+
+  it("treats invalid elapsed minutes as unknown", () => {
+    expect(normalizeLocalRefereeEvidence({ elapsedMinutes: "not-a-number" })).toMatchObject({
+      elapsedMinutes: null,
+      elapsedMinutesBucket: "unknown",
     });
   });
 

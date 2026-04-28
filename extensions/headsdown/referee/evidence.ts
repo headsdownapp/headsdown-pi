@@ -35,12 +35,17 @@ export function normalizeNonNegativeInteger(value: unknown, fallback = 0): numbe
 
 function normalizeOptionalMinutes(value: unknown): number | null {
   if (value === undefined || value === null || value === "") return null;
-  return normalizeNonNegativeInteger(value, 0);
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.floor(parsed));
+  }
+  return null;
 }
 
 function normalizeBoolean(value: unknown, fallback = false): boolean {
   if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
     if (["true", "yes", "y", "1", "passed", "run"].includes(normalized)) return true;

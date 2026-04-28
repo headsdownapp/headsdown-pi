@@ -95,9 +95,7 @@ export async function loadLocalRefereeContract(options: {
 }): Promise<LocalRefereeContract> {
   const path = await resolveContractPath(options.cwd, options.contractPath);
   const read = options.adapters?.readFile ?? readFile;
-  let contents: string;
-
-  contents = await read(path, "utf-8");
+  const contents = await read(path, "utf-8");
 
   return parseLocalRefereeContractJson(contents);
 }

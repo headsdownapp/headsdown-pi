@@ -54,11 +54,11 @@ function parseCheckType(value: unknown, index: number): LocalRefereeCheckType {
 }
 
 function parseMax(value: unknown, index: number, field: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0)
     throw new LocalRefereeContractError(
-      `check ${index + 1} requires non-negative numeric ${field}.`,
+      `check ${index + 1} requires a non-negative integer ${field}.`,
     );
-  return Math.floor(value);
+  return value;
 }
 
 function parseRequiredString(value: unknown, index: number, allowed: string[]): string {
@@ -98,8 +98,9 @@ function parseCheck(value: unknown, index: number): LocalRefereeCheck {
     case "max_tool_calls":
       return { type, max: parseMax(record.max, index, "max") };
     case "require_tests":
-    case "network_required":
       return { type, required: parseRequiredBoolean(record.required ?? true, index) };
+    case "network_required":
+      return { type, required: parseRequiredBoolean(record.required, index) };
     case "outcome":
       return {
         type,

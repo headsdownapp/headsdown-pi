@@ -3568,9 +3568,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params: LocalRefereeToolParams, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params: LocalRefereeToolParams, _signal, _onUpdate, ctx) {
       const result = await runLocalReferee({
-        cwd: _ctx.cwd,
+        cwd: ctx.cwd,
         contractPath: params.contract_path,
         evidence: {
           filesTouched: params.evidence?.files_touched,
