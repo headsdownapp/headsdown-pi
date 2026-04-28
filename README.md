@@ -66,7 +66,7 @@ On `tool_result`, successful `write`/`edit` operations are tracked as realized m
 
 During approved runs, Pi reports privacy-safe progress metadata (counts, buckets, validation state, and timing only). If HeadsDown raises `rabbit_hole_detected` or `finish_line_friction`, Pi emits Call/Trap/Play/Escalation guidance, saves a continuation handoff, and locally blocks further mutating edits while the backend call is still available for the next action.
 
-Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing.
+Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing. Use `/headsdown help` to see grouped usage, or `/headsdown menu` to open an interactive picker for common HeadsDown controls.
 
 If rabbit-hole guidance is miscalibrated for the current Pi session, use a session-scoped override instead of disabling telemetry or changing global settings:
 
@@ -108,7 +108,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 - `headsdown_report` - report approved task outcome
 - `headsdown_auth` - authenticate via Device Flow
 
-The package also registers `/headsdown` for quick status checks and session controls, including `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
+The package also registers `/headsdown` for quick status checks and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Session controls include `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
 
 ## Skill
 
