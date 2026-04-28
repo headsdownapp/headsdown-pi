@@ -59,6 +59,15 @@ If HeadsDown reports `rabbit_hole_detected`, follow this structure:
 - Play: stop mutating edits, save the handoff, then choose one valid backend action while the call is still `rabbit_hole_detected`: `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow 15` to apply `allow_for_duration` instead.
 - Escalation: do not apply `allow_for_duration` after pause; once paused, resume later with a valid ready-to-resume action.
 
+If the user says the rabbit-hole call is wrong for the current session, use the local session controls instead of changing global settings:
+
+- `/headsdown rabbit-hole off`: disable hard stops for this session while keeping soft keep-it-tight guidance.
+- `/headsdown rabbit-hole quiet`: suppress hard stops and repeated rabbit-hole guidance for this session.
+- `/headsdown rabbit-hole on`: restore normal rabbit-hole handling for future calls in this session.
+- `/headsdown rabbit-hole status`: show the active mode. Status must distinguish normal handling, hard-stop-disabled mode, and quiet mode.
+
+Progress telemetry continues in all rabbit-hole session modes, and other HeadsDown policies still apply.
+
 ## Digest Triage
 
 When a session starts with pending digest summaries, or when the user asks what they missed:

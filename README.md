@@ -68,6 +68,15 @@ During approved runs, Pi reports privacy-safe progress metadata (counts, buckets
 
 Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing.
 
+If rabbit-hole guidance is miscalibrated for the current Pi session, use a session-scoped override instead of disabling telemetry or changing global settings:
+
+- `/headsdown rabbit-hole off` disables rabbit-hole hard stops for this session. Mutating tools are no longer blocked by a local rabbit-hole containment, but Pi still receives soft guidance to keep the run tight.
+- `/headsdown rabbit-hole quiet` disables both rabbit-hole hard stops and repeated rabbit-hole guidance for this session. Progress telemetry continues quietly.
+- `/headsdown rabbit-hole on` restores normal rabbit-hole hard stops and guidance for future calls in this session.
+- `/headsdown rabbit-hole status` shows whether normal handling, hard-stop-disabled mode, or quiet mode is active.
+
+Other HeadsDown policies still apply while a rabbit-hole session override is active.
+
 ### Auto-Thinking Policy
 
 Auto-thinking is an optional policy that lets the extension choose a pi thinking level before each agent turn. It uses the current prompt, active HeadsDown availability context, and approved proposal state that the extension already has locally. It does not make extra telemetry calls.
@@ -99,7 +108,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 - `headsdown_report` - report approved task outcome
 - `headsdown_auth` - authenticate via Device Flow
 
-The package also registers `/headsdown` for quick status checks.
+The package also registers `/headsdown` for quick status checks and session controls, including `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
 
 ## Skill
 
@@ -144,13 +153,13 @@ The package also registers `/headsdown` for quick status checks.
 
 This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). Requests go only to HeadsDown APIs.
 
-**Sent:** task descriptions and estimates (for proposals), auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`). Auto-thinking does not send additional data.
+**Sent:** task descriptions and estimates (for proposals), privacy-safe progress telemetry for approved runs, auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`). Auto-thinking does not send additional data.
 
 **Received:** availability state, schedule context, verdicts, digest summaries.
 
 **Stored locally:** API credentials and optional continuation artifact (`~/.config/headsdown/continuation.json`).
 
-No telemetry. No analytics. No third-party requests.
+No prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, analytics, or third-party requests are sent.
 
 ## Development
 
