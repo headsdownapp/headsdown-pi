@@ -88,6 +88,8 @@ interface ProposalScopeSnapshot {
   updatedAt: string;
 }
 
+type PiProgressState = "working" | "validating" | "ready_for_review";
+
 interface PiRunTelemetry {
   runId: string;
   proposalId: string;
@@ -102,6 +104,7 @@ interface PiRunTelemetry {
   redirectCount: number;
   filesRead: Set<string>;
   filesModified: Set<string>;
+  progressState: PiProgressState;
   startedReported: boolean;
   scopeDriftReported: boolean;
   completedReported: boolean;
@@ -1360,7 +1363,7 @@ function buildProgressEventInput(
       failureCount: telemetry.failureCount,
       scopeChanged,
       redirectCount: telemetry.redirectCount,
-      progressState: "working",
+      progressState: telemetry.progressState,
       scopeGrowthBucket: bucketScopeGrowth(scopeGrowth),
       confidenceBucket,
       spendEstimateBucket: "unknown",
@@ -1712,6 +1715,31 @@ async function submitProposalCompat(
   }
 }
 
+function progressStateForBashCommand(command: string): PiProgressState | null {
+  const normalized = command.trim();
+  if (normalized.length === 0) return null;
+
+  if (
+    /^(?:env\s+)?(?:npm|pnpm|yarn)\s+(?:test|run\s+test|run\s+lint|run\s+typecheck|run\s+compile)\b/i.test(
+      normalized,
+    ) ||
+    /^(?:env\s+)?(?:vitest|jest|pytest|go\s+test|cargo\s+test|mix\s+(?:test|compile))\b/i.test(
+      normalized,
+    )
+  ) {
+    return "validating";
+  }
+
+  if (
+    /^(?:env\s+)?git\s+(?:commit|push)\b/i.test(normalized) ||
+    /^(?:env\s+)?gh\s+pr\s+(?:create|edit|ready|view|checks)\b/i.test(normalized)
+  ) {
+    return "ready_for_review";
+  }
+
+  return null;
+}
+
 function isReadonlyBashCommand(command: string): boolean {
   const normalized = command.trim();
   if (normalized.length === 0) return true;
@@ -1901,6 +1929,7 @@ export const __internal = {
   queueForMorningWithHandoff,
   isPotentiallyMutatingBashCommand,
   isReadonlyBashCommand,
+  progressStateForBashCommand,
   buildHeadsDownCompaction,
   buildStartedEventInput,
   progressConfidenceBucket,
@@ -2044,6 +2073,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       redirectCount: 0,
       filesRead: new Set(),
       filesModified: new Set(getScopeSnapshot(proposal.id).modifiedFiles),
+      progressState: "working",
       startedReported: false,
       scopeDriftReported: false,
       completedReported: false,
@@ -3253,6 +3283,18 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     if (event.isError) return undefined;
+
+    if (event.toolName === "bash") {
+      const activeProposal = getLatestApprovedProposal();
+      const command = (event.input as { command?: string }).command ?? "";
+      const progressState = progressStateForBashCommand(command);
+
+      if (activeProposal && progressState) {
+        const telemetry = getTelemetryForProposal(activeProposal);
+        telemetry.progressState = progressState;
+        await reportProgress(ctx, activeProposal);
+      }
+    }
 
     if (event.toolName !== "write" && event.toolName !== "edit") {
       return undefined;

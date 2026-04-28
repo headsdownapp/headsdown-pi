@@ -56,6 +56,7 @@ describe("Pi agent run event payloads", () => {
       redirectCount: 1,
       filesRead: new Set(["/private/repo/src/auth.ts"]),
       filesModified: new Set(["/private/repo/src/auth.ts", "/private/repo/test/auth_test.ts"]),
+      progressState: "working" as const,
       startedReported: true,
       scopeDriftReported: false,
       completedReported: false,
@@ -106,6 +107,56 @@ describe("Pi agent run event payloads", () => {
     expect(serialized).not.toContain("auth.ts");
   });
 
+  it("reports validation and ready-for-review progress-state hints without raw command content", () => {
+    expect(__internal.progressStateForBashCommand("npm test")).toBe("validating");
+    expect(__internal.progressStateForBashCommand("mix compile --warnings-as-errors")).toBe(
+      "validating",
+    );
+    expect(__internal.progressStateForBashCommand("git commit -m public-safe")).toBe(
+      "ready_for_review",
+    );
+    expect(__internal.progressStateForBashCommand("gh pr create --fill")).toBe("ready_for_review");
+    expect(__internal.progressStateForBashCommand("rg finish_line_friction")).toBeNull();
+
+    const telemetry = {
+      runId: __internal.runIdForProposal("proposal-1"),
+      proposalId: "proposal-1",
+      startedAt: Date.now() - 10_000,
+      sequence: 2,
+      toolCallsCount: 4,
+      toolReadCount: 1,
+      toolWriteCount: 2,
+      toolExternalCount: 1,
+      failureCount: 0,
+      retryCount: 0,
+      redirectCount: 1,
+      filesRead: new Set(["/private/repo/src/auth.ts"]),
+      filesModified: new Set(["/private/repo/src/auth.ts"]),
+      progressState: "validating" as const,
+      startedReported: true,
+      scopeDriftReported: false,
+      completedReported: false,
+    };
+
+    const progress = __internal.buildProgressEventInput(telemetry, false, 2, 20);
+    const graphqlInput = __internal.serializeAgentRunEventForGraphQL(progress);
+    const serialized = stringify({ progress, graphqlInput });
+
+    expect(progress).toMatchObject({
+      progressPayload: {
+        progressState: "validating",
+      },
+    });
+    expect(graphqlInput).toMatchObject({
+      progressPayload: {
+        progressState: "VALIDATING",
+      },
+    });
+    expect(serialized).not.toContain("npm test");
+    expect(serialized).not.toContain("git commit");
+    expect(serialized).not.toContain("/private/repo");
+  });
+
   it("reports only growth beyond the approved file estimate", () => {
     const telemetry = {
       runId: __internal.runIdForProposal("proposal-1"),
@@ -121,6 +172,7 @@ describe("Pi agent run event payloads", () => {
       redirectCount: 0,
       filesRead: new Set<string>(),
       filesModified: new Set(["one.ts", "two.ts", "three.ts"]),
+      progressState: "working" as const,
       startedReported: true,
       scopeDriftReported: false,
       completedReported: false,
@@ -201,6 +253,7 @@ describe("Pi agent run event payloads", () => {
       redirectCount: 0,
       filesRead: new Set<string>(),
       filesModified: new Set(["/private/repo/src/auth.ts"]),
+      progressState: "working" as const,
       startedReported: true,
       scopeDriftReported: true,
       completedReported: false,
