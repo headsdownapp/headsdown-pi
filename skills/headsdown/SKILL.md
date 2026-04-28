@@ -11,6 +11,7 @@ This skill connects you to [HeadsDown](https://headsdown.app) so you're aware of
 
 Use these tools directly:
 
+- `headsdown_referee`: local-only run verification from a repo-local contract; no account required
 - `headsdown_status`: current mode, schedule context, wrap-up instruction, active proposal scope
 - `headsdown_presets`: list or apply saved availability presets
 - `headsdown_propose`: submit a task proposal for approved/deferred verdict
@@ -31,7 +32,7 @@ Before any non-trivial coding task:
    - `approved`: proceed.
    - `deferred`: tell the user and offer a reduced-scope slice.
 
-Skip this flow only for trivial actions like quick reads or simple clarifications.
+Skip this flow only for trivial actions like quick reads or simple clarifications. The local Referee path is also account-optional: use `headsdown_referee` or `/headsdown referee` when the user asks for local verification without hosted HeadsDown.
 
 ## Mode Semantics
 
@@ -94,6 +95,10 @@ After finishing approved work, call `headsdown_report` with `completed`, `failed
 - Use `headsdown_presets` only when the user explicitly asks to change mode.
 - Use `headsdown_override` for temporary one-off mode changes.
 - Respect locked status and never force mode changes.
+
+## Local Referee
+
+Use `headsdown_referee` or `/headsdown referee` to verify a run locally from `.headsdown/referee.json`. This path does not require HeadsDown credentials and should not be treated as hosted sync or outcome sharing. The receipt contains derived review fields only: verdict, check outcomes, broad buckets, validation status, test/network booleans, outcome category, generated time, and an opaque contract reference. Do not include prompts, code, file paths, repository names, branch names, terminal output, logs, or message contents in local receipt text.
 
 ## Authentication And Failures
 

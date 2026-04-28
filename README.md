@@ -28,11 +28,47 @@ Or add to `~/.pi/agent/settings.json`:
 
 ## Setup
 
-After installing, authenticate with HeadsDown:
+After installing, authenticate with HeadsDown for hosted availability, proposal, digest, continuation, and reporting features:
 
 > "Run headsdown_auth to connect my HeadsDown account"
 
 Pi guides Device Flow auth. Credentials are stored at `~/.config/headsdown/credentials.json`.
+
+Authentication is optional for the local Referee path below. You can verify a run locally without a HeadsDown account.
+
+## Local Referee (account optional)
+
+Local Referee is a local-only verification path for source-readable run receipts. It reads a small repo-local completion contract, evaluates local evidence, and prints a sanitized receipt. It does not require HeadsDown credentials and does not make required network calls.
+
+Create `.headsdown/referee.json` in the workspace:
+
+```json
+{
+  "version": 1,
+  "checks": [
+    { "type": "validation_status", "required": "passed" },
+    { "type": "max_files_touched", "max": 5 },
+    { "type": "max_tool_calls", "max": 10 },
+    { "type": "require_tests", "required": true },
+    { "type": "network_required", "required": false },
+    { "type": "outcome", "required": "completed" }
+  ]
+}
+```
+
+Run the local Referee from Pi:
+
+```text
+/headsdown referee
+```
+
+Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`. If `files_touched` is omitted, the runner counts changed entries from local `git status --short --untracked-files=all` and stores only the count bucket in the receipt. If Git status is unavailable, pass `files_touched` explicitly so the receipt does not silently undercount local changes.
+
+Supported check types are `validation_status`, `max_files_touched`, `max_tool_calls`, `require_tests`, `network_required`, and `outcome`. `require_tests` may omit `required` as shorthand for `true`; `network_required` must always set `required` explicitly because both `true` and `false` are meaningful.
+
+The receipt includes only derived review fields: verdict, check outcomes, broad count/time buckets, validation status, test/network booleans, outcome category, generated time, and an opaque contract reference. It does not include prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, credentials, or raw contract text.
+
+Hosted HeadsDown remains additive. Connecting an account can add hosted availability policy, standing rules, mobile approval, audit/history, cross-client coordination, and outcome learning. The local Referee receipt works without those hosted features.
 
 ## Extension Features
 
@@ -98,6 +134,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 
 ### Registered Tools
 
+- `headsdown_referee` - local-only run verification receipt from a repo-local contract; no account required
 - `headsdown_status` - current availability, schedule, wrap-up instruction, active scope
 - `headsdown_presets` - list/apply saved presets
 - `headsdown_propose` - submit task proposal for approved/deferred verdict
@@ -108,7 +145,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 - `headsdown_report` - report approved task outcome
 - `headsdown_auth` - authenticate via Device Flow
 
-The package also registers `/headsdown` for quick status checks and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Session controls include `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
+The package also registers `/headsdown` for quick status checks, local Referee verification, and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Local verification uses `/headsdown referee`. Session controls include `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
 
 ## Skill
 
@@ -151,15 +188,17 @@ The package also registers `/headsdown` for quick status checks and session cont
 
 ## Data Transparency
 
-This package is a thin wrapper around the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). Requests go only to HeadsDown APIs.
+Hosted features use the [HeadsDown SDK](https://github.com/headsdownapp/headsdown-sdk). Requests go only to HeadsDown APIs.
 
-**Sent:** task descriptions and estimates (for proposals), privacy-safe progress telemetry for approved runs, auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`). Auto-thinking does not send additional data.
+**Sent by hosted features:** task descriptions and estimates (for proposals), privacy-safe progress telemetry for approved runs, auth credentials, actor metadata (`source`, `agentId`, `sessionId`, `workspaceRef`). Auto-thinking does not send additional data.
 
-**Received:** availability state, schedule context, verdicts, digest summaries.
+**Sent by Local Referee:** nothing by default. It evaluates locally and prints a local receipt.
 
-**Stored locally:** API credentials and optional continuation artifact (`~/.config/headsdown/continuation.json`).
+**Received by hosted features:** availability state, schedule context, verdicts, digest summaries.
 
-No prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, analytics, or third-party requests are sent.
+**Stored locally:** API credentials when authenticated, optional continuation artifact (`~/.config/headsdown/continuation.json`), and any repo-local Referee contract you create.
+
+No prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, analytics, or third-party requests are sent by default.
 
 ## Development
 

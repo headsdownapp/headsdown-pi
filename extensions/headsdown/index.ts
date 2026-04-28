@@ -56,6 +56,7 @@ import {
   type HeadsDownUiIntent,
   type RenderedHeadsDownCallCopy,
 } from "./call-renderer.js";
+import { runLocalReferee } from "./referee/local-runner.js";
 
 // === State ===
 
@@ -83,6 +84,19 @@ interface ProposeToolParams {
   source_ref?: string;
   idempotency_key?: string;
   delivery_mode?: "auto" | "wrap_up" | "full_depth";
+}
+
+interface LocalRefereeToolParams {
+  contract_path?: string;
+  evidence?: {
+    files_touched?: number;
+    tool_calls?: number;
+    validation_status?: string;
+    tests_run?: boolean;
+    network_required?: boolean;
+    elapsed_minutes?: number;
+    outcome?: string;
+  };
 }
 
 interface ProposalScopeSnapshot {
@@ -2306,6 +2320,12 @@ const HEADSDOWN_COMMAND_OPTIONS: HeadsDownCommandOption[] = [
     menu: true,
   },
   {
+    value: "referee",
+    label: "Local Referee",
+    description: "Verify the current run locally without a HeadsDown account",
+    menu: true,
+  },
+  {
     value: "pause",
     label: "Pause + summarize",
     description: "Pause the active run and save a handoff",
@@ -2436,6 +2456,9 @@ function buildHeadsDownCommandHelp(): string {
     "  /headsdown status",
     "  /headsdown digest",
     "",
+    "Local verification",
+    "  /headsdown referee",
+    "",
     "Run actions",
     "  /headsdown pause",
     "  /headsdown allow <minutes>",
@@ -2524,6 +2547,7 @@ export const __internal = {
   getHeadsDownCommandCompletions,
   normalizeHeadsDownCommandArgs,
   toOpaqueWorkspaceRef,
+  runLocalReferee,
   CONTINUATION_PATH,
 };
 
@@ -3936,6 +3960,69 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   // === Custom tools ===
 
   pi.registerTool({
+    name: "headsdown_referee",
+    label: "HeadsDown Local Referee",
+    description:
+      "Verify the current run locally from a repo-local completion contract. Runs without HeadsDown credentials or required network calls.",
+    promptSnippet: "Run local HeadsDown Referee verification without requiring an account",
+    parameters: Type.Object({
+      contract_path: Type.Optional(
+        Type.String({
+          description:
+            "Optional path to the local Referee JSON contract. Defaults to .headsdown/referee.json.",
+        }),
+      ),
+      evidence: Type.Optional(
+        Type.Object({
+          files_touched: Type.Optional(
+            Type.Number({ description: "Local count of touched files." }),
+          ),
+          tool_calls: Type.Optional(Type.Number({ description: "Local count of tool calls." })),
+          validation_status: Type.Optional(
+            StringEnum(["passed", "failed", "unknown"] as const, {
+              description: "Local validation status for this run.",
+            }),
+          ),
+          tests_run: Type.Optional(
+            Type.Boolean({ description: "Whether tests or validation ran locally." }),
+          ),
+          network_required: Type.Optional(
+            Type.Boolean({ description: "Whether the local run required network access." }),
+          ),
+          elapsed_minutes: Type.Optional(
+            Type.Number({ description: "Elapsed local run time in minutes." }),
+          ),
+          outcome: Type.Optional(
+            StringEnum(["completed", "partially_completed", "blocked", "unknown"] as const, {
+              description: "Local run outcome category.",
+            }),
+          ),
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params: LocalRefereeToolParams, _signal, _onUpdate, ctx) {
+      const result = await runLocalReferee({
+        cwd: ctx.cwd,
+        contractPath: params.contract_path,
+        evidence: {
+          filesTouched: params.evidence?.files_touched,
+          toolCalls: params.evidence?.tool_calls,
+          validationStatus: params.evidence?.validation_status,
+          testsRun: params.evidence?.tests_run,
+          networkRequired: params.evidence?.network_required,
+          elapsedMinutes: params.evidence?.elapsed_minutes,
+          outcome: params.evidence?.outcome,
+        },
+      });
+
+      return {
+        content: [{ type: "text", text: result.renderedReceipt }],
+        details: { receipt: result.receipt, evaluation: result.evaluation },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "headsdown_status",
     label: "HeadsDown Status",
     description:
@@ -4904,6 +4991,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const selectedIndex = choices.indexOf(selected);
       const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : null;
       if (selectedOption) await runHeadsDownCommand(selectedOption.value, ctx);
+      return;
+    }
+
+    if (normalizedArgs === "referee") {
+      const result = await runLocalReferee({ cwd: ctx.cwd });
+      ctx.ui.notify(
+        result.renderedReceipt,
+        result.evaluation.verdict === "passed" ? "info" : "warning",
+      );
       return;
     }
 
