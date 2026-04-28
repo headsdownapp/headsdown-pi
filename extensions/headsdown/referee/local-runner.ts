@@ -45,7 +45,12 @@ export interface LocalRefereeRunResult {
 
 function assertInsideWorkspace(workspaceRoot: string, candidatePath: string): void {
   const relativePath = relative(workspaceRoot, candidatePath);
-  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+  if (
+    relativePath === ".." ||
+    relativePath.startsWith("../") ||
+    relativePath.startsWith("..\\") ||
+    isAbsolute(relativePath)
+  ) {
     throw new Error("Local Referee contract_path must stay inside the workspace.");
   }
 }
@@ -72,20 +77,26 @@ async function resolveContractPath(cwd: string, contractPath?: string): Promise<
 }
 
 async function defaultGitStatusShort(cwd: string): Promise<string> {
-  try {
-    const result = await execFile("git", [...GIT_STATUS_ARGS], {
-      cwd,
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
-    });
-    return result.stdout;
-  } catch {
-    return "";
-  }
+  const result = await execFile("git", [...GIT_STATUS_ARGS], {
+    cwd,
+    timeout: 5000,
+    maxBuffer: 1024 * 1024,
+  });
+  return result.stdout;
 }
 
 function countTouchedFilesFromGitStatus(status: string): number {
   return status.split(/\r?\n/).filter((line) => line.trim().length > 0).length;
+}
+
+async function countTouchedFiles(cwd: string, gitStatusShort: (cwd: string) => Promise<string>) {
+  try {
+    return countTouchedFilesFromGitStatus(await gitStatusShort(cwd));
+  } catch {
+    throw new Error(
+      "Local Referee could not count touched files with git status. Pass files_touched evidence explicitly.",
+    );
+  }
 }
 
 export async function loadLocalRefereeContract(options: {
@@ -108,7 +119,7 @@ export async function collectLocalRefereeEvidence(options: {
   const rawEvidence = options.evidence ?? {};
   const gitStatusShort = options.adapters?.gitStatusShort ?? defaultGitStatusShort;
   const filesTouched =
-    rawEvidence.filesTouched ?? countTouchedFilesFromGitStatus(await gitStatusShort(options.cwd));
+    rawEvidence.filesTouched ?? (await countTouchedFiles(options.cwd, gitStatusShort));
   return normalizeLocalRefereeEvidence({ networkRequired: false, ...rawEvidence, filesTouched });
 }
 

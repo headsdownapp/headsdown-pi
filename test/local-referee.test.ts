@@ -156,6 +156,15 @@ describe("Local Referee receipt and runner", () => {
     ).rejects.toThrow("inside the workspace");
   });
 
+  it("allows workspace-local contract filenames that start with two dots", async () => {
+    const cwd = await tempWorkspaceWithContract();
+    await writeFile(join(cwd, "..referee.json"), JSON.stringify(validContract()), "utf-8");
+
+    await expect(
+      loadLocalRefereeContract({ cwd, contractPath: "..referee.json" }),
+    ).resolves.toEqual(validContract());
+  });
+
   it("counts untracked files individually when collecting git status", () => {
     expect(__localRefereeRunnerInternal.GIT_STATUS_ARGS).toEqual([
       "status",
@@ -183,6 +192,24 @@ describe("Local Referee receipt and runner", () => {
     expect(gitStatusShort).toHaveBeenCalledWith(cwd);
     expect(result.evaluation.verdict).toBe("passed");
     expect(result.receipt.evidence.filesTouchedBucket).toBe("1_to_2");
+  });
+
+  it("fails safely when touched-file counting is unavailable", async () => {
+    const cwd = await tempWorkspaceWithContract();
+
+    await expect(
+      runLocalReferee({
+        cwd,
+        evidence: {
+          toolCalls: 3,
+          validationStatus: "passed",
+          testsRun: true,
+          networkRequired: false,
+          outcome: "completed",
+        },
+        adapters: { gitStatusShort: vi.fn().mockRejectedValue(new Error("private git error")) },
+      }),
+    ).rejects.toThrow("Pass files_touched evidence explicitly");
   });
 
   it("sanitizes the receipt so raw local details are not exposed", async () => {

@@ -1,8 +1,12 @@
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
+
+const execFile = promisify(execFileCallback);
 
 function registerHeadsDownCommand() {
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
@@ -26,6 +30,7 @@ function registerHeadsDownCommand() {
 
 async function tempWorkspaceWithRefereeContract() {
   const cwd = await mkdtemp(join(tmpdir(), "headsdown-command-referee-"));
+  await execFile("git", ["init"], { cwd });
   await mkdir(join(cwd, ".headsdown"));
   await writeFile(
     join(cwd, ".headsdown", "referee.json"),

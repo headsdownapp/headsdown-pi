@@ -62,7 +62,7 @@ Run the local Referee from Pi:
 /headsdown referee
 ```
 
-Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`. If `files_touched` is omitted, the runner counts changed entries from local `git status --short --untracked-files=all` and stores only the count bucket in the receipt.
+Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`. If `files_touched` is omitted, the runner counts changed entries from local `git status --short --untracked-files=all` and stores only the count bucket in the receipt. If Git status is unavailable, pass `files_touched` explicitly so the receipt does not silently undercount local changes.
 
 Supported check types are `validation_status`, `max_files_touched`, `max_tool_calls`, `require_tests`, `network_required`, and `outcome`. `require_tests` may omit `required` as shorthand for `true`; `network_required` must always set `required` explicitly because both `true` and `false` are meaningful.
 
