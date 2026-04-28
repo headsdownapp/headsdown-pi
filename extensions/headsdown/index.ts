@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
+import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as HeadsDownSDK from "@headsdown/sdk";
 import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
@@ -1898,6 +1899,179 @@ function buildHeadsDownCompaction(input: HeadsDownCompactionInput): {
   };
 }
 
+interface HeadsDownCommandOption {
+  value: string;
+  label: string;
+  description: string;
+  menu?: boolean;
+}
+
+const HEADSDOWN_COMMAND_OPTIONS: HeadsDownCommandOption[] = [
+  {
+    value: "status",
+    label: "Status",
+    description: "Refresh HeadsDown status and run guidance",
+    menu: true,
+  },
+  { value: "help", label: "Help", description: "Show HeadsDown command help", menu: true },
+  { value: "menu", label: "Menu", description: "Open this interactive HeadsDown command picker" },
+  {
+    value: "digest",
+    label: "Digest",
+    description: "Show how many digest summaries are waiting",
+    menu: true,
+  },
+  {
+    value: "pause",
+    label: "Pause + summarize",
+    description: "Pause the active run and save a handoff",
+    menu: true,
+  },
+  {
+    value: "allow 5",
+    label: "Allow 5 minutes",
+    description: "Allow a contained run to continue for 5 minutes",
+    menu: true,
+  },
+  {
+    value: "allow 15",
+    label: "Allow 15 minutes",
+    description: "Allow a contained run to continue for 15 minutes",
+    menu: true,
+  },
+  {
+    value: "allow 30",
+    label: "Allow 30 minutes",
+    description: "Allow a contained run to continue for 30 minutes",
+    menu: true,
+  },
+  {
+    value: "allow 60",
+    label: "Allow 60 minutes",
+    description: "Allow a contained run to continue for 60 minutes",
+    menu: true,
+  },
+  {
+    value: "rabbit-hole status",
+    label: "Rabbit-hole status",
+    description: "Show current rabbit-hole session handling",
+    menu: true,
+  },
+  {
+    value: "rabbit-hole off",
+    label: "Rabbit-hole hard stops off",
+    description: "Disable hard stops for this session while keeping soft guidance",
+    menu: true,
+  },
+  {
+    value: "rabbit-hole quiet",
+    label: "Rabbit-hole quiet",
+    description: "Disable hard stops and repeated rabbit-hole guidance for this session",
+    menu: true,
+  },
+  {
+    value: "rabbit-hole on",
+    label: "Rabbit-hole handling on",
+    description: "Restore normal rabbit-hole hard stops and guidance",
+    menu: true,
+  },
+  {
+    value: "details on",
+    label: "Details on",
+    description: "Show the HeadsDown details widget",
+    menu: true,
+  },
+  {
+    value: "details off",
+    label: "Details off",
+    description: "Hide the HeadsDown details widget",
+    menu: true,
+  },
+  {
+    value: "details toggle",
+    label: "Toggle details",
+    description: "Toggle the HeadsDown details widget",
+    menu: true,
+  },
+  {
+    value: "theme list",
+    label: "List themes",
+    description: "List HeadsDown UI themes",
+    menu: true,
+  },
+  {
+    value: "theme neo",
+    label: "Theme: Neo",
+    description: "Switch to the Neo HeadsDown UI theme",
+    menu: true,
+  },
+  {
+    value: "theme mono",
+    label: "Theme: Mono",
+    description: "Switch to the Mono HeadsDown UI theme",
+    menu: true,
+  },
+  {
+    value: "theme executive",
+    label: "Theme: Executive",
+    description: "Switch to the Executive HeadsDown UI theme",
+    menu: true,
+  },
+  {
+    value: "theme reset",
+    label: "Reset theme",
+    description: "Reset HeadsDown UI theme to the configured default",
+    menu: true,
+  },
+];
+
+function normalizeHeadsDownCommandArgs(args: string | null | undefined): string {
+  const normalized = (args ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  return normalized === "status" ? "" : normalized;
+}
+
+function getHeadsDownCommandCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+  const prefix = argumentPrefix.trim().toLowerCase().replace(/\s+/g, " ");
+  const filtered = HEADSDOWN_COMMAND_OPTIONS.filter((option) => option.value.startsWith(prefix));
+
+  if (filtered.length === 0) return null;
+
+  return filtered.map((option) => ({
+    value: option.value,
+    label: option.label,
+    description: option.description,
+  }));
+}
+
+function buildHeadsDownCommandHelp(): string {
+  return [
+    "HeadsDown commands:",
+    "",
+    "Status",
+    "  /headsdown",
+    "  /headsdown status",
+    "  /headsdown digest",
+    "",
+    "Run actions",
+    "  /headsdown pause",
+    "  /headsdown allow <minutes>",
+    "",
+    "Rabbit-hole controls",
+    "  /headsdown rabbit-hole status",
+    "  /headsdown rabbit-hole off",
+    "  /headsdown rabbit-hole quiet",
+    "  /headsdown rabbit-hole on",
+    "",
+    "Display",
+    "  /headsdown details <on|off|toggle>",
+    "  /headsdown theme <neo|mono|executive|list|reset>",
+    "",
+    "Discovery",
+    "  /headsdown help",
+    "  /headsdown menu",
+  ].join("\n");
+}
+
 export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
   ACTIVE_AVAILABILITY_OVERRIDE_QUERY,
@@ -1952,6 +2126,10 @@ export const __internal = {
   shouldEmitRabbitHoleGuidance,
   buildPauseAndSummarizeActionInput,
   buildAllowForDurationInput,
+  HEADSDOWN_COMMAND_OPTIONS,
+  buildHeadsDownCommandHelp,
+  getHeadsDownCommandCompletions,
+  normalizeHeadsDownCommandArgs,
   toOpaqueWorkspaceRef,
   CONTINUATION_PATH,
 };
@@ -4241,228 +4419,271 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   // === /headsdown command ===
 
+  async function runHeadsDownCommand(args: string | null | undefined, ctx: ExtensionContext) {
+    const normalizedArgs = normalizeHeadsDownCommandArgs(args);
+
+    if (normalizedArgs === "help") {
+      ctx.ui.notify(buildHeadsDownCommandHelp(), "info");
+      return;
+    }
+
+    if (normalizedArgs === "menu") {
+      if (!ctx.hasUI) {
+        ctx.ui.notify(buildHeadsDownCommandHelp(), "info");
+        return;
+      }
+
+      const options = HEADSDOWN_COMMAND_OPTIONS.filter((option) => option.menu);
+      const choices = options.map((option) => `${option.label}: /headsdown ${option.value}`);
+      const selected = await ctx.ui.select("HeadsDown commands", choices);
+      if (!selected) return;
+
+      const selectedIndex = choices.indexOf(selected);
+      const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : null;
+      if (selectedOption) await runHeadsDownCommand(selectedOption.value, ctx);
+      return;
+    }
+
+    if (
+      normalizedArgs === "rabbit-hole" ||
+      normalizedArgs === "rabbit" ||
+      normalizedArgs.startsWith("rabbit-hole ") ||
+      normalizedArgs.startsWith("rabbit ")
+    ) {
+      const [, modeArgRaw] = normalizedArgs.split(/\s+/, 2);
+      const modeArg = modeArgRaw?.trim() || "status";
+      const proposal = getLatestApprovedProposal();
+      const runId = proposal ? getTelemetryForProposal(proposal).runId : null;
+      const intervention = runId ? rabbitHoleInterventions.get(runId) : null;
+
+      if (modeArg === "status") {
+        ctx.ui.notify(
+          formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
+          "info",
+        );
+        return;
+      }
+
+      const parsedMode = normalizeRabbitHoleSessionMode(modeArg);
+      if (!parsedMode) {
+        ctx.ui.notify(
+          "[HeadsDown] Unknown rabbit-hole mode. Use /headsdown rabbit-hole <status|off|quiet|on>.",
+          "warning",
+        );
+        return;
+      }
+
+      rabbitHoleSessionMode = parsedMode;
+      ctx.ui.notify(
+        formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
+        "info",
+      );
+      return;
+    }
+
+    const requiresClient =
+      normalizedArgs === "" ||
+      normalizedArgs === "digest" ||
+      normalizedArgs.startsWith("pause") ||
+      normalizedArgs.startsWith("allow") ||
+      normalizedArgs.startsWith("theme") ||
+      normalizedArgs.startsWith("details");
+
+    if (!requiresClient) {
+      ctx.ui.notify(
+        "[HeadsDown] Unknown command. Use /headsdown help or /headsdown menu.",
+        "warning",
+      );
+      return;
+    }
+
+    const client = await getClient();
+    if (!client) {
+      ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
+      return;
+    }
+
+    if (normalizedArgs === "digest") {
+      const actorClient = withActorContext(client, ctx);
+      const summaries = await actorClient.listDigestSummaries({ latest: 10 });
+      const noun = summaries.length === 1 ? "summary" : "summaries";
+      ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
+      return;
+    }
+
+    if (normalizedArgs.startsWith("pause")) {
+      const proposal = getLatestApprovedProposal();
+      if (!proposal) {
+        ctx.ui.notify("[HeadsDown] No active approved run found to pause.", "warning");
+        return;
+      }
+
+      const runId = getTelemetryForProposal(proposal).runId;
+      const paused = await applyPauseAndSummarize(ctx, proposal.id);
+
+      await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
+      rabbitHoleInterventions.set(runId, {
+        contained: true,
+        sourceState: "rabbit_hole_detected",
+        pausedAt: Date.now(),
+      });
+
+      if (!paused) {
+        ctx.ui.notify(
+          "[HeadsDown] Could not apply pause-and-summarize through the API. Run remains locally contained.",
+          "warning",
+        );
+        return;
+      }
+
+      ctx.ui.notify(
+        "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice.",
+        "info",
+      );
+      return;
+    }
+
+    if (normalizedArgs.startsWith("allow")) {
+      const [, minutesArg] = normalizedArgs.split(/\s+/, 2);
+      const parsedMinutes = Number(minutesArg ?? "15");
+      const durationMinutes = Number.isFinite(parsedMinutes)
+        ? Math.max(1, Math.min(240, Math.floor(parsedMinutes)))
+        : 15;
+
+      const proposal = getLatestApprovedProposal();
+      if (!proposal) {
+        ctx.ui.notify(
+          "[HeadsDown] No active approved run found for allow-for-duration.",
+          "warning",
+        );
+        return;
+      }
+
+      const runId = getTelemetryForProposal(proposal).runId;
+      const intervention = rabbitHoleInterventions.get(runId);
+      if (!intervention?.contained) {
+        ctx.ui.notify(
+          "[HeadsDown] No active rabbit-hole intervention is waiting for an allow-for-duration decision.",
+          "warning",
+        );
+        return;
+      }
+
+      if (intervention.pausedAt) {
+        ctx.ui.notify(
+          "[HeadsDown] This run has already been paused. Use a ready-to-resume action instead of allow-for-duration.",
+          "warning",
+        );
+        return;
+      }
+
+      const allowed = await allowRunForDuration(ctx, proposal.id, runId, durationMinutes);
+
+      if (!allowed) {
+        ctx.ui.notify(
+          "[HeadsDown] Could not apply allow-for-duration. Keep run paused or retry when API support is available.",
+          "warning",
+        );
+        return;
+      }
+
+      ctx.ui.notify(
+        `[HeadsDown] Allowed run ${runId} for ${durationMinutes}m. Keep scope tight and re-check before expanding.`,
+        "info",
+      );
+      return;
+    }
+
+    if (normalizedArgs.startsWith("theme")) {
+      const [, themeArgRaw] = normalizedArgs.split(/\s+/, 2);
+      const themeArg = themeArgRaw?.trim();
+
+      if (!themeArg || themeArg === "list") {
+        ctx.ui.notify(
+          `[HeadsDown] Themes: neo, mono, executive. Current: ${activeUITheme}.`,
+          "info",
+        );
+        return;
+      }
+
+      if (themeArg === "reset") {
+        activeUITheme = defaultUITheme;
+        await updateStatusUI(ctx);
+        ctx.ui.notify(`[HeadsDown] Theme reset to ${activeUITheme}.`, "info");
+        return;
+      }
+
+      const parsedTheme = normalizeUITheme(themeArg);
+      if (!parsedTheme) {
+        ctx.ui.notify(
+          "[HeadsDown] Unknown theme. Use /headsdown theme <neo|mono|executive|list|reset>.",
+          "warning",
+        );
+        return;
+      }
+
+      activeUITheme = parsedTheme;
+      await updateStatusUI(ctx);
+      ctx.ui.notify(`[HeadsDown] Theme set to ${activeUITheme}.`, "info");
+      return;
+    }
+
+    if (normalizedArgs.startsWith("details")) {
+      const [, detailsArgRaw] = normalizedArgs.split(/\s+/, 2);
+      const detailsArg = detailsArgRaw?.trim();
+
+      if (!detailsArg || detailsArg === "toggle") {
+        detailsWidgetVisible = !detailsWidgetVisible;
+      } else if (detailsArg === "on") {
+        detailsWidgetVisible = true;
+      } else if (detailsArg === "off") {
+        detailsWidgetVisible = false;
+      } else {
+        ctx.ui.notify(
+          "[HeadsDown] Unknown details mode. Use /headsdown details <on|off|toggle>.",
+          "warning",
+        );
+        return;
+      }
+
+      await updateStatusUI(ctx);
+      ctx.ui.notify(
+        `[HeadsDown] Details ${detailsWidgetVisible ? "enabled" : "hidden"}. Use /headsdown details <on|off|toggle>.`,
+        "info",
+      );
+      return;
+    }
+
+    const actorClient = withActorContext(client, ctx);
+    const availability = await getAvailabilityContext(actorClient);
+    const summary = formatSummary(
+      availability.contract,
+      availability.calendar ?? availability.schedule,
+    );
+    const wrapUpInstruction = resolveExecutionInstruction({
+      contract: availability.contract,
+      schedule: availability.schedule,
+    });
+
+    availabilitySnapshot = {
+      contract: availability.contract,
+      calendar: availability.calendar,
+      schedule: availability.schedule,
+      summary,
+      wrapUpInstruction,
+      fetchedAt: Date.now(),
+    };
+
+    await updateStatusUI(ctx);
+    ctx.ui.notify(`[HeadsDown] ${summary}`, "info");
+  }
+
   pi.registerCommand("headsdown", {
-    description: "Check your HeadsDown availability status",
+    description: "Check HeadsDown status and session controls",
+    getArgumentCompletions: getHeadsDownCommandCompletions,
     handler: async (args, ctx) => {
       try {
-        const normalizedArgs = (args ?? "").trim().toLowerCase();
-
-        if (
-          normalizedArgs === "rabbit-hole" ||
-          normalizedArgs === "rabbit" ||
-          normalizedArgs.startsWith("rabbit-hole ") ||
-          normalizedArgs.startsWith("rabbit ")
-        ) {
-          const [, modeArgRaw] = normalizedArgs.split(/\s+/, 2);
-          const modeArg = modeArgRaw?.trim() || "status";
-          const proposal = getLatestApprovedProposal();
-          const runId = proposal ? getTelemetryForProposal(proposal).runId : null;
-          const intervention = runId ? rabbitHoleInterventions.get(runId) : null;
-
-          if (modeArg === "status") {
-            ctx.ui.notify(
-              formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
-              "info",
-            );
-            return;
-          }
-
-          const parsedMode = normalizeRabbitHoleSessionMode(modeArg);
-          if (!parsedMode) {
-            ctx.ui.notify(
-              "[HeadsDown] Unknown rabbit-hole mode. Use /headsdown rabbit-hole <status|off|quiet|on>.",
-              "warning",
-            );
-            return;
-          }
-
-          rabbitHoleSessionMode = parsedMode;
-          ctx.ui.notify(
-            formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
-            "info",
-          );
-          return;
-        }
-
-        const client = await getClient();
-        if (!client) {
-          ctx.ui.notify("[HeadsDown] Not authenticated. Ask me to run headsdown_auth.", "warning");
-          return;
-        }
-
-        if (normalizedArgs === "digest") {
-          const actorClient = withActorContext(client, ctx);
-          const summaries = await actorClient.listDigestSummaries({ latest: 10 });
-          const noun = summaries.length === 1 ? "summary" : "summaries";
-          ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
-          return;
-        }
-
-        if (normalizedArgs.startsWith("pause")) {
-          const proposal = getLatestApprovedProposal();
-          if (!proposal) {
-            ctx.ui.notify("[HeadsDown] No active approved run found to pause.", "warning");
-            return;
-          }
-
-          const runId = getTelemetryForProposal(proposal).runId;
-          const paused = await applyPauseAndSummarize(ctx, proposal.id);
-
-          await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
-          rabbitHoleInterventions.set(runId, {
-            contained: true,
-            sourceState: "rabbit_hole_detected",
-            pausedAt: Date.now(),
-          });
-
-          if (!paused) {
-            ctx.ui.notify(
-              "[HeadsDown] Could not apply pause-and-summarize through the API. Run remains locally contained.",
-              "warning",
-            );
-            return;
-          }
-
-          ctx.ui.notify(
-            "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice.",
-            "info",
-          );
-          return;
-        }
-
-        if (normalizedArgs.startsWith("allow")) {
-          const [, minutesArg] = normalizedArgs.split(/\s+/, 2);
-          const parsedMinutes = Number(minutesArg ?? "15");
-          const durationMinutes = Number.isFinite(parsedMinutes)
-            ? Math.max(1, Math.min(240, Math.floor(parsedMinutes)))
-            : 15;
-
-          const proposal = getLatestApprovedProposal();
-          if (!proposal) {
-            ctx.ui.notify(
-              "[HeadsDown] No active approved run found for allow-for-duration.",
-              "warning",
-            );
-            return;
-          }
-
-          const runId = getTelemetryForProposal(proposal).runId;
-          const intervention = rabbitHoleInterventions.get(runId);
-          if (!intervention?.contained) {
-            ctx.ui.notify(
-              "[HeadsDown] No active rabbit-hole intervention is waiting for an allow-for-duration decision.",
-              "warning",
-            );
-            return;
-          }
-
-          if (intervention.pausedAt) {
-            ctx.ui.notify(
-              "[HeadsDown] This run has already been paused. Use a ready-to-resume action instead of allow-for-duration.",
-              "warning",
-            );
-            return;
-          }
-
-          const allowed = await allowRunForDuration(ctx, proposal.id, runId, durationMinutes);
-
-          if (!allowed) {
-            ctx.ui.notify(
-              "[HeadsDown] Could not apply allow-for-duration. Keep run paused or retry when API support is available.",
-              "warning",
-            );
-            return;
-          }
-
-          ctx.ui.notify(
-            `[HeadsDown] Allowed run ${runId} for ${durationMinutes}m. Keep scope tight and re-check before expanding.`,
-            "info",
-          );
-          return;
-        }
-
-        if (normalizedArgs.startsWith("theme")) {
-          const [, themeArgRaw] = normalizedArgs.split(/\s+/, 2);
-          const themeArg = themeArgRaw?.trim();
-
-          if (!themeArg || themeArg === "list") {
-            ctx.ui.notify(
-              `[HeadsDown] Themes: neo, mono, executive. Current: ${activeUITheme}.`,
-              "info",
-            );
-            return;
-          }
-
-          if (themeArg === "reset") {
-            activeUITheme = defaultUITheme;
-            await updateStatusUI(ctx);
-            ctx.ui.notify(`[HeadsDown] Theme reset to ${activeUITheme}.`, "info");
-            return;
-          }
-
-          const parsedTheme = normalizeUITheme(themeArg);
-          if (!parsedTheme) {
-            ctx.ui.notify(
-              "[HeadsDown] Unknown theme. Use /headsdown theme <neo|mono|executive|list|reset>.",
-              "warning",
-            );
-            return;
-          }
-
-          activeUITheme = parsedTheme;
-          await updateStatusUI(ctx);
-          ctx.ui.notify(`[HeadsDown] Theme set to ${activeUITheme}.`, "info");
-          return;
-        }
-
-        if (normalizedArgs.startsWith("details")) {
-          const [, detailsArgRaw] = normalizedArgs.split(/\s+/, 2);
-          const detailsArg = detailsArgRaw?.trim();
-
-          if (!detailsArg || detailsArg === "toggle") {
-            detailsWidgetVisible = !detailsWidgetVisible;
-          } else if (detailsArg === "on") {
-            detailsWidgetVisible = true;
-          } else if (detailsArg === "off") {
-            detailsWidgetVisible = false;
-          } else {
-            ctx.ui.notify(
-              "[HeadsDown] Unknown details mode. Use /headsdown details <on|off|toggle>.",
-              "warning",
-            );
-            return;
-          }
-
-          await updateStatusUI(ctx);
-          ctx.ui.notify(
-            `[HeadsDown] Details ${detailsWidgetVisible ? "enabled" : "hidden"}. Use /headsdown details <on|off|toggle>.`,
-            "info",
-          );
-          return;
-        }
-
-        const actorClient = withActorContext(client, ctx);
-        const availability = await getAvailabilityContext(actorClient);
-        const summary = formatSummary(
-          availability.contract,
-          availability.calendar ?? availability.schedule,
-        );
-        const wrapUpInstruction = resolveExecutionInstruction({
-          contract: availability.contract,
-          schedule: availability.schedule,
-        });
-
-        availabilitySnapshot = {
-          contract: availability.contract,
-          calendar: availability.calendar,
-          schedule: availability.schedule,
-          summary,
-          wrapUpInstruction,
-          fetchedAt: Date.now(),
-        };
-
-        await updateStatusUI(ctx);
-        ctx.ui.notify(`[HeadsDown] ${summary}`, "info");
+        await runHeadsDownCommand(args, ctx);
       } catch (error) {
         ctx.ui.notify(
           `[HeadsDown] Error: ${error instanceof Error ? error.message : String(error)}`,
