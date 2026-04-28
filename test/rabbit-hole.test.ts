@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { __internal } from "../extensions/headsdown/index.js";
+import {
+  formatHeadsDownCallForPrompt,
+  renderHeadsDownCallCopy,
+} from "../extensions/headsdown/call-renderer.js";
 
 describe("rabbit-hole detection helpers", () => {
   it("detects rabbit_hole_detected from run summary and returns matching run", () => {
@@ -145,6 +149,148 @@ describe("rabbit-hole detection helpers", () => {
       source: "pi",
       client: "headsdown-pi",
     });
+  });
+
+  it("filters rendered call actions through backend allowed action keys", () => {
+    const rendered = renderHeadsDownCallCopy({ key: "rabbit_hole_detected" });
+    const deniedPrompt = formatHeadsDownCallForPrompt(
+      __internal.filterRenderedCallActions(rendered, []),
+    );
+    const allowedPrompt = formatHeadsDownCallForPrompt(
+      __internal.filterRenderedCallActions(rendered, ["pause_and_summarize"]),
+    );
+
+    expect(deniedPrompt).not.toContain("action=pause_and_summarize");
+    expect(deniedPrompt).not.toContain("action=allow_for_duration");
+    expect(allowedPrompt).toContain("action=pause_and_summarize");
+    expect(allowedPrompt).not.toContain("action=allow_for_duration");
+  });
+
+  it("uses matching run action keys before global call action keys for prompts", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      headsdownCall: {
+        key: "RABBIT_HOLE_DETECTED",
+        allowedActionKeys: ["PAUSE_AND_SUMMARIZE"],
+      },
+      runSummaries: [
+        {
+          runId: "run-active",
+          callKey: "RABBIT_HOLE_DETECTED",
+          allowedActionKeys: [],
+        },
+      ],
+    });
+
+    expect(
+      __internal.allowedActionKeysForCallPrompt(overview!, "rabbit_hole_detected", ["run-active"]),
+    ).toEqual([]);
+    expect(
+      __internal.allowedActionKeysForCallPrompt(overview!, "rabbit_hole_detected", []),
+    ).toEqual([]);
+  });
+
+  it("allows rabbit-hole actions only when the backend run allow-list includes the action", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "proposal-uuid",
+          callKey: "RABBIT_HOLE_DETECTED",
+          allowedActionKeys: ["PAUSE_AND_SUMMARIZE", "ALLOW_FOR_DURATION"],
+        },
+      ],
+    });
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview,
+        candidateRunIds: ["run_proposal-uuid", "proposal-uuid"],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }),
+    ).toMatchObject({ allowed: true, reason: "allowed", runSummary: { runId: "proposal-uuid" } });
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview,
+        candidateRunIds: ["proposal-uuid"],
+        actionKey: "allow_for_duration",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }),
+    ).toMatchObject({ allowed: true, reason: "allowed", runSummary: { runId: "proposal-uuid" } });
+  });
+
+  it("fails closed when action allow-list data is missing, stale, or denies the action", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "proposal-uuid",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+        {
+          runId: "run-without-actions",
+          callKey: "RABBIT_HOLE_DETECTED",
+        },
+      ],
+    });
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview: null,
+        candidateRunIds: ["proposal-uuid"],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }).reason,
+    ).toBe("missing_overview");
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview,
+        candidateRunIds: ["missing-run"],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }).reason,
+    ).toBe("missing_run");
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview,
+        candidateRunIds: ["proposal-uuid"],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }).reason,
+    ).toBe("call_mismatch");
+
+    expect(
+      __internal.resolveAllowedRunAction({
+        overview,
+        candidateRunIds: ["run-without-actions"],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      }).reason,
+    ).toBe("action_not_allowed");
+  });
+
+  it("keeps rabbit-hole narrative copy canonical even if incoming call copy is untrusted", () => {
+    const narrative = __internal.buildRabbitHoleNarrative({
+      call: {
+        key: "rabbit_hole_detected",
+        knownKey: "rabbit_hole_detected",
+        title: "Untrusted call title",
+        body: "Untrusted call body",
+        reasonCodes: ["scope_growth"],
+      } as any,
+      runSummary: {
+        runId: "run_proposal-1",
+        callKey: "rabbit_hole_detected",
+        reasonCodes: ["scope_growth"],
+      } as any,
+    });
+
+    expect(narrative).toContain("Call: Rabbit hole detected");
+    expect(narrative).toContain("The work is growing past the size that was worth approving");
+    expect(narrative).not.toContain("Untrusted call title");
+    expect(narrative).not.toContain("Untrusted call body");
   });
 
   it("hashes workspace refs so raw cwd is not sent", () => {

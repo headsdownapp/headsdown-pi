@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { __internal } from "../extensions/headsdown/index.js";
 
@@ -279,6 +282,7 @@ describe("agent control off-clock queue flow", () => {
     expect(selected?.runId).toBe("run-2");
 
     const artifact = __internal.buildQueuedForMorningContinuationArtifact(selected!, "main");
+    expect(artifact.runId).toBe("run-2");
     expect(artifact.reason).toBe("queue-for-morning");
     expect(artifact.completedSteps).toContain("Queued for morning.");
     expect(artifact.resumeInstruction).toBe("Ready to resume. Resume approved work.");
@@ -325,6 +329,49 @@ describe("agent control off-clock queue flow", () => {
     expect(__internal.isAlreadyQueuedForMorning(run as any)).toBe(true);
   });
 
+  it("selects ready-to-resume runs only when resume_run is backend-allowed", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-denied",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["KEEP_QUEUED"],
+        },
+        {
+          runId: "run-allowed",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN", "KEEP_QUEUED"],
+        },
+      ],
+    });
+
+    expect(
+      __internal.pickReadyToResumeRun(normalized?.runSummaries ?? [], ["run-denied"]),
+    ).toBeNull();
+    expect(
+      __internal.pickReadyToResumeRun(normalized?.runSummaries ?? [], ["run-allowed"])?.runId,
+    ).toBe("run-allowed");
+  });
+
+  it("does not guess a ready-to-resume run when multiple runs are resume-allowed", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-1",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+        {
+          runId: "run-2",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+      ],
+    });
+
+    expect(__internal.pickReadyToResumeRun(normalized?.runSummaries ?? [])).toBeNull();
+  });
+
   it("preserves native SDK method receivers for agent-control compat calls", async () => {
     const client = {
       async getAgentControlOverview() {
@@ -334,8 +381,9 @@ describe("agent control off-clock queue flow", () => {
           runSummaries: [],
         };
       },
-      async applyHeadsDownAction(input: Record<string, unknown>) {
+      async applyHeadsDownAction(actionKey: string, input: Record<string, unknown>) {
         expect(this).toBe(client);
+        expect(actionKey).toBe("resume_run");
         expect(input).toEqual({ runId: "run-native", actionKey: "resume_run" });
         return {
           ok: true,
@@ -362,6 +410,24 @@ describe("agent control off-clock queue flow", () => {
     expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
   });
 
+  it("supports legacy one-argument native action helpers", async () => {
+    const client = {
+      async applyHeadsDownAction(input: Record<string, unknown>) {
+        expect(this).toBe(client);
+        expect(input).toEqual({ runId: "run-legacy", actionKey: "resume_run" });
+        return { ok: true, runSummary: { runId: "run-legacy", allowedActionKeys: ["RESUME_RUN"] } };
+      },
+    };
+
+    const result = await __internal.applyHeadsDownActionCompat(client as any, {
+      runId: "run-legacy",
+      actionKey: "resume_run",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
+  });
+
   it("does not auto-queue queue_for_morning on non-off-clock runs", () => {
     const run = {
       runId: "run-needs-yes",
@@ -377,6 +443,27 @@ describe("agent control off-clock queue flow", () => {
     };
 
     expect(__internal.pickQueueForMorningRun([run as any])).toBeNull();
+    expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
+  });
+
+  it("fails closed when off-clock runs omit allowed action metadata", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-off-clock",
+          callKey: "OFF_THE_CLOCK",
+          actionState: "AWAITING_ACTION",
+          safeTitle: "Queued ask",
+          clientLabel: "Pi",
+          handoffAvailable: false,
+          handoffState: "MISSING",
+        },
+      ],
+    });
+    const run = normalized?.runSummaries[0];
+
+    expect(run?.allowedActionKeys).toEqual([]);
+    expect(__internal.pickQueueForMorningRun(normalized?.runSummaries ?? [])).toBeNull();
     expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
   });
 
@@ -492,6 +579,168 @@ describe("agent control off-clock queue flow", () => {
     expect(__internal.toGraphQLEnumValue("READY_TO_RESUME")).toBe("READY_TO_RESUME");
     expect(__internal.toGraphQLEnumValue("readyToResume")).toBe("READY_TO_RESUME");
     expect(__internal.toGraphQLEnumValue(null)).toBeUndefined();
+  });
+
+  it("normalizes legacy continuation artifacts and reports parse failures", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headsdown-continuation-"));
+    const legacyPath = join(dir, "legacy.json");
+    await writeFile(
+      legacyPath,
+      JSON.stringify({
+        branch: "main",
+        approvedProposalId: "proposal-1",
+        approvedProposalDescription: "Resume work",
+        estimatedFiles: 1,
+        modifiedFiles: ["src/index.ts"],
+        openDecisions: [],
+        pendingSteps: ["finish"],
+        completedSteps: ["started"],
+        resumeInstruction: "resume",
+        wrapUpInstruction: null,
+        savedAt: "2026-04-27T00:00:00Z",
+        reason: "manual-save",
+      }),
+    );
+
+    const legacy = await __internal.loadContinuationArtifactFromPath(legacyPath, false);
+    expect(legacy.error).toBeNull();
+    expect(legacy.artifact?.runId).toBeNull();
+    expect(legacy.artifact?.pendingSteps).toEqual(["finish"]);
+
+    const badPath = join(dir, "bad.json");
+    await writeFile(badPath, "{not-json");
+
+    const bad = await __internal.loadContinuationArtifactFromPath(badPath, false);
+    expect(bad.artifact).toBeNull();
+    expect(bad.error?.reason).toBe("parse_failed");
+  });
+
+  it("loads continuation by applying resume_run only for the matched backend-allowed run", async () => {
+    const artifact = __internal.normalizeContinuationArtifact({
+      branch: "main",
+      runId: "saved-run",
+      approvedProposalId: "proposal-1",
+      approvedProposalDescription: "Resume work",
+      estimatedFiles: 1,
+      modifiedFiles: [],
+      openDecisions: [],
+      pendingSteps: [],
+      completedSteps: [],
+      resumeInstruction: "resume",
+      wrapUpInstruction: null,
+      savedAt: "2026-04-27T00:00:00Z",
+      reason: "manual-save",
+    })!;
+    const applied: Array<Record<string, unknown>> = [];
+    let cleared = false;
+    let reported = false;
+
+    const result = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({
+        ok: true,
+        overview: __internal.normalizeAgentControlOverviewPayload({
+          runSummaries: [
+            {
+              runId: "saved-run",
+              callKey: "READY_TO_RESUME",
+              allowedActionKeys: ["RESUME_RUN"],
+            },
+          ],
+        }),
+      }),
+      applyAction: async (_client: any, input: any) => {
+        applied.push(input);
+        return { ok: true, runSummary: null };
+      },
+      clearContinuation: async () => {
+        cleared = true;
+        return true;
+      },
+      reportResumed: async () => {
+        reported = true;
+      },
+    });
+
+    expect(result).toEqual({
+      consumed: true,
+      resumeAction: { attempted: true, ok: true, runId: "saved-run" },
+    });
+    expect(applied).toEqual([
+      expect.objectContaining({ runId: "saved-run", actionKey: "resume_run" }),
+    ]);
+    expect(cleared).toBe(true);
+    expect(reported).toBe(true);
+  });
+
+  it("keeps continuation artifacts when overview or resume apply fails", async () => {
+    const artifact = __internal.normalizeContinuationArtifact({
+      branch: "main",
+      runId: "saved-run",
+      approvedProposalId: null,
+      approvedProposalDescription: "Resume work",
+      estimatedFiles: null,
+      modifiedFiles: [],
+      openDecisions: [],
+      pendingSteps: [],
+      completedSteps: [],
+      resumeInstruction: "resume",
+      wrapUpInstruction: null,
+      savedAt: "2026-04-27T00:00:00Z",
+      reason: "manual-save",
+    })!;
+
+    const overviewFailure = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({ ok: false, reason: "overview_failed", message: "network down" }),
+      applyAction: async () => {
+        throw new Error("should not apply");
+      },
+      clearContinuation: async () => true,
+      reportResumed: async () => {},
+    });
+    expect(overviewFailure.consumed).toBe(false);
+    expect(overviewFailure.resumeAction).toMatchObject({
+      attempted: false,
+      reason: "overview_failed",
+      message: "network down",
+    });
+
+    const applyFailure = await __internal.resumeContinuationArtifact({
+      artifact,
+      actorClient: {} as any,
+      loadOverview: async () => ({
+        ok: true,
+        overview: __internal.normalizeAgentControlOverviewPayload({
+          runSummaries: [
+            {
+              runId: "saved-run",
+              callKey: "READY_TO_RESUME",
+              allowedActionKeys: ["RESUME_RUN"],
+            },
+          ],
+        }),
+      }),
+      applyAction: async () => {
+        throw new Error("timeout");
+      },
+      clearContinuation: async () => {
+        throw new Error("should not clear");
+      },
+      reportResumed: async () => {
+        throw new Error("should not report");
+      },
+    });
+    expect(applyFailure.consumed).toBe(false);
+    expect(applyFailure.resumeAction).toMatchObject({
+      attempted: true,
+      ok: false,
+      runId: "saved-run",
+      reason: "apply_failed",
+      message: "timeout",
+    });
   });
 
   it("does not report a saved handoff if continuation persistence fails", async () => {

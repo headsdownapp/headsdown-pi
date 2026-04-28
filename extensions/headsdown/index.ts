@@ -51,7 +51,10 @@ import {
 import {
   formatHeadsDownCallForPrompt,
   renderHeadsDownCallCopy,
+  type CanonicalHeadsDownCallKey,
   type HeadsDownActionKey,
+  type HeadsDownUiIntent,
+  type RenderedHeadsDownCallCopy,
 } from "./call-renderer.js";
 
 // === State ===
@@ -166,8 +169,8 @@ interface HeadsDownCallPayload {
   key: string | null;
   title: string | null;
   body: string | null;
-  recommendedActionKey: string | null;
-  allowedActionKeys: string[];
+  recommendedActionKey: HeadsDownActionKey | null;
+  allowedActionKeys: HeadsDownActionKey[];
   reasonCodes: string[];
 }
 
@@ -175,7 +178,7 @@ interface AgentRunSummaryPayload {
   runId: string;
   callKey: string | null;
   actionState: string | null;
-  allowedActionKeys: string[];
+  allowedActionKeys: HeadsDownActionKey[];
   safeTitle: string | null;
   clientLabel: string | null;
   resumeEligibleAt: string | null;
@@ -191,7 +194,7 @@ interface AgentControlOverviewPayload {
 
 interface ApplyHeadsDownActionInput {
   runId: string;
-  actionKey: HeadsDownActionKey | string;
+  actionKey: HeadsDownActionKey;
   sourceState?: string;
   reason?: string;
   source?: string;
@@ -218,6 +221,7 @@ interface QueueForMorningResult {
 
 interface ContinuationArtifact {
   branch: string | null;
+  runId: string | null;
   approvedProposalId: string | null;
   approvedProposalDescription: string | null;
   estimatedFiles: number | null;
@@ -673,12 +677,33 @@ function normalizeEnumKey(value: unknown): string | null {
   return snakeCase.length > 0 ? snakeCase : null;
 }
 
+const HEADSDOWN_ACTION_KEYS = [
+  "continue",
+  "continue_with_limit",
+  "narrow_scope",
+  "ask_user",
+  "queue_for_later",
+  "queue_for_morning",
+  "pause_and_summarize",
+  "stop_run",
+  "resume_run",
+  "allow_once",
+  "allow_for_duration",
+  "create_temporary_exception",
+  "keep_queued",
+] as const satisfies readonly HeadsDownActionKey[];
+
+function isHeadsDownActionKey(value: string): value is HeadsDownActionKey {
+  return (HEADSDOWN_ACTION_KEYS as readonly string[]).includes(value);
+}
+
 function normalizeCallKey(value: unknown): string | null {
   return normalizeEnumKey(value);
 }
 
-function normalizeActionKey(value: unknown): string | null {
-  return normalizeEnumKey(value);
+function normalizeActionKey(value: unknown): HeadsDownActionKey | null {
+  const normalized = normalizeEnumKey(value);
+  return normalized && isHeadsDownActionKey(normalized) ? normalized : null;
 }
 
 function normalizeRunState(value: unknown): string | null {
@@ -690,12 +715,12 @@ function toGraphQLEnumValue(value: unknown): string | undefined {
   return normalized ? normalized.toUpperCase() : undefined;
 }
 
-function normalizeActionKeyList(value: unknown): string[] {
+function normalizeActionKeyList(value: unknown): HeadsDownActionKey[] {
   if (!Array.isArray(value)) return [];
 
   return value
     .map((item) => normalizeActionKey(item))
-    .filter((item): item is string => item !== null);
+    .filter((item): item is HeadsDownActionKey => item !== null);
 }
 
 function normalizeHeadsDownCallPayload(value: unknown): HeadsDownCallPayload | null {
@@ -780,37 +805,70 @@ async function getAgentControlOverviewCompat(
   }
 }
 
+type AgentControlOverviewResult =
+  | { ok: true; overview: AgentControlOverviewPayload | null }
+  | { ok: false; reason: "overview_failed"; message: string };
+
+async function getAgentControlOverviewResult(
+  client: HeadsDownClient,
+): Promise<AgentControlOverviewResult> {
+  try {
+    return { ok: true, overview: await getAgentControlOverviewCompat(client) };
+  } catch (error) {
+    return { ok: false, reason: "overview_failed", message: sanitizeErrorMessage(error) };
+  }
+}
+
+async function callNativeApplyHeadsDownAction(
+  client: HeadsDownClient,
+  method: (
+    actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+    payload?: ApplyHeadsDownActionInput,
+  ) => Promise<unknown>,
+  input: ApplyHeadsDownActionInput,
+): Promise<ApplyHeadsDownActionPayload> {
+  const result = (await (method.length >= 2
+    ? method.call(client, input.actionKey, input)
+    : method.call(client, input))) as Record<string, unknown>;
+
+  return {
+    ok: result.ok === true,
+    runSummary: normalizeRunSummaryPayload(result.runSummary),
+  };
+}
+
 async function applyHeadsDownActionCompat(
   client: HeadsDownClient,
   input: ApplyHeadsDownActionInput,
 ): Promise<ApplyHeadsDownActionPayload> {
   const nativeMethod = (
     client as unknown as {
-      applyHeadsDownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
-      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+      applyHeadsDownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
+      applyHeadsdownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
     }
   ).applyHeadsDownAction;
 
   if (typeof nativeMethod === "function") {
-    const result = (await nativeMethod.call(client, input)) as Record<string, unknown>;
-    return {
-      ok: result.ok === true,
-      runSummary: normalizeRunSummaryPayload(result.runSummary),
-    };
+    return callNativeApplyHeadsDownAction(client, nativeMethod, input);
   }
 
   const fallbackNativeMethod = (
     client as unknown as {
-      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+      applyHeadsdownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
     }
   ).applyHeadsdownAction;
 
   if (typeof fallbackNativeMethod === "function") {
-    const result = (await fallbackNativeMethod.call(client, input)) as Record<string, unknown>;
-    return {
-      ok: result.ok === true,
-      runSummary: normalizeRunSummaryPayload(result.runSummary),
-    };
+    return callNativeApplyHeadsDownAction(client, fallbackNativeMethod, input);
   }
 
   const graphql = getLowLevelGraphQLClient(client);
@@ -882,6 +940,238 @@ function shouldAutoQueueForMorning(
   return true;
 }
 
+interface AllowedRunActionResolution {
+  allowed: boolean;
+  runSummary: AgentRunSummaryPayload | null;
+  reason: "missing_overview" | "missing_run" | "call_mismatch" | "action_not_allowed" | "allowed";
+}
+
+function resolveAllowedRunAction(input: {
+  overview: AgentControlOverviewPayload | null | undefined;
+  candidateRunIds: string[];
+  actionKey: HeadsDownActionKey;
+  expectedCallKeys?: CanonicalHeadsDownCallKey[];
+}): AllowedRunActionResolution {
+  if (!input.overview) {
+    return { allowed: false, runSummary: null, reason: "missing_overview" };
+  }
+
+  const candidateRunIds = buildCandidateRunIdSet(input.candidateRunIds);
+  const runSummary =
+    input.overview.runSummaries.find((summary) => candidateRunIds.has(summary.runId)) ?? null;
+
+  if (!runSummary) {
+    return { allowed: false, runSummary: null, reason: "missing_run" };
+  }
+
+  const expectedCallKeys = input.expectedCallKeys ?? [];
+  if (
+    expectedCallKeys.length > 0 &&
+    (!runSummary.callKey || !expectedCallKeys.some((callKey) => callKey === runSummary.callKey))
+  ) {
+    return { allowed: false, runSummary, reason: "call_mismatch" };
+  }
+
+  if (!runSummary.allowedActionKeys.includes(input.actionKey)) {
+    return { allowed: false, runSummary, reason: "action_not_allowed" };
+  }
+
+  return { allowed: true, runSummary, reason: "allowed" };
+}
+
+function allowedRunActionFailureMessage(
+  actionLabel: string,
+  resolution: AllowedRunActionResolution,
+): string {
+  switch (resolution.reason) {
+    case "missing_overview":
+      return `[HeadsDown] Cannot verify backend-allowed actions for ${actionLabel}. Re-check the current HeadsDown call before acting.`;
+    case "missing_run":
+      return `[HeadsDown] Cannot find the active run in backend action data for ${actionLabel}. Re-check the current HeadsDown call before acting.`;
+    case "call_mismatch":
+      return `[HeadsDown] The active run is no longer in the expected call state for ${actionLabel}. Re-check before acting.`;
+    case "action_not_allowed":
+      return `[HeadsDown] Backend did not allow ${actionLabel} for this run. Keep the run contained and re-check the current call.`;
+    case "allowed":
+      return `[HeadsDown] ${actionLabel} is allowed.`;
+  }
+}
+
+function allowedActionKeysForCallPrompt(
+  overview: AgentControlOverviewPayload,
+  callKey: string,
+  candidateRunIds: string[] = [],
+): HeadsDownActionKey[] {
+  const candidateRunIdSet = buildCandidateRunIdSet(candidateRunIds);
+  const matchingRuns = overview.runSummaries.filter((summary) => summary.callKey === callKey);
+
+  if (candidateRunIdSet.size > 0) {
+    const candidate = matchingRuns.find((summary) => candidateRunIdSet.has(summary.runId));
+    return candidate?.allowedActionKeys ?? [];
+  }
+
+  if (matchingRuns.length === 1) {
+    return matchingRuns[0]!.allowedActionKeys;
+  }
+
+  return overview.headsdownCall?.allowedActionKeys ?? [];
+}
+
+function filterRenderedCallActions(
+  rendered: RenderedHeadsDownCallCopy,
+  allowedActionKeys: HeadsDownActionKey[],
+): RenderedHeadsDownCallCopy {
+  const filterAction = (
+    label: string | null,
+    actionKey: HeadsDownActionKey | null,
+    uiIntent: HeadsDownUiIntent | null,
+  ) => {
+    if (!actionKey || allowedActionKeys.includes(actionKey)) {
+      return { label, actionKey, uiIntent };
+    }
+
+    return { label: null, actionKey: null, uiIntent: null };
+  };
+
+  const primary = filterAction(
+    rendered.primaryLabel,
+    rendered.primaryActionKey,
+    rendered.primaryUiIntent,
+  );
+  const secondary = filterAction(
+    rendered.secondaryLabel,
+    rendered.secondaryActionKey,
+    rendered.secondaryUiIntent,
+  );
+
+  return {
+    ...rendered,
+    primaryLabel: primary.label,
+    primaryActionKey: primary.actionKey,
+    primaryUiIntent: primary.uiIntent,
+    secondaryLabel: secondary.label,
+    secondaryActionKey: secondary.actionKey,
+    secondaryUiIntent: secondary.uiIntent,
+  };
+}
+
+function pickReadyToResumeRun(
+  runSummaries: AgentRunSummaryPayload[],
+  candidateRunIds: string[] = [],
+): AgentRunSummaryPayload | null {
+  const candidateRunIdSet = buildCandidateRunIdSet(candidateRunIds);
+  const readyRuns = runSummaries.filter(
+    (summary) =>
+      summary.callKey === "ready_to_resume" && summary.allowedActionKeys.includes("resume_run"),
+  );
+
+  if (candidateRunIdSet.size > 0) {
+    return readyRuns.find((summary) => candidateRunIdSet.has(summary.runId)) ?? null;
+  }
+
+  return readyRuns.length === 1 ? readyRuns[0] : null;
+}
+
+type ResumeContinuationResult = {
+  consumed: boolean;
+  resumeAction: Record<string, unknown>;
+};
+
+async function resumeContinuationArtifact(input: {
+  artifact: ContinuationArtifact;
+  actorClient: HeadsDownClient | null;
+  loadOverview: (client: HeadsDownClient) => Promise<AgentControlOverviewResult>;
+  applyAction: (
+    client: HeadsDownClient,
+    actionInput: ApplyHeadsDownActionInput,
+  ) => Promise<ApplyHeadsDownActionPayload>;
+  clearContinuation: () => Promise<boolean>;
+  reportResumed: () => Promise<void>;
+}): Promise<ResumeContinuationResult> {
+  if (!input.actorClient) {
+    return { consumed: false, resumeAction: { attempted: false, reason: "not_authenticated" } };
+  }
+
+  const overviewResult = await input.loadOverview(input.actorClient);
+  if (!overviewResult.ok) {
+    return {
+      consumed: false,
+      resumeAction: {
+        attempted: false,
+        reason: overviewResult.reason,
+        message: overviewResult.message,
+      },
+    };
+  }
+
+  const candidateRunIds = [
+    input.artifact.runId ?? "",
+    input.artifact.approvedProposalId ?? "",
+    input.artifact.approvedProposalId ? runIdForProposal(input.artifact.approvedProposalId) : "",
+  ];
+  const readyRun = pickReadyToResumeRun(
+    overviewResult.overview?.runSummaries ?? [],
+    candidateRunIds,
+  );
+
+  if (!readyRun) {
+    return {
+      consumed: false,
+      resumeAction: { attempted: false, reason: "resume_run_not_allowed" },
+    };
+  }
+
+  let result: ApplyHeadsDownActionPayload;
+  try {
+    result = await input.applyAction(input.actorClient, {
+      runId: readyRun.runId,
+      actionKey: "resume_run",
+      source: "pi",
+      client: "pi",
+      reason: "Ready to resume. Resume approved work.",
+    });
+  } catch (error) {
+    return {
+      consumed: false,
+      resumeAction: {
+        attempted: true,
+        ok: false,
+        runId: readyRun.runId,
+        reason: "apply_failed",
+        message: sanitizeErrorMessage(error),
+      },
+    };
+  }
+
+  if (!result.ok) {
+    return {
+      consumed: false,
+      resumeAction: {
+        attempted: true,
+        ok: false,
+        runId: readyRun.runId,
+        reason: "apply_not_ok",
+      },
+    };
+  }
+
+  const consumed = await input.clearContinuation();
+  if (!consumed) {
+    return {
+      consumed: false,
+      resumeAction: {
+        attempted: true,
+        ok: true,
+        runId: readyRun.runId,
+        reason: "clear_failed",
+      },
+    };
+  }
+
+  await input.reportResumed();
+  return { consumed: true, resumeAction: { attempted: true, ok: true, runId: readyRun.runId } };
+}
+
 function buildQueuedForMorningContinuationArtifact(
   runSummary: AgentRunSummaryPayload,
   branch: string | null,
@@ -889,6 +1179,7 @@ function buildQueuedForMorningContinuationArtifact(
   const safeTitle = runSummary.safeTitle ?? "approved run";
   return {
     branch,
+    runId: runSummary.runId,
     approvedProposalId: null,
     approvedProposalDescription: safeTitle,
     estimatedFiles: null,
@@ -963,6 +1254,19 @@ function randomHex(length: number): string {
 
 function stripUndefinedValues(value: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+function sanitizeErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message.trim();
+  }
+
+  const message = String(error).trim();
+  return message.length > 0 ? message : "unknown error";
+}
+
+function buildCandidateRunIdSet(candidateRunIds: string[]): Set<string> {
+  return new Set(candidateRunIds.filter((id) => id.trim().length > 0));
 }
 
 export function deriveProposalIdempotencyKey(
@@ -1125,14 +1429,17 @@ function buildRabbitHoleNarrative(input: {
     normalizeGraphQLEnumOutput(input.activeCallKey) ??
     normalizeGraphQLEnumOutput(input.runSummary?.callKey ?? null) ??
     "rabbit_hole_detected";
-  const callKey = normalizeGraphQLEnumOutput(input.call?.knownKey ?? input.call?.key ?? null);
-  const useCallCopy = callKey === activeCallKey;
-  const renderedCall = renderHeadsDownCallCopy({
-    key: activeCallKey,
-    title: useCallCopy ? input.call?.title : undefined,
-    body: useCallCopy ? input.call?.body : undefined,
-    fallbackSignals: { limitSignal: true },
-  });
+  const renderedCall = filterRenderedCallActions(
+    renderHeadsDownCallCopy({
+      key: activeCallKey,
+      title: undefined,
+      body: undefined,
+      fallbackSignals: { limitSignal: true },
+    }),
+    normalizeActionKeyList(
+      (input.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
+    ),
+  );
   const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
   const reasonLine =
     reasonCodes.length > 0
@@ -1143,8 +1450,12 @@ function buildRabbitHoleNarrative(input: {
     "HEADSDOWN INTERVENTION",
     `Call: ${renderedCall.title}`,
     `Trap: ${reasonLine}`,
-    `Play: ${renderedCall.primaryLabel ?? "Pause and summarize"}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`,
-    "Escalation: If the seam is still unclear, request an explicit allow-for-duration override before continuing deeper.",
+    renderedCall.primaryLabel
+      ? `Play: ${renderedCall.primaryLabel}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`
+      : "Play: Keep the run contained, stop adding scope, and re-check the current HeadsDown call before choosing an action.",
+    renderedCall.secondaryLabel
+      ? "Escalation: If the seam is still unclear, use only a backend-allowed secondary action before continuing deeper."
+      : "Escalation: If the seam is still unclear, ask for a fresh HeadsDown call before continuing deeper.",
     "",
     formatHeadsDownCallForPrompt(renderedCall),
   ].join("\n");
@@ -1782,19 +2093,92 @@ async function continuationExists(): Promise<boolean> {
   }
 }
 
-async function loadContinuationArtifact(
+type ContinuationLoadErrorReason = "not_found" | "read_failed" | "parse_failed" | "unlink_failed";
+
+type ContinuationLoadError = {
+  reason: ContinuationLoadErrorReason;
+  message: string;
+};
+
+type ContinuationLoadResult = {
+  artifact: ContinuationArtifact | null;
+  error: ContinuationLoadError | null;
+};
+
+function normalizeContinuationArtifact(value: unknown): ContinuationArtifact | null {
+  if (!value || typeof value !== "object") return null;
+
+  const artifact = value as Record<string, unknown>;
+  return {
+    branch: toStringOrNull(artifact.branch),
+    runId: toStringOrNull(artifact.runId),
+    approvedProposalId: toStringOrNull(artifact.approvedProposalId),
+    approvedProposalDescription: toStringOrNull(artifact.approvedProposalDescription),
+    estimatedFiles: typeof artifact.estimatedFiles === "number" ? artifact.estimatedFiles : null,
+    modifiedFiles: normalizeStringArray(artifact.modifiedFiles),
+    openDecisions: normalizeStringArray(artifact.openDecisions),
+    pendingSteps: normalizeStringArray(artifact.pendingSteps),
+    completedSteps: normalizeStringArray(artifact.completedSteps),
+    resumeInstruction: toStringOrNull(artifact.resumeInstruction),
+    wrapUpInstruction: toStringOrNull(artifact.wrapUpInstruction),
+    savedAt: toStringOrNull(artifact.savedAt) ?? new Date(0).toISOString(),
+    reason: toStringOrNull(artifact.reason) ?? "unknown",
+  };
+}
+
+async function loadContinuationArtifactFromPath(
+  path: string,
   removeAfterRead: boolean,
-): Promise<ContinuationArtifact | null> {
+): Promise<ContinuationLoadResult> {
+  let raw: string;
+
   try {
-    const raw = await readFile(CONTINUATION_PATH, "utf-8");
-    const parsed = JSON.parse(raw) as ContinuationArtifact;
-    if (removeAfterRead) {
-      await unlink(CONTINUATION_PATH);
+    raw = await readFile(path, "utf-8");
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "ENOENT") {
+      return { artifact: null, error: null };
     }
-    return parsed;
-  } catch {
-    return null;
+
+    return {
+      artifact: null,
+      error: { reason: "read_failed", message: sanitizeErrorMessage(error) },
+    };
   }
+
+  let artifact: ContinuationArtifact | null;
+  try {
+    artifact = normalizeContinuationArtifact(JSON.parse(raw));
+  } catch (error) {
+    return {
+      artifact: null,
+      error: { reason: "parse_failed", message: sanitizeErrorMessage(error) },
+    };
+  }
+
+  if (!artifact) {
+    return {
+      artifact: null,
+      error: { reason: "parse_failed", message: "Continuation artifact is not an object." },
+    };
+  }
+
+  if (removeAfterRead) {
+    try {
+      await unlink(path);
+    } catch (error) {
+      return {
+        artifact,
+        error: { reason: "unlink_failed", message: sanitizeErrorMessage(error) },
+      };
+    }
+  }
+
+  return { artifact, error: null };
+}
+
+async function loadContinuationArtifact(removeAfterRead: boolean): Promise<ContinuationLoadResult> {
+  return loadContinuationArtifactFromPath(CONTINUATION_PATH, removeAfterRead);
 }
 
 async function clearContinuationArtifact(): Promise<boolean> {
@@ -2082,6 +2466,7 @@ export const __internal = {
   getLowLevelGraphQLClient,
   getAvailabilityContext,
   getAgentControlOverviewCompat,
+  getAgentControlOverviewResult,
   applyHeadsDownActionCompat,
   buildActorContext,
   withActorContext,
@@ -2099,8 +2484,16 @@ export const __internal = {
   pickQueueForMorningRun,
   isAlreadyQueuedForMorning,
   shouldAutoQueueForMorning,
+  allowedActionKeysForCallPrompt,
+  filterRenderedCallActions,
+  pickReadyToResumeRun,
+  normalizeContinuationArtifact,
+  loadContinuationArtifactFromPath,
+  resumeContinuationArtifact,
   buildQueuedForMorningContinuationArtifact,
   queueForMorningWithHandoff,
+  resolveAllowedRunAction,
+  allowedRunActionFailureMessage,
   isPotentiallyMutatingBashCommand,
   isReadonlyBashCommand,
   progressStateForBashCommand,
@@ -2323,20 +2716,35 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     );
   }
 
+  type HeadsDownActionAttemptResult =
+    | { ok: true }
+    | {
+        ok: false;
+        reason: "not_authenticated" | "apply_failed" | "apply_not_ok";
+        message?: string;
+      };
+
+  function formatHeadsDownActionAttemptFailure(result: HeadsDownActionAttemptResult): string {
+    if (result.ok) return "action applied";
+    if (result.reason === "not_authenticated") return "not authenticated";
+    if (result.reason === "apply_not_ok") return "backend returned ok=false";
+    return result.message ? `${result.reason}: ${result.message}` : result.reason;
+  }
+
   async function applyPauseAndSummarize(
     ctx: ExtensionContext,
     proposalId: string,
-  ): Promise<boolean> {
+  ): Promise<HeadsDownActionAttemptResult> {
     try {
       const client = await getClient();
-      if (!client) return false;
+      if (!client) return { ok: false, reason: "not_authenticated" };
       const actorClient = withActorContext(client, ctx);
       const payload = await actorClient.pauseAndSummarize(
         buildPauseAndSummarizeActionInput(proposalId, "rabbit_hole_detected"),
       );
-      return payload.ok === true;
-    } catch {
-      return false;
+      return payload.ok === true ? { ok: true } : { ok: false, reason: "apply_not_ok" };
+    } catch (error) {
+      return { ok: false, reason: "apply_failed", message: sanitizeErrorMessage(error) };
     }
   }
 
@@ -2345,25 +2753,24 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     proposalId: string,
     eventRunId: string,
     durationMinutes: number,
-  ): Promise<boolean> {
+  ): Promise<HeadsDownActionAttemptResult> {
     try {
       const client = await getClient();
-      if (!client) return false;
+      if (!client) return { ok: false, reason: "not_authenticated" };
       const actorClient = withActorContext(client, ctx);
       const payload = await actorClient.allowForDuration(
         buildAllowForDurationInput(proposalId, durationMinutes, "manual_override"),
       );
-      const allowed = payload.ok === true;
-      if (allowed) {
-        rabbitHoleInterventions.set(eventRunId, {
-          contained: false,
-          sourceState: "rabbit_hole_detected",
-          allowedUntil: Date.now() + durationMinutes * 60_000,
-        });
-      }
-      return allowed;
-    } catch {
-      return false;
+      if (payload.ok !== true) return { ok: false, reason: "apply_not_ok" };
+
+      rabbitHoleInterventions.set(eventRunId, {
+        contained: false,
+        sourceState: "rabbit_hole_detected",
+        allowedUntil: Date.now() + durationMinutes * 60_000,
+      });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: "apply_failed", message: sanitizeErrorMessage(error) };
     }
   }
 
@@ -2452,10 +2859,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     });
 
     if (ctx.hasUI) {
-      ctx.ui.notify(
-        "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing.",
-        "warning",
+      const allowedActionKeys = normalizeActionKeyList(
+        (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
       );
+      const message = allowedActionKeys.includes("pause_and_summarize")
+        ? "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing."
+        : "[HeadsDown] Rabbit hole detected. Stop mutating edits and re-check the current call before acting.";
+      ctx.ui.notify(message, "warning");
     }
 
     pi.sendMessage(
@@ -2474,8 +2884,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     await saveAutomaticContinuation("rabbit_hole_detected", ctx);
 
-    const escalation =
-      "HeadsDown call: rabbit_hole_detected. Pause this run locally, summarize current progress, and stop further file edits. To continue instead, ask for an explicit allow-for-duration override before applying pause_and_summarize.";
+    const allowedActionKeys = normalizeActionKeyList(
+      (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
+    );
+    const escalation = allowedActionKeys.includes("pause_and_summarize")
+      ? "HeadsDown call: rabbit_hole_detected. Stop further file edits and use /headsdown pause if you choose the backend-allowed pause action."
+      : "HeadsDown call: rabbit_hole_detected. Stop further file edits and re-check the current call before choosing a backend-allowed action.";
     pi.sendUserMessage(escalation, { deliverAs: "steer" });
   }
 
@@ -2991,6 +3405,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     return {
       branch: await currentBranchName(),
+      runId: getTelemetryForProposal(activeProposal).runId,
       approvedProposalId: activeProposal.id,
       approvedProposalDescription: activeProposal.description,
       estimatedFiles: activeProposal.estimatedFiles ?? null,
@@ -3009,9 +3424,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     };
   }
 
-  async function saveAutomaticContinuation(reason: string, ctx?: ExtensionContext) {
+  async function saveAutomaticContinuation(
+    reason: string,
+    ctx?: ExtensionContext,
+  ): Promise<boolean> {
     const artifact = await createContinuationArtifact(reason);
-    if (!artifact) return;
+    if (!artifact) return false;
 
     try {
       await saveContinuationArtifact(artifact);
@@ -3021,8 +3439,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         telemetry.sequence += 1;
         await reportPiAgentRunEvent(ctx, buildContinuationSavedEventInput(telemetry, artifact));
       }
+      return true;
     } catch {
-      // Ignore persistence failures for automatic lifecycle saves.
+      return false;
     }
   }
 
@@ -3295,11 +3714,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         const actorClient = withActorContext(client, ctx);
         const overview = await getAgentControlOverviewCompat(actorClient);
         if (overview?.headsdownCall) {
-          const renderedCall = renderHeadsDownCallCopy({
+          const renderedCallCopy = renderHeadsDownCallCopy({
             key: overview.headsdownCall.key,
             title: overview.headsdownCall.title,
             body: overview.headsdownCall.body,
           });
+          const activeProposalRunIds = activeProposal
+            ? [
+                getTelemetryForProposal(activeProposal).runId,
+                activeProposal.id,
+                runIdForProposal(activeProposal.id),
+              ]
+            : [];
+          const renderedCall = filterRenderedCallActions(
+            renderedCallCopy,
+            allowedActionKeysForCallPrompt(overview, renderedCallCopy.key, activeProposalRunIds),
+          );
           instructionBlocks.push(formatHeadsDownCallForPrompt(renderedCall));
 
           if (renderedCall.key === "off_the_clock") {
@@ -3329,9 +3759,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           }
 
           if (renderedCall.key === "ready_to_resume") {
-            instructionBlocks.push(
-              "[HeadsDown] Ready to resume. Resume approved work. Load saved context with headsdown_continuation action=load.",
-            );
+            const resumeInstruction =
+              renderedCall.primaryActionKey === "resume_run"
+                ? "[HeadsDown] Ready to resume. Load saved context with headsdown_continuation action=load before continuing."
+                : "[HeadsDown] Ready to resume state is visible, but the backend has not allowed a resume action yet. Re-check before continuing.";
+            instructionBlocks.push(resumeInstruction);
           }
         }
       } catch (error) {
@@ -4152,25 +4584,55 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       if (params.action === "load") {
-        const artifact = await loadContinuationArtifact(true);
-        if (artifact) {
-          const eventInput = buildResumedEventInput(artifact);
-          if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                artifact
-                  ? { found: true, consumed: true, artifact, path: CONTINUATION_PATH }
-                  : { found: false, consumed: false, path: CONTINUATION_PATH },
-                null,
-                2,
-              ),
+        const loadResult = await loadContinuationArtifact(false);
+        const artifact = loadResult.artifact;
+        let consumed = false;
+        let resumeAction: Record<string, unknown> = { attempted: false, reason: "no_artifact" };
+
+        if (loadResult.error) {
+          resumeAction = {
+            attempted: false,
+            reason: `artifact_${loadResult.error.reason}`,
+            message: loadResult.error.message,
+          };
+        } else if (artifact) {
+          const client = await getClient();
+          const actorClient = client ? withActorContext(client, _ctx) : null;
+          const resumeResult = await resumeContinuationArtifact({
+            artifact,
+            actorClient,
+            loadOverview: getAgentControlOverviewResult,
+            applyAction: applyHeadsDownActionCompat,
+            clearContinuation: clearContinuationArtifact,
+            reportResumed: async () => {
+              const eventInput = buildResumedEventInput(artifact);
+              if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
             },
-          ],
-          details: artifact ? { found: true, artifact } : { found: false },
+          });
+          consumed = resumeResult.consumed;
+          resumeAction = resumeResult.resumeAction;
+        }
+
+        const response = artifact
+          ? {
+              found: true,
+              consumed,
+              artifact,
+              resumeAction,
+              artifactError: loadResult.error,
+              path: CONTINUATION_PATH,
+            }
+          : {
+              found: false,
+              consumed: false,
+              resumeAction,
+              artifactError: loadResult.error,
+              path: CONTINUATION_PATH,
+            };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+          details: response,
         };
       }
 
@@ -4179,6 +4641,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       const artifact: ContinuationArtifact = {
         branch: params.branch ?? (await currentBranchName()),
+        runId: activeProposal ? getTelemetryForProposal(activeProposal).runId : null,
         approvedProposalId: activeProposal?.id ?? null,
         approvedProposalDescription: activeProposal?.description ?? null,
         estimatedFiles: activeProposal?.estimatedFiles ?? null,
@@ -4519,26 +4982,49 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       const runId = getTelemetryForProposal(proposal).runId;
-      const paused = await applyPauseAndSummarize(ctx, proposal.id);
+      const actorClient = withActorContext(client, ctx);
+      const overviewResult = await getAgentControlOverviewResult(actorClient);
+      if (!overviewResult.ok) {
+        ctx.ui.notify(
+          `[HeadsDown] Cannot verify backend-allowed actions for pause + summarize because HeadsDown could not load the current call: ${overviewResult.message}`,
+          "warning",
+        );
+        return;
+      }
 
-      await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
+      const resolution = resolveAllowedRunAction({
+        overview: overviewResult.overview,
+        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      });
+
+      if (!resolution.allowed || !resolution.runSummary) {
+        ctx.ui.notify(allowedRunActionFailureMessage("pause + summarize", resolution), "warning");
+        return;
+      }
+
+      const paused = await applyPauseAndSummarize(ctx, resolution.runSummary.runId);
+      const handoffSaved = await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
       rabbitHoleInterventions.set(runId, {
         contained: true,
         sourceState: "rabbit_hole_detected",
         pausedAt: Date.now(),
       });
 
-      if (!paused) {
+      if (!paused.ok) {
         ctx.ui.notify(
-          "[HeadsDown] Could not apply pause-and-summarize through the API. Run remains locally contained.",
+          `[HeadsDown] Could not apply pause-and-summarize through the API (${formatHeadsDownActionAttemptFailure(paused)}). Run remains locally contained${handoffSaved ? " with a saved handoff" : ", but the handoff was not saved"}.`,
           "warning",
         );
         return;
       }
 
       ctx.ui.notify(
-        "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice.",
-        "info",
+        handoffSaved
+          ? "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice."
+          : "[HeadsDown] Pause + summarize applied, but the handoff could not be saved. Keep the run contained and save a handoff before resuming.",
+        handoffSaved ? "info" : "warning",
       );
       return;
     }
@@ -4577,11 +5063,38 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const allowed = await allowRunForDuration(ctx, proposal.id, runId, durationMinutes);
-
-      if (!allowed) {
+      const actorClient = withActorContext(client, ctx);
+      const overviewResult = await getAgentControlOverviewResult(actorClient);
+      if (!overviewResult.ok) {
         ctx.ui.notify(
-          "[HeadsDown] Could not apply allow-for-duration. Keep run paused or retry when API support is available.",
+          `[HeadsDown] Cannot verify backend-allowed actions for allow for duration because HeadsDown could not load the current call: ${overviewResult.message}`,
+          "warning",
+        );
+        return;
+      }
+
+      const resolution = resolveAllowedRunAction({
+        overview: overviewResult.overview,
+        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
+        actionKey: "allow_for_duration",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      });
+
+      if (!resolution.allowed || !resolution.runSummary) {
+        ctx.ui.notify(allowedRunActionFailureMessage("allow for duration", resolution), "warning");
+        return;
+      }
+
+      const allowed = await allowRunForDuration(
+        ctx,
+        resolution.runSummary.runId,
+        runId,
+        durationMinutes,
+      );
+
+      if (!allowed.ok) {
+        ctx.ui.notify(
+          `[HeadsDown] Could not apply allow-for-duration (${formatHeadsDownActionAttemptFailure(allowed)}). Keep run paused or retry when API support is available.`,
           "warning",
         );
         return;

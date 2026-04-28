@@ -260,6 +260,7 @@ describe("Pi agent run event payloads", () => {
     };
     const artifact = {
       branch: "feature/secret-branch",
+      runId: telemetry.runId,
       approvedProposalId: "proposal-1",
       approvedProposalDescription: "Fix secret auth issue with prompt details",
       estimatedFiles: 2,
