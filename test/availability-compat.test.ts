@@ -279,6 +279,7 @@ describe("agent control off-clock queue flow", () => {
     expect(selected?.runId).toBe("run-2");
 
     const artifact = __internal.buildQueuedForMorningContinuationArtifact(selected!, "main");
+    expect(artifact.runId).toBe("run-2");
     expect(artifact.reason).toBe("queue-for-morning");
     expect(artifact.completedSteps).toContain("Queued for morning.");
     expect(artifact.resumeInstruction).toBe("Ready to resume. Resume approved work.");
@@ -325,6 +326,49 @@ describe("agent control off-clock queue flow", () => {
     expect(__internal.isAlreadyQueuedForMorning(run as any)).toBe(true);
   });
 
+  it("selects ready-to-resume runs only when resume_run is backend-allowed", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-denied",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["KEEP_QUEUED"],
+        },
+        {
+          runId: "run-allowed",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN", "KEEP_QUEUED"],
+        },
+      ],
+    });
+
+    expect(
+      __internal.pickReadyToResumeRun(normalized?.runSummaries ?? [], ["run-denied"]),
+    ).toBeNull();
+    expect(
+      __internal.pickReadyToResumeRun(normalized?.runSummaries ?? [], ["run-allowed"])?.runId,
+    ).toBe("run-allowed");
+  });
+
+  it("does not guess a ready-to-resume run when multiple runs are resume-allowed", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-1",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+        {
+          runId: "run-2",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+      ],
+    });
+
+    expect(__internal.pickReadyToResumeRun(normalized?.runSummaries ?? [])).toBeNull();
+  });
+
   it("preserves native SDK method receivers for agent-control compat calls", async () => {
     const client = {
       async getAgentControlOverview() {
@@ -334,8 +378,9 @@ describe("agent control off-clock queue flow", () => {
           runSummaries: [],
         };
       },
-      async applyHeadsDownAction(input: Record<string, unknown>) {
+      async applyHeadsDownAction(actionKey: string, input: Record<string, unknown>) {
         expect(this).toBe(client);
+        expect(actionKey).toBe("resume_run");
         expect(input).toEqual({ runId: "run-native", actionKey: "resume_run" });
         return {
           ok: true,
@@ -362,6 +407,24 @@ describe("agent control off-clock queue flow", () => {
     expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
   });
 
+  it("supports legacy one-argument native action helpers", async () => {
+    const client = {
+      async applyHeadsDownAction(input: Record<string, unknown>) {
+        expect(this).toBe(client);
+        expect(input).toEqual({ runId: "run-legacy", actionKey: "resume_run" });
+        return { ok: true, runSummary: { runId: "run-legacy", allowedActionKeys: ["RESUME_RUN"] } };
+      },
+    };
+
+    const result = await __internal.applyHeadsDownActionCompat(client as any, {
+      runId: "run-legacy",
+      actionKey: "resume_run",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
+  });
+
   it("does not auto-queue queue_for_morning on non-off-clock runs", () => {
     const run = {
       runId: "run-needs-yes",
@@ -377,6 +440,27 @@ describe("agent control off-clock queue flow", () => {
     };
 
     expect(__internal.pickQueueForMorningRun([run as any])).toBeNull();
+    expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
+  });
+
+  it("fails closed when off-clock runs omit allowed action metadata", () => {
+    const normalized = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-off-clock",
+          callKey: "OFF_THE_CLOCK",
+          actionState: "AWAITING_ACTION",
+          safeTitle: "Queued ask",
+          clientLabel: "Pi",
+          handoffAvailable: false,
+          handoffState: "MISSING",
+        },
+      ],
+    });
+    const run = normalized?.runSummaries[0];
+
+    expect(run?.allowedActionKeys).toEqual([]);
+    expect(__internal.pickQueueForMorningRun(normalized?.runSummaries ?? [])).toBeNull();
     expect(__internal.shouldAutoQueueForMorning(run as any, new Set<string>())).toBe(false);
   });
 

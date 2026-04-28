@@ -52,6 +52,8 @@ import {
   formatHeadsDownCallForPrompt,
   renderHeadsDownCallCopy,
   type HeadsDownActionKey,
+  type HeadsDownUiIntent,
+  type RenderedHeadsDownCallCopy,
 } from "./call-renderer.js";
 
 // === State ===
@@ -218,6 +220,7 @@ interface QueueForMorningResult {
 
 interface ContinuationArtifact {
   branch: string | null;
+  runId?: string | null;
   approvedProposalId: string | null;
   approvedProposalDescription: string | null;
   estimatedFiles: number | null;
@@ -786,13 +789,21 @@ async function applyHeadsDownActionCompat(
 ): Promise<ApplyHeadsDownActionPayload> {
   const nativeMethod = (
     client as unknown as {
-      applyHeadsDownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
-      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+      applyHeadsDownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
+      applyHeadsdownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
     }
   ).applyHeadsDownAction;
 
   if (typeof nativeMethod === "function") {
-    const result = (await nativeMethod.call(client, input)) as Record<string, unknown>;
+    const result = (await (nativeMethod.length >= 2
+      ? nativeMethod.call(client, input.actionKey as HeadsDownActionKey, input)
+      : nativeMethod.call(client, input))) as Record<string, unknown>;
     return {
       ok: result.ok === true,
       runSummary: normalizeRunSummaryPayload(result.runSummary),
@@ -801,12 +812,17 @@ async function applyHeadsDownActionCompat(
 
   const fallbackNativeMethod = (
     client as unknown as {
-      applyHeadsdownAction?: (payload: ApplyHeadsDownActionInput) => Promise<unknown>;
+      applyHeadsdownAction?: (
+        actionKeyOrPayload: HeadsDownActionKey | ApplyHeadsDownActionInput,
+        payload?: ApplyHeadsDownActionInput,
+      ) => Promise<unknown>;
     }
   ).applyHeadsdownAction;
 
   if (typeof fallbackNativeMethod === "function") {
-    const result = (await fallbackNativeMethod.call(client, input)) as Record<string, unknown>;
+    const result = (await (fallbackNativeMethod.length >= 2
+      ? fallbackNativeMethod.call(client, input.actionKey as HeadsDownActionKey, input)
+      : fallbackNativeMethod.call(client, input))) as Record<string, unknown>;
     return {
       ok: result.ok === true,
       runSummary: normalizeRunSummaryPayload(result.runSummary),
@@ -882,6 +898,138 @@ function shouldAutoQueueForMorning(
   return true;
 }
 
+interface AllowedRunActionResolution {
+  allowed: boolean;
+  runSummary: AgentRunSummaryPayload | null;
+  reason: "missing_overview" | "missing_run" | "call_mismatch" | "action_not_allowed" | "allowed";
+}
+
+function resolveAllowedRunAction(input: {
+  overview: AgentControlOverviewPayload | null | undefined;
+  candidateRunIds: string[];
+  actionKey: HeadsDownActionKey;
+  expectedCallKeys?: string[];
+}): AllowedRunActionResolution {
+  if (!input.overview) {
+    return { allowed: false, runSummary: null, reason: "missing_overview" };
+  }
+
+  const candidateRunIds = new Set(input.candidateRunIds.filter((id) => id.trim().length > 0));
+  const runSummary =
+    input.overview.runSummaries.find((summary) => candidateRunIds.has(summary.runId)) ?? null;
+
+  if (!runSummary) {
+    return { allowed: false, runSummary: null, reason: "missing_run" };
+  }
+
+  const expectedCallKeys = input.expectedCallKeys ?? [];
+  if (
+    expectedCallKeys.length > 0 &&
+    (!runSummary.callKey || !expectedCallKeys.includes(runSummary.callKey))
+  ) {
+    return { allowed: false, runSummary, reason: "call_mismatch" };
+  }
+
+  if (!runSummary.allowedActionKeys.includes(input.actionKey)) {
+    return { allowed: false, runSummary, reason: "action_not_allowed" };
+  }
+
+  return { allowed: true, runSummary, reason: "allowed" };
+}
+
+function allowedRunActionFailureMessage(
+  actionLabel: string,
+  resolution: AllowedRunActionResolution,
+): string {
+  switch (resolution.reason) {
+    case "missing_overview":
+      return `[HeadsDown] Cannot verify backend-allowed actions for ${actionLabel}. Re-check the current HeadsDown call before acting.`;
+    case "missing_run":
+      return `[HeadsDown] Cannot find the active run in backend action data for ${actionLabel}. Re-check the current HeadsDown call before acting.`;
+    case "call_mismatch":
+      return `[HeadsDown] The active run is no longer in the expected call state for ${actionLabel}. Re-check before acting.`;
+    case "action_not_allowed":
+      return `[HeadsDown] Backend did not allow ${actionLabel} for this run. Keep the run contained and re-check the current call.`;
+    case "allowed":
+      return `[HeadsDown] ${actionLabel} is allowed.`;
+  }
+}
+
+function allowedActionKeysForCallPrompt(
+  overview: AgentControlOverviewPayload,
+  callKey: string,
+  candidateRunIds: string[] = [],
+): string[] {
+  const candidateRunIdSet = new Set(candidateRunIds.filter((id) => id.trim().length > 0));
+  const matchingRuns = overview.runSummaries.filter((summary) => summary.callKey === callKey);
+
+  if (candidateRunIdSet.size > 0) {
+    const candidate = matchingRuns.find((summary) => candidateRunIdSet.has(summary.runId));
+    return candidate?.allowedActionKeys ?? [];
+  }
+
+  if (matchingRuns.length === 1) {
+    return matchingRuns[0]!.allowedActionKeys;
+  }
+
+  return overview.headsdownCall?.allowedActionKeys ?? [];
+}
+
+function filterRenderedCallActions(
+  rendered: RenderedHeadsDownCallCopy,
+  allowedActionKeys: string[],
+): RenderedHeadsDownCallCopy {
+  const filterAction = (
+    label: string | null,
+    actionKey: HeadsDownActionKey | null,
+    uiIntent: HeadsDownUiIntent | null,
+  ) => {
+    if (!actionKey || allowedActionKeys.includes(actionKey)) {
+      return { label, actionKey, uiIntent };
+    }
+
+    return { label: null, actionKey: null, uiIntent: null };
+  };
+
+  const primary = filterAction(
+    rendered.primaryLabel,
+    rendered.primaryActionKey,
+    rendered.primaryUiIntent,
+  );
+  const secondary = filterAction(
+    rendered.secondaryLabel,
+    rendered.secondaryActionKey,
+    rendered.secondaryUiIntent,
+  );
+
+  return {
+    ...rendered,
+    primaryLabel: primary.label,
+    primaryActionKey: primary.actionKey,
+    primaryUiIntent: primary.uiIntent,
+    secondaryLabel: secondary.label,
+    secondaryActionKey: secondary.actionKey,
+    secondaryUiIntent: secondary.uiIntent,
+  };
+}
+
+function pickReadyToResumeRun(
+  runSummaries: AgentRunSummaryPayload[],
+  candidateRunIds: string[] = [],
+): AgentRunSummaryPayload | null {
+  const candidateRunIdSet = new Set(candidateRunIds.filter((id) => id.trim().length > 0));
+  const readyRuns = runSummaries.filter(
+    (summary) =>
+      summary.callKey === "ready_to_resume" && summary.allowedActionKeys.includes("resume_run"),
+  );
+
+  if (candidateRunIdSet.size > 0) {
+    return readyRuns.find((summary) => candidateRunIdSet.has(summary.runId)) ?? null;
+  }
+
+  return readyRuns.length === 1 ? readyRuns[0] : null;
+}
+
 function buildQueuedForMorningContinuationArtifact(
   runSummary: AgentRunSummaryPayload,
   branch: string | null,
@@ -889,6 +1037,7 @@ function buildQueuedForMorningContinuationArtifact(
   const safeTitle = runSummary.safeTitle ?? "approved run";
   return {
     branch,
+    runId: runSummary.runId,
     approvedProposalId: null,
     approvedProposalDescription: safeTitle,
     estimatedFiles: null,
@@ -1125,14 +1274,17 @@ function buildRabbitHoleNarrative(input: {
     normalizeGraphQLEnumOutput(input.activeCallKey) ??
     normalizeGraphQLEnumOutput(input.runSummary?.callKey ?? null) ??
     "rabbit_hole_detected";
-  const callKey = normalizeGraphQLEnumOutput(input.call?.knownKey ?? input.call?.key ?? null);
-  const useCallCopy = callKey === activeCallKey;
-  const renderedCall = renderHeadsDownCallCopy({
-    key: activeCallKey,
-    title: useCallCopy ? input.call?.title : undefined,
-    body: useCallCopy ? input.call?.body : undefined,
-    fallbackSignals: { limitSignal: true },
-  });
+  const renderedCall = filterRenderedCallActions(
+    renderHeadsDownCallCopy({
+      key: activeCallKey,
+      title: undefined,
+      body: undefined,
+      fallbackSignals: { limitSignal: true },
+    }),
+    normalizeActionKeyList(
+      (input.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
+    ),
+  );
   const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
   const reasonLine =
     reasonCodes.length > 0
@@ -1143,8 +1295,12 @@ function buildRabbitHoleNarrative(input: {
     "HEADSDOWN INTERVENTION",
     `Call: ${renderedCall.title}`,
     `Trap: ${reasonLine}`,
-    `Play: ${renderedCall.primaryLabel ?? "Pause and summarize"}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`,
-    "Escalation: If the seam is still unclear, request an explicit allow-for-duration override before continuing deeper.",
+    renderedCall.primaryLabel
+      ? `Play: ${renderedCall.primaryLabel}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`
+      : "Play: Keep the run contained, stop adding scope, and re-check the current HeadsDown call before choosing an action.",
+    renderedCall.secondaryLabel
+      ? "Escalation: If the seam is still unclear, use only a backend-allowed secondary action before continuing deeper."
+      : "Escalation: If the seam is still unclear, ask for a fresh HeadsDown call before continuing deeper.",
     "",
     formatHeadsDownCallForPrompt(renderedCall),
   ].join("\n");
@@ -2099,8 +2255,13 @@ export const __internal = {
   pickQueueForMorningRun,
   isAlreadyQueuedForMorning,
   shouldAutoQueueForMorning,
+  allowedActionKeysForCallPrompt,
+  filterRenderedCallActions,
+  pickReadyToResumeRun,
   buildQueuedForMorningContinuationArtifact,
   queueForMorningWithHandoff,
+  resolveAllowedRunAction,
+  allowedRunActionFailureMessage,
   isPotentiallyMutatingBashCommand,
   isReadonlyBashCommand,
   progressStateForBashCommand,
@@ -2452,10 +2613,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     });
 
     if (ctx.hasUI) {
-      ctx.ui.notify(
-        "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing.",
-        "warning",
+      const allowedActionKeys = normalizeActionKeyList(
+        (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
       );
+      const message = allowedActionKeys.includes("pause_and_summarize")
+        ? "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing."
+        : "[HeadsDown] Rabbit hole detected. Stop mutating edits and re-check the current call before acting.";
+      ctx.ui.notify(message, "warning");
     }
 
     pi.sendMessage(
@@ -2474,8 +2638,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     await saveAutomaticContinuation("rabbit_hole_detected", ctx);
 
-    const escalation =
-      "HeadsDown call: rabbit_hole_detected. Pause this run locally, summarize current progress, and stop further file edits. To continue instead, ask for an explicit allow-for-duration override before applying pause_and_summarize.";
+    const allowedActionKeys = normalizeActionKeyList(
+      (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
+    );
+    const escalation = allowedActionKeys.includes("pause_and_summarize")
+      ? "HeadsDown call: rabbit_hole_detected. Stop further file edits and use /headsdown pause if you choose the backend-allowed pause action."
+      : "HeadsDown call: rabbit_hole_detected. Stop further file edits and re-check the current call before choosing a backend-allowed action.";
     pi.sendUserMessage(escalation, { deliverAs: "steer" });
   }
 
@@ -2991,6 +3159,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     return {
       branch: await currentBranchName(),
+      runId: getTelemetryForProposal(activeProposal).runId,
       approvedProposalId: activeProposal.id,
       approvedProposalDescription: activeProposal.description,
       estimatedFiles: activeProposal.estimatedFiles ?? null,
@@ -3295,11 +3464,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         const actorClient = withActorContext(client, ctx);
         const overview = await getAgentControlOverviewCompat(actorClient);
         if (overview?.headsdownCall) {
-          const renderedCall = renderHeadsDownCallCopy({
+          const renderedCallCopy = renderHeadsDownCallCopy({
             key: overview.headsdownCall.key,
             title: overview.headsdownCall.title,
             body: overview.headsdownCall.body,
           });
+          const activeProposalRunIds = activeProposal
+            ? [
+                getTelemetryForProposal(activeProposal).runId,
+                activeProposal.id,
+                runIdForProposal(activeProposal.id),
+              ]
+            : [];
+          const renderedCall = filterRenderedCallActions(
+            renderedCallCopy,
+            allowedActionKeysForCallPrompt(overview, renderedCallCopy.key, activeProposalRunIds),
+          );
           instructionBlocks.push(formatHeadsDownCallForPrompt(renderedCall));
 
           if (renderedCall.key === "off_the_clock") {
@@ -3329,9 +3509,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           }
 
           if (renderedCall.key === "ready_to_resume") {
-            instructionBlocks.push(
-              "[HeadsDown] Ready to resume. Resume approved work. Load saved context with headsdown_continuation action=load.",
-            );
+            const resumeInstruction =
+              renderedCall.primaryActionKey === "resume_run"
+                ? "[HeadsDown] Ready to resume. Load saved context with headsdown_continuation action=load before continuing."
+                : "[HeadsDown] Ready to resume state is visible, but the backend has not allowed a resume action yet. Re-check before continuing.";
+            instructionBlocks.push(resumeInstruction);
           }
         }
       } catch (error) {
@@ -4152,25 +4334,62 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       if (params.action === "load") {
-        const artifact = await loadContinuationArtifact(true);
+        const artifact = await loadContinuationArtifact(false);
+        let consumed = false;
+        let resumeAction: Record<string, unknown> = { attempted: false, reason: "no_artifact" };
+
         if (artifact) {
-          const eventInput = buildResumedEventInput(artifact);
-          if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
+          const client = await getClient();
+          if (!client) {
+            resumeAction = { attempted: false, reason: "not_authenticated" };
+          } else {
+            const actorClient = withActorContext(client, _ctx);
+            const overview = await getAgentControlOverviewCompat(actorClient).catch(() => null);
+            const candidateRunIds = [
+              artifact.runId ?? "",
+              artifact.approvedProposalId ?? "",
+              artifact.approvedProposalId ? runIdForProposal(artifact.approvedProposalId) : "",
+            ];
+            const readyRun = pickReadyToResumeRun(overview?.runSummaries ?? [], candidateRunIds);
+
+            if (readyRun) {
+              const result = await applyHeadsDownActionCompat(actorClient, {
+                runId: readyRun.runId,
+                actionKey: "resume_run",
+                source: "pi",
+                client: "pi",
+                reason: "Ready to resume. Resume approved work.",
+              }).catch(() => ({ ok: false, runSummary: null }));
+
+              resumeAction = { attempted: true, ok: result.ok, runId: readyRun.runId };
+
+              if (result.ok) {
+                consumed = await clearContinuationArtifact();
+                const eventInput = buildResumedEventInput(artifact);
+                if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
+              }
+            } else {
+              resumeAction = { attempted: false, reason: "resume_run_not_allowed" };
+            }
+          }
         }
+
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 artifact
-                  ? { found: true, consumed: true, artifact, path: CONTINUATION_PATH }
-                  : { found: false, consumed: false, path: CONTINUATION_PATH },
+                  ? { found: true, consumed, artifact, resumeAction, path: CONTINUATION_PATH }
+                  : { found: false, consumed: false, resumeAction, path: CONTINUATION_PATH },
                 null,
                 2,
               ),
             },
           ],
-          details: artifact ? { found: true, artifact } : { found: false },
+          details: artifact
+            ? { found: true, consumed, artifact, resumeAction }
+            : { found: false, consumed: false, resumeAction },
         };
       }
 
@@ -4179,6 +4398,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       const artifact: ContinuationArtifact = {
         branch: params.branch ?? (await currentBranchName()),
+        runId: activeProposal ? getTelemetryForProposal(activeProposal).runId : null,
         approvedProposalId: activeProposal?.id ?? null,
         approvedProposalDescription: activeProposal?.description ?? null,
         estimatedFiles: activeProposal?.estimatedFiles ?? null,
@@ -4519,7 +4739,21 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
 
       const runId = getTelemetryForProposal(proposal).runId;
-      const paused = await applyPauseAndSummarize(ctx, proposal.id);
+      const actorClient = withActorContext(client, ctx);
+      const overview = await getAgentControlOverviewCompat(actorClient).catch(() => null);
+      const resolution = resolveAllowedRunAction({
+        overview,
+        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
+        actionKey: "pause_and_summarize",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      });
+
+      if (!resolution.allowed || !resolution.runSummary) {
+        ctx.ui.notify(allowedRunActionFailureMessage("pause + summarize", resolution), "warning");
+        return;
+      }
+
+      const paused = await applyPauseAndSummarize(ctx, resolution.runSummary.runId);
 
       await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
       rabbitHoleInterventions.set(runId, {
@@ -4577,7 +4811,26 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const allowed = await allowRunForDuration(ctx, proposal.id, runId, durationMinutes);
+      const actorClient = withActorContext(client, ctx);
+      const overview = await getAgentControlOverviewCompat(actorClient).catch(() => null);
+      const resolution = resolveAllowedRunAction({
+        overview,
+        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
+        actionKey: "allow_for_duration",
+        expectedCallKeys: ["rabbit_hole_detected"],
+      });
+
+      if (!resolution.allowed || !resolution.runSummary) {
+        ctx.ui.notify(allowedRunActionFailureMessage("allow for duration", resolution), "warning");
+        return;
+      }
+
+      const allowed = await allowRunForDuration(
+        ctx,
+        resolution.runSummary.runId,
+        runId,
+        durationMinutes,
+      );
 
       if (!allowed) {
         ctx.ui.notify(
