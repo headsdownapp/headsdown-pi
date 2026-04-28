@@ -1,3 +1,7 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mkdtemp } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
 
@@ -21,8 +25,28 @@ function registerHeadsDownCommand() {
   return command;
 }
 
-function makeCommandContext(options: { selected?: string | undefined; hasUI?: boolean } = {}) {
+async function tempWorkspaceWithRefereeContract() {
+  const cwd = await mkdtemp(join(tmpdir(), "headsdown-command-referee-"));
+  await mkdir(join(cwd, ".headsdown"));
+  await writeFile(
+    join(cwd, ".headsdown", "referee.json"),
+    JSON.stringify({
+      version: 1,
+      checks: [
+        { type: "network_required", required: false },
+        { type: "max_files_touched", max: 5 },
+      ],
+    }),
+    "utf-8",
+  );
+  return cwd;
+}
+
+function makeCommandContext(
+  options: { selected?: string | undefined; hasUI?: boolean; cwd?: string } = {},
+) {
   return {
+    cwd: options.cwd ?? process.cwd(),
     hasUI: options.hasUI ?? true,
     ui: {
       notify: vi.fn(),
@@ -37,6 +61,7 @@ describe("HeadsDown command discovery", () => {
 
     expect(values).toContain("help");
     expect(values).toContain("menu");
+    expect(values).toContain("referee");
     expect(values).toContain("rabbit-hole status");
     expect(values).toContain("rabbit-hole off");
     expect(values).toContain("rabbit-hole quiet");
@@ -62,6 +87,8 @@ describe("HeadsDown command discovery", () => {
 
     expect(help).toContain("Status");
     expect(help).toContain("/headsdown digest");
+    expect(help).toContain("Local verification");
+    expect(help).toContain("/headsdown referee");
     expect(help).toContain("Run actions");
     expect(help).toContain("/headsdown pause");
     expect(help).toContain("/headsdown allow <minutes>");
@@ -86,6 +113,7 @@ describe("HeadsDown command discovery", () => {
     );
 
     expect(menuValues).toContain("help");
+    expect(menuValues).toContain("referee");
     expect(menuValues).toContain("rabbit-hole status");
     expect(menuValues).toContain("allow 15");
     expect(menuValues).not.toContain("rabbit");
@@ -99,6 +127,22 @@ describe("HeadsDown command discovery", () => {
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(__internal.buildHeadsDownCommandHelp(), "info");
     expect(ctx.ui.select).not.toHaveBeenCalled();
+  });
+
+  it("routes /headsdown referee without requiring authentication", async () => {
+    const command = registerHeadsDownCommand();
+    const ctx = makeCommandContext({ cwd: await tempWorkspaceWithRefereeContract() });
+
+    await command.handler("referee", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("HEADSDOWN LOCAL REFEREE RECEIPT"),
+      "info",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("Not authenticated"),
+      expect.anything(),
+    );
   });
 
   it("routes /headsdown menu through the interactive picker", async () => {
