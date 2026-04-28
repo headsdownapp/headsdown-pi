@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it, vi } from "vitest";
+import { HeadsDownClient } from "@headsdown/sdk";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension from "../extensions/headsdown/index.js";
 import {
   parseLocalRefereeContract,
@@ -36,6 +37,14 @@ async function tempWorkspaceWithContract(contract: unknown = validContract()) {
   await writeFile(join(cwd, ".headsdown", "referee.json"), JSON.stringify(contract), "utf-8");
   return cwd;
 }
+
+function stubSignedOutHeadsDownClient() {
+  vi.spyOn(HeadsDownClient, "fromCredentials").mockRejectedValue(new Error("not signed in"));
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("Local Referee contract", () => {
   it("parses a supported repo-local completion contract", () => {
@@ -283,7 +292,322 @@ describe("Local Referee receipt and runner", () => {
     );
 
     expect(result.content[0].text).toContain("HEADSDOWN LOCAL REFEREE RECEIPT");
+    expect(result.content[0].text).toContain("Share this run summary with HeadsDown?");
     expect(result.content[0].text).not.toContain("Not authenticated");
     expect(result.details.evaluation.verdict).toBe("passed");
+  });
+
+  it("shows an explicit preview even when the run is not a high-signal share prompt", async () => {
+    const cwd = await tempWorkspaceWithContract({
+      version: 1,
+      checks: [{ type: "max_files_touched", max: 1 }],
+    });
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "preview",
+        evidence: {
+          files_touched: 0,
+          tool_calls: 0,
+          validation_status: "unknown",
+          tests_run: false,
+          network_required: false,
+          outcome: "unknown",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(result.details.evaluation.verdict).toBe("passed");
+    expect(result.details.outcomeSharing.suggested).toBe(false);
+    expect(result.content[0].text).toContain("Share this run summary with HeadsDown?");
+  });
+
+  it("does not persist always-share preference when hosted sharing fails", async () => {
+    stubSignedOutHeadsDownClient();
+    const cwd = await tempWorkspaceWithContract();
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const preview = await tool.execute(
+      "tool-call",
+      {
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    const token = preview.details.outcomeSharing.previewToken;
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "always_share",
+        confirm_share_preview: true,
+        share_preview_token: token,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(result.details.outcomeSharing.preference).toBe("local_only");
+    expect(result.content[0].text).toContain("Run stays local");
+  });
+
+  it("requires a prior preview token before sharing", async () => {
+    stubSignedOutHeadsDownClient();
+    const cwd = await tempWorkspaceWithContract();
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "share_once",
+        confirm_share_preview: true,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(result.content[0].text).toContain("Preview token required");
+    expect(result.details.outcomeSharing.shared).toBe(false);
+  });
+
+  it("does not consume a preview token when confirmation is missing", async () => {
+    stubSignedOutHeadsDownClient();
+    const cwd = await tempWorkspaceWithContract();
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const preview = await tool.execute(
+      "tool-call",
+      {
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    const token = preview.details.outcomeSharing.previewToken;
+
+    const missingConfirmation = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "share_once",
+        share_preview_token: token,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(missingConfirmation.content[0].text).toContain("Preview confirmation required");
+
+    const confirmed = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "share_once",
+        confirm_share_preview: true,
+        share_preview_token: token,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(confirmed.content[0].text).toContain("Run stays local");
+    expect(confirmed.content[0].text).not.toContain("Preview token required");
+  });
+
+  it("does not allow a preview token from another workspace", async () => {
+    stubSignedOutHeadsDownClient();
+    const workspaceA = await tempWorkspaceWithContract();
+    const workspaceB = await tempWorkspaceWithContract();
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const preview = await tool.execute(
+      "tool-call",
+      {
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd: workspaceA },
+    );
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "share_once",
+        confirm_share_preview: true,
+        share_preview_token: preview.details.outcomeSharing.previewToken,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd: workspaceB },
+    );
+
+    expect(result.content[0].text).toContain("Preview token required");
+    expect(result.details.outcomeSharing.shared).toBe(false);
+  });
+
+  it("fails closed when sharing is requested without available hosted sync", async () => {
+    stubSignedOutHeadsDownClient();
+    const cwd = await tempWorkspaceWithContract();
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const preview = await tool.execute(
+      "tool-call",
+      {
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    const token = preview.details.outcomeSharing.previewToken;
+    expect(typeof token).toBe("string");
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        share_outcome: "share_once",
+        confirm_share_preview: true,
+        share_preview_token: token,
+        evidence: {
+          files_touched: 1,
+          tool_calls: 1,
+          validation_status: "passed",
+          tests_run: true,
+          network_required: false,
+          outcome: "completed",
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(result.content[0].text).toContain("Share this run summary with HeadsDown?");
+    expect(result.content[0].text).toContain("Run stays local");
+    expect(result.details.outcomeSharing.shared).toBe(false);
   });
 });

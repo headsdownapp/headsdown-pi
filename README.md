@@ -62,13 +62,17 @@ Run the local Referee from Pi:
 /headsdown referee
 ```
 
-Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`. If `files_touched` is omitted, the runner counts changed entries from local `git status --short --untracked-files=all` and stores only the count bucket in the receipt. If Git status is unavailable, pass `files_touched` explicitly so the receipt does not silently undercount local changes.
+After high-signal runs, Local Referee can show an explicit "Share outcome summary" preview with the exact metadata categories before anything is sent. Local mode remains the default. Sharing is opt-in, workspace-scoped, and fail-closed.
+
+Agents can call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`. The tool also supports optional consent controls: `share_outcome` (`preview`, `share_once`, `always_share`, `keep_local`), `confirm_share_preview`, and `share_preview_token` from a prior preview call. Persistent `always_share` consent is stored only after a confirmed share succeeds; it is scoped per workspace and bound to the current outcome-summary privacy boundary version.
+
+If `files_touched` is omitted, the runner counts changed entries from local `git status --short --untracked-files=all` and stores only the count bucket in the receipt. If Git status is unavailable, pass `files_touched` explicitly so the receipt does not silently undercount local changes.
 
 Supported check types are `validation_status`, `max_files_touched`, `max_tool_calls`, `require_tests`, `network_required`, and `outcome`. `require_tests` may omit `required` as shorthand for `true`; `network_required` must always set `required` explicitly because both `true` and `false` are meaningful.
 
 The receipt includes only derived review fields: verdict, check outcomes, broad count/time buckets, validation status, test/network booleans, outcome category, generated time, and an opaque contract reference. It does not include prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, credentials, or raw contract text.
 
-Hosted HeadsDown remains additive. Connecting an account can add hosted availability policy, standing rules, mobile approval, audit/history, cross-client coordination, and outcome learning. The local Referee receipt works without those hosted features.
+Hosted HeadsDown remains additive. Connecting an account can add hosted availability policy, standing rules, mobile approval, audit/history, cross-client coordination, and outcome learning. If outcome sharing is requested while hosted sync is unavailable or the user is not signed in, the tool fails closed and keeps the run local. The local Referee receipt works without hosted features.
 
 ## Extension Features
 
