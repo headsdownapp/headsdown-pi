@@ -234,7 +234,15 @@ npm test
 npm run typecheck
 ```
 
-No build step is required. Pi loads TypeScript extensions via jiti.
+This repo keeps source extensions in TypeScript for local development and Pi can still load them via jiti while editing.
+
+Published npm artifacts are built with esbuild so extension runtime code ships from `dist/extensions` with `@headsdown/sdk` inlined. Peer host packages remain external. Skills are copied to `dist/skills` so the package manifest can point Pi to the publish-time artifact layout.
+
+Before packing or publishing, run:
+
+```bash
+npm run build
+```
 
 ## License
 
