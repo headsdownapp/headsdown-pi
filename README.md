@@ -236,6 +236,10 @@ npm run typecheck
 
 No build step is required. Pi loads TypeScript extensions via jiti.
 
+## Dependency update automation
+
+This repo uses Renovate to keep `@headsdown/sdk` and other routine dependencies current. New SDK releases open bot PRs automatically, and eligible updates can automerge after required CI checks pass. In normal maintenance flow, do not manually edit `@headsdown/sdk` versions unless you are intentionally overriding Renovate behavior.
+
 ## License
 
 MIT
