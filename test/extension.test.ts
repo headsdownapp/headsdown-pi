@@ -122,24 +122,14 @@ describe("Extension file", () => {
     );
   });
 
-  it("handles rabbit_hole_detected with pause/summarize and allow-for-duration override", async () => {
+  it("ignores legacy rabbit_hole_detected containment paths", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
-    expect(content).toContain("maybeHandleRabbitHoleDetected");
-    expect(content).toContain("pauseAndSummarize");
-    expect(content).toContain("allowForDuration");
-    expect(content).toContain("rabbitHoleInterventions");
-    expect(content).toContain('normalizedArgs.startsWith("pause")');
-    expect(content).toContain('normalizedArgs.startsWith("allow")');
-  });
-
-  it("supports session-scoped rabbit-hole override controls", async () => {
-    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
-    expect(content).toContain('type RabbitHoleSessionMode = "on" | "off" | "quiet"');
-    expect(content).toContain("rabbitHoleSessionMode");
-    expect(content).toContain('normalizedArgs.startsWith("rabbit-hole ")');
-    expect(content).toContain("/headsdown rabbit-hole <status|off|quiet|on>");
-    expect(content).toContain("shouldBlockRabbitHoleMutation");
-    expect(content).toContain("shouldEmitRabbitHoleGuidance");
+    expect(content).not.toContain("maybeHandleRabbitHoleDetected");
+    expect(content).not.toContain("rabbitHoleInterventions");
+    expect(content).not.toContain('normalizedArgs.startsWith("pause")');
+    expect(content).not.toContain('normalizedArgs.startsWith("allow")');
+    expect(content).not.toContain('normalizedArgs.startsWith("rabbit-hole ")');
+    expect(content).not.toContain("shouldBlockRabbitHoleMutation");
   });
 
   it("supports themed status UI and runtime /headsdown theme switching", async () => {
