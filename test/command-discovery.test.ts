@@ -66,6 +66,10 @@ describe("HeadsDown command discovery", () => {
     expect(values).toContain("help");
     expect(values).toContain("menu");
     expect(values).toContain("referee");
+    expect(values).toContain("box 15m");
+    expect(values).toContain("box 1h");
+    expect(values).toContain("box status");
+    expect(values).toContain("box clear");
     expect(values).toContain("rabbit-hole status");
     expect(values).toContain("rabbit-hole off");
     expect(values).toContain("rabbit-hole quiet");
@@ -83,6 +87,9 @@ describe("HeadsDown command discovery", () => {
     expect(
       (__internal.getHeadsDownCommandCompletions("theme e") ?? []).map((item) => item.value),
     ).toEqual(["theme executive"]);
+    expect(
+      (__internal.getHeadsDownCommandCompletions("box s") ?? []).map((item) => item.value),
+    ).toEqual(["box status"]);
     expect(__internal.getHeadsDownCommandCompletions("missing")).toBeNull();
   });
 
@@ -96,6 +103,10 @@ describe("HeadsDown command discovery", () => {
     expect(help).toContain("Run actions");
     expect(help).toContain("/headsdown pause");
     expect(help).toContain("/headsdown allow <minutes>");
+    expect(help).toContain("Local time box");
+    expect(help).toContain("/headsdown box <duration>");
+    expect(help).toContain("/headsdown box status");
+    expect(help).toContain("/headsdown box clear");
     expect(help).toContain("Rabbit-hole controls");
     expect(help).toContain("/headsdown rabbit-hole quiet");
     expect(help).toContain("Display");
@@ -118,6 +129,9 @@ describe("HeadsDown command discovery", () => {
 
     expect(menuValues).toContain("help");
     expect(menuValues).toContain("referee");
+    expect(menuValues).toContain("box 15m");
+    expect(menuValues).toContain("box status");
+    expect(menuValues).toContain("box clear");
     expect(menuValues).toContain("rabbit-hole status");
     expect(menuValues).toContain("allow 15");
     expect(menuValues).not.toContain("rabbit");
@@ -159,6 +173,7 @@ describe("HeadsDown command discovery", () => {
       "HeadsDown commands",
       expect.arrayContaining([
         "Help: /headsdown help",
+        "Time box status: /headsdown box status",
         "Rabbit-hole status: /headsdown rabbit-hole status",
       ]),
     );
