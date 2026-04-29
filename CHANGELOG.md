@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-04-29
+
+- Added a publish-time esbuild bundling step for extension entrypoints into `dist/extensions`.
+- Switched package publishing metadata to ship `dist` artifacts and point Pi extension/skill manifests at `dist` paths.
+- Moved `@headsdown/sdk` from runtime `dependencies` to `devDependencies` so it is inlined in published extension artifacts instead of installed transitively at runtime.
+- Updated CI and npm publish workflows to run `npm run build` before typecheck/test/lint.
+- Updated README and manifest tests to document and verify the bundled artifact layout.
+
 ## 0.2.0 - 2026-04-22
 
 - Deepened Pi integration across session lifecycle hooks, including `session_before_compact`, `session_before_tree`, `session_before_switch`, and `session_shutdown`.
