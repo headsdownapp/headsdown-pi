@@ -226,8 +226,8 @@ describe("Pi package manifest", () => {
   it("declares pi extensions and skills", async () => {
     const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf-8"));
     expect(pkg.pi).toBeTruthy();
-    expect(pkg.pi.extensions).toContain("./extensions");
-    expect(pkg.pi.skills).toContain("./skills");
+    expect(pkg.pi.extensions).toContain("./dist/extensions");
+    expect(pkg.pi.skills).toContain("./dist/skills");
   });
 
   it("has pi-package keyword for discoverability", async () => {
@@ -241,8 +241,9 @@ describe("Pi package manifest", () => {
     expect(pkg.peerDependencies["@sinclair/typebox"]).toBeTruthy();
   });
 
-  it("depends on @headsdown/sdk", async () => {
+  it("declares @headsdown/sdk as a development dependency", async () => {
     const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf-8"));
-    expect(pkg.dependencies["@headsdown/sdk"]).toBeTruthy();
+    expect(pkg.dependencies["@headsdown/sdk"]).toBeUndefined();
+    expect(pkg.devDependencies["@headsdown/sdk"]).toBeTruthy();
   });
 });
