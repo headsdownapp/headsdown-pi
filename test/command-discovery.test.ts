@@ -70,20 +70,18 @@ describe("HeadsDown command discovery", () => {
     expect(values).toContain("box 1h");
     expect(values).toContain("box status");
     expect(values).toContain("box clear");
-    expect(values).toContain("rabbit-hole status");
-    expect(values).toContain("rabbit-hole off");
-    expect(values).toContain("rabbit-hole quiet");
-    expect(values).toContain("rabbit-hole on");
-    expect(values).toContain("pause");
-    expect(values).toContain("allow 15");
+    expect(values).not.toContain("rabbit-hole status");
+    expect(values).not.toContain("rabbit-hole off");
+    expect(values).not.toContain("rabbit-hole quiet");
+    expect(values).not.toContain("rabbit-hole on");
+    expect(values).not.toContain("pause");
+    expect(values).not.toContain("allow 15");
     expect(values).toContain("details toggle");
     expect(values).toContain("theme neo");
   });
 
   it("filters completions by partial nested command prefixes", () => {
-    expect(
-      (__internal.getHeadsDownCommandCompletions("rabbit-hole o") ?? []).map((item) => item.value),
-    ).toEqual(["rabbit-hole off", "rabbit-hole on"]);
+    expect(__internal.getHeadsDownCommandCompletions("rabbit-hole o")).toBeNull();
     expect(
       (__internal.getHeadsDownCommandCompletions("theme e") ?? []).map((item) => item.value),
     ).toEqual(["theme executive"]);
@@ -100,15 +98,15 @@ describe("HeadsDown command discovery", () => {
     expect(help).toContain("/headsdown digest");
     expect(help).toContain("Local verification");
     expect(help).toContain("/headsdown referee");
-    expect(help).toContain("Run actions");
-    expect(help).toContain("/headsdown pause");
-    expect(help).toContain("/headsdown allow <minutes>");
+    expect(help).not.toContain("Run actions");
+    expect(help).not.toContain("/headsdown pause");
+    expect(help).not.toContain("/headsdown allow <minutes>");
     expect(help).toContain("Local time box");
     expect(help).toContain("/headsdown box <duration>");
     expect(help).toContain("/headsdown box status");
     expect(help).toContain("/headsdown box clear");
-    expect(help).toContain("Rabbit-hole controls");
-    expect(help).toContain("/headsdown rabbit-hole quiet");
+    expect(help).not.toContain("Rabbit-hole controls");
+    expect(help).not.toContain("/headsdown rabbit-hole quiet");
     expect(help).toContain("Display");
     expect(help).toContain("/headsdown theme <neo|mono|executive|list|reset>");
     expect(help).toContain("Discovery");
@@ -117,9 +115,7 @@ describe("HeadsDown command discovery", () => {
 
   it("normalizes status and whitespace for command routing", () => {
     expect(__internal.normalizeHeadsDownCommandArgs(" status ")).toBe("");
-    expect(__internal.normalizeHeadsDownCommandArgs(" rabbit-hole   quiet ")).toBe(
-      "rabbit-hole quiet",
-    );
+    expect(__internal.normalizeHeadsDownCommandArgs(" box   status ")).toBe("box status");
   });
 
   it("keeps menu choices on canonical command strings", () => {
@@ -132,8 +128,8 @@ describe("HeadsDown command discovery", () => {
     expect(menuValues).toContain("box 15m");
     expect(menuValues).toContain("box status");
     expect(menuValues).toContain("box clear");
-    expect(menuValues).toContain("rabbit-hole status");
-    expect(menuValues).toContain("allow 15");
+    expect(menuValues).not.toContain("rabbit-hole status");
+    expect(menuValues).not.toContain("allow 15");
     expect(menuValues).not.toContain("rabbit");
   });
 
@@ -171,11 +167,7 @@ describe("HeadsDown command discovery", () => {
 
     expect(ctx.ui.select).toHaveBeenCalledWith(
       "HeadsDown commands",
-      expect.arrayContaining([
-        "Help: /headsdown help",
-        "Time box status: /headsdown box status",
-        "Rabbit-hole status: /headsdown rabbit-hole status",
-      ]),
+      expect.arrayContaining(["Help: /headsdown help", "Time box status: /headsdown box status"]),
     );
     expect(ctx.ui.notify).toHaveBeenCalledWith(__internal.buildHeadsDownCommandHelp(), "info");
   });

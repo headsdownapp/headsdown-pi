@@ -24,15 +24,11 @@ import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
 import type {
   ActorContext,
   AgentControlOverview,
-  AgentRunSummary,
-  AllowForDurationActionOptions,
   Contract,
   DelegationGrantFilterInput,
   DelegationGrantInput,
   DelegationGrantPermission,
   DelegationGrantScope,
-  HeadsDownActionOptions,
-  HeadsDownCall,
   HeadsDownConfig,
   ProposalInput,
   ScheduleResolution,
@@ -161,21 +157,6 @@ interface AvailabilitySnapshot {
   wrapUpInstruction: string | null;
   fetchedAt: number;
 }
-
-interface RabbitHoleDetection {
-  detected: boolean;
-  call: HeadsDownCall | null;
-  runSummary: AgentRunSummary | null;
-}
-
-type RabbitHoleSessionMode = "on" | "off" | "quiet";
-
-type RabbitHoleInterventionState = {
-  contained: boolean;
-  sourceState: "rabbit_hole_detected";
-  allowedUntil?: number;
-  pausedAt?: number;
-};
 
 interface AvailabilityContext {
   contract: Contract | null;
@@ -1437,186 +1418,6 @@ function normalizeGraphQLEnumOutput(value: string | null | undefined): string | 
   return value ? value.toLowerCase() : null;
 }
 
-function detectRabbitHoleFromOverview(
-  overview: AgentControlOverview | null | undefined,
-  runIds: string | string[],
-): RabbitHoleDetection {
-  if (!overview) {
-    return { detected: false, call: null, runSummary: null };
-  }
-
-  const candidateRunIds = Array.isArray(runIds) ? runIds : [runIds];
-  const runSummary =
-    overview.runSummaries.find((entry) => candidateRunIds.includes(entry.runId)) ?? null;
-  const call = overview.headsdownCall ?? null;
-
-  const runCallKey = normalizeGraphQLEnumOutput(runSummary?.callKey ?? null);
-  if (runSummary) {
-    return {
-      detected: runCallKey === "rabbit_hole_detected",
-      call,
-      runSummary,
-    };
-  }
-
-  const callKey = normalizeGraphQLEnumOutput(call?.knownKey ?? call?.key ?? null);
-  return { detected: callKey === "rabbit_hole_detected", call, runSummary };
-}
-
-function buildRabbitHoleNarrative(input: {
-  call: HeadsDownCall | null;
-  runSummary: AgentRunSummary | null;
-  activeCallKey?: string;
-}): string {
-  const activeCallKey =
-    normalizeGraphQLEnumOutput(input.activeCallKey) ??
-    normalizeGraphQLEnumOutput(input.runSummary?.callKey ?? null) ??
-    "rabbit_hole_detected";
-  const renderedCall = filterRenderedCallActions(
-    renderHeadsDownCallCopy({
-      key: activeCallKey,
-      title: undefined,
-      body: undefined,
-      fallbackSignals: { limitSignal: true },
-    }),
-    normalizeActionKeyList(
-      (input.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
-    ),
-  );
-  const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
-  const reasonLine =
-    reasonCodes.length > 0
-      ? `Reason codes: ${reasonCodes.join(", ")}.`
-      : "Reason codes: scope drift or low-progress loop signals crossed the approved slice.";
-
-  return [
-    "HEADSDOWN INTERVENTION",
-    `Call: ${renderedCall.title}`,
-    `Trap: ${reasonLine}`,
-    renderedCall.primaryLabel
-      ? `Play: ${renderedCall.primaryLabel}. Save the handoff, stop adding scope, and keep only the smallest path needed to finish safely.`
-      : "Play: Keep the run contained, stop adding scope, and re-check the current HeadsDown call before choosing an action.",
-    renderedCall.secondaryLabel
-      ? "Escalation: If the seam is still unclear, use only a backend-allowed secondary action before continuing deeper."
-      : "Escalation: If the seam is still unclear, ask for a fresh HeadsDown call before continuing deeper.",
-    "",
-    formatHeadsDownCallForPrompt(renderedCall),
-  ].join("\n");
-}
-
-function buildRabbitHoleSoftNarrative(input: {
-  call: HeadsDownCall | null;
-  runSummary: AgentRunSummary | null;
-}): string {
-  const reasonCodes = input.runSummary?.reasonCodes ?? input.call?.reasonCodes ?? [];
-  const reasonLine =
-    reasonCodes.length > 0
-      ? `Reason codes: ${reasonCodes.join(", ")}.`
-      : "Reason codes: scope drift or low-progress loop signals crossed the approved slice.";
-
-  return [
-    "HEADSDOWN RABBIT-HOLE GUIDANCE",
-    "Rabbit-hole hard stops are disabled for this Pi session.",
-    reasonLine,
-    "Keep the run tight: finish the smallest useful slice, validate before expanding, and re-enable hard stops with /headsdown rabbit-hole on when ready.",
-  ].join("\n");
-}
-
-function normalizeRabbitHoleSessionMode(value: string | undefined): RabbitHoleSessionMode | null {
-  const normalized = value?.trim().toLowerCase();
-  if (normalized === "on" || normalized === "normal" || normalized === "enable") return "on";
-  if (normalized === "off" || normalized === "soft" || normalized === "disable") return "off";
-  if (normalized === "quiet" || normalized === "silent" || normalized === "mute") {
-    return "quiet";
-  }
-  return null;
-}
-
-function formatRabbitHoleSessionStatus(
-  mode: RabbitHoleSessionMode,
-  runId?: string | null,
-  intervention?: RabbitHoleInterventionState | null,
-): string {
-  const modeLabel =
-    mode === "on"
-      ? "on: normal hard stops and guidance"
-      : mode === "off"
-        ? "off: hard stops disabled, soft guidance remains"
-        : "quiet: hard stops and rabbit-hole guidance disabled";
-  const runLine = runId ? `Active run: ${runId}.` : "Active run: none.";
-  const interventionLine = intervention?.contained
-    ? intervention.allowedUntil
-      ? `Rabbit-hole containment: allowed until ${new Date(intervention.allowedUntil).toISOString()}.`
-      : "Rabbit-hole containment: active locally."
-    : "Rabbit-hole containment: inactive locally.";
-
-  return [
-    `[HeadsDown] Rabbit-hole session mode is ${modeLabel}.`,
-    runLine,
-    interventionLine,
-    "Telemetry reporting stays enabled in all modes.",
-  ].join("\n");
-}
-
-function shouldBlockRabbitHoleMutation(
-  mode: RabbitHoleSessionMode,
-  intervention: RabbitHoleInterventionState | null | undefined,
-  now: number,
-): { block: boolean; expiredAllowance: boolean; reason?: string } {
-  if (mode !== "on" || !intervention) {
-    return { block: false, expiredAllowance: false };
-  }
-
-  if (intervention.allowedUntil && now >= intervention.allowedUntil) {
-    return {
-      block: true,
-      expiredAllowance: true,
-      reason:
-        "[HeadsDown] The allow-for-duration window expired. Run is contained again; re-check the rabbit-hole call before additional edits.",
-    };
-  }
-
-  if (intervention.contained) {
-    return {
-      block: true,
-      expiredAllowance: false,
-      reason:
-        "[HeadsDown] Rabbit hole detected. Run is paused for summarize/handoff. Ask for allow-for-duration before additional edits.",
-    };
-  }
-
-  return { block: false, expiredAllowance: false };
-}
-
-function shouldEmitRabbitHoleGuidance(mode: RabbitHoleSessionMode): boolean {
-  return mode !== "quiet";
-}
-
-function buildPauseAndSummarizeActionInput(runId: string, reason: string): HeadsDownActionOptions {
-  return {
-    runId,
-    reason,
-    sourceState: "rabbit_hole_detected",
-    source: "pi",
-    client: "headsdown-pi",
-  };
-}
-
-function buildAllowForDurationInput(
-  runId: string,
-  durationMinutes: number,
-  reason: string,
-): AllowForDurationActionOptions {
-  return {
-    runId,
-    durationMinutes,
-    reason,
-    sourceState: "rabbit_hole_detected",
-    source: "pi",
-    client: "headsdown-pi",
-  };
-}
-
 function basePiAgentRunEvent(context: PiAgentRunEventContext): Record<string, unknown> {
   return stripUndefinedValues({
     runId: context.runId,
@@ -1938,19 +1739,6 @@ const SHARE_LOCAL_REFEREE_OUTCOME_SUMMARY_MUTATION = `
         code
         message
       }
-    }
-  }
-`;
-
-const RABBIT_HOLE_EVENT_QUERY = `
-  query RabbitHoleEvents($proposalRef: String!, $eventType: String!, $limit: Int) {
-    agentRunEvents(proposalRef: $proposalRef, eventType: $eventType, limit: $limit) {
-      eventId
-      eventType
-      runId
-      proposalRef
-      payload
-      insertedAt
     }
   }
 `;
@@ -2367,36 +2155,6 @@ const HEADSDOWN_COMMAND_OPTIONS: HeadsDownCommandOption[] = [
     menu: true,
   },
   {
-    value: "pause",
-    label: "Pause + summarize",
-    description: "Pause the active run and save a handoff",
-    menu: true,
-  },
-  {
-    value: "allow 5",
-    label: "Allow 5 minutes",
-    description: "Allow a contained run to continue for 5 minutes",
-    menu: true,
-  },
-  {
-    value: "allow 15",
-    label: "Allow 15 minutes",
-    description: "Allow a contained run to continue for 15 minutes",
-    menu: true,
-  },
-  {
-    value: "allow 30",
-    label: "Allow 30 minutes",
-    description: "Allow a contained run to continue for 30 minutes",
-    menu: true,
-  },
-  {
-    value: "allow 60",
-    label: "Allow 60 minutes",
-    description: "Allow a contained run to continue for 60 minutes",
-    menu: true,
-  },
-  {
     value: "box 15m",
     label: "Time box: 15 minutes",
     description: "Set a local session time box for 15 minutes",
@@ -2418,30 +2176,6 @@ const HEADSDOWN_COMMAND_OPTIONS: HeadsDownCommandOption[] = [
     value: "box clear",
     label: "Clear time box",
     description: "Cancel the active local session time box",
-    menu: true,
-  },
-  {
-    value: "rabbit-hole status",
-    label: "Rabbit-hole status",
-    description: "Show current rabbit-hole session handling",
-    menu: true,
-  },
-  {
-    value: "rabbit-hole off",
-    label: "Rabbit-hole hard stops off",
-    description: "Disable hard stops for this session while keeping soft guidance",
-    menu: true,
-  },
-  {
-    value: "rabbit-hole quiet",
-    label: "Rabbit-hole quiet",
-    description: "Disable hard stops and repeated rabbit-hole guidance for this session",
-    menu: true,
-  },
-  {
-    value: "rabbit-hole on",
-    label: "Rabbit-hole handling on",
-    description: "Restore normal rabbit-hole hard stops and guidance",
     menu: true,
   },
   {
@@ -2524,20 +2258,10 @@ function buildHeadsDownCommandHelp(): string {
     "Local verification",
     "  /headsdown referee",
     "",
-    "Run actions",
-    "  /headsdown pause",
-    "  /headsdown allow <minutes>",
-    "",
     "Local time box",
     "  /headsdown box <duration>  (examples: 15m, 1h, 90m, 1h30m)",
     "  /headsdown box status",
     "  /headsdown box clear",
-    "",
-    "Rabbit-hole controls",
-    "  /headsdown rabbit-hole status",
-    "  /headsdown rabbit-hole off",
-    "  /headsdown rabbit-hole quiet",
-    "  /headsdown rabbit-hole on",
     "",
     "Display",
     "  /headsdown details <on|off|toggle>",
@@ -2603,15 +2327,6 @@ export const __internal = {
   serializeAgentRunEventForGraphQL,
   mapTaskOutcomeToAgentRunOutcome,
   runIdForProposal,
-  detectRabbitHoleFromOverview,
-  buildRabbitHoleNarrative,
-  buildRabbitHoleSoftNarrative,
-  normalizeRabbitHoleSessionMode,
-  formatRabbitHoleSessionStatus,
-  shouldBlockRabbitHoleMutation,
-  shouldEmitRabbitHoleGuidance,
-  buildPauseAndSummarizeActionInput,
-  buildAllowForDurationInput,
   advanceTimeBoxForPrompt,
   createTimeBox,
   formatTimeBoxConfirmation,
@@ -2637,8 +2352,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
   let activeTimeBox: TimeBoxState | null = null;
-  let rabbitHoleSessionMode: RabbitHoleSessionMode = "on";
-  const rabbitHoleInterventions = new Map<string, RabbitHoleInterventionState>();
   const pendingOutcomeSharePreviews = new Map<
     string,
     {
@@ -2780,227 +2493,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function getLatestAgentRunEventSafe(
-    ctx: ExtensionContext,
-    proposalId: string,
-    eventType: string,
-  ): Promise<Record<string, unknown> | null> {
-    try {
-      const client = await getClient();
-      if (!client) return null;
-      const actorClient = withActorContext(client, ctx);
-      const graphql = getLowLevelGraphQLClient(actorClient);
-      if (!graphql) return null;
-      const data = await graphql.request(RABBIT_HOLE_EVENT_QUERY, {
-        proposalRef: proposalId,
-        eventType,
-        limit: 1,
-      });
-      const events = (data.agentRunEvents as Record<string, unknown>[] | undefined) ?? [];
-      return events[0] ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  function eventInsertedAt(event: Record<string, unknown> | null): number {
-    const insertedAt = typeof event?.insertedAt === "string" ? event.insertedAt : "";
-    const timestamp = Date.parse(insertedAt);
-    return Number.isFinite(timestamp) ? timestamp : 0;
-  }
-
-  function unresolvedRabbitHoleEvent(
-    rabbitHoleEvent: Record<string, unknown> | null,
-    resolvedEvent: Record<string, unknown> | null,
-  ): boolean {
-    if (!rabbitHoleEvent) return false;
-    return eventInsertedAt(resolvedEvent) < eventInsertedAt(rabbitHoleEvent);
-  }
-
-  function runSummaryResolvedRabbitHole(runSummary: AgentRunSummary | null): boolean {
-    const callKey = normalizeGraphQLEnumOutput(runSummary?.callKey ?? null);
-    return (
-      callKey === "ready_to_resume" || callKey === "all_contained" || callKey === "off_the_clock"
-    );
-  }
-
-  type HeadsDownActionAttemptResult =
-    | { ok: true }
-    | {
-        ok: false;
-        reason: "not_authenticated" | "apply_failed" | "apply_not_ok";
-        message?: string;
-      };
-
-  function formatHeadsDownActionAttemptFailure(result: HeadsDownActionAttemptResult): string {
-    if (result.ok) return "action applied";
-    if (result.reason === "not_authenticated") return "not authenticated";
-    if (result.reason === "apply_not_ok") return "backend returned ok=false";
-    return result.message ? `${result.reason}: ${result.message}` : result.reason;
-  }
-
-  async function applyPauseAndSummarize(
-    ctx: ExtensionContext,
-    proposalId: string,
-  ): Promise<HeadsDownActionAttemptResult> {
-    try {
-      const client = await getClient();
-      if (!client) return { ok: false, reason: "not_authenticated" };
-      const actorClient = withActorContext(client, ctx);
-      const payload = await actorClient.pauseAndSummarize(
-        buildPauseAndSummarizeActionInput(proposalId, "rabbit_hole_detected"),
-      );
-      return payload.ok === true ? { ok: true } : { ok: false, reason: "apply_not_ok" };
-    } catch (error) {
-      return { ok: false, reason: "apply_failed", message: sanitizeErrorMessage(error) };
-    }
-  }
-
-  async function allowRunForDuration(
-    ctx: ExtensionContext,
-    proposalId: string,
-    eventRunId: string,
-    durationMinutes: number,
-  ): Promise<HeadsDownActionAttemptResult> {
-    try {
-      const client = await getClient();
-      if (!client) return { ok: false, reason: "not_authenticated" };
-      const actorClient = withActorContext(client, ctx);
-      const payload = await actorClient.allowForDuration(
-        buildAllowForDurationInput(proposalId, durationMinutes, "manual_override"),
-      );
-      if (payload.ok !== true) return { ok: false, reason: "apply_not_ok" };
-
-      rabbitHoleInterventions.set(eventRunId, {
-        contained: false,
-        sourceState: "rabbit_hole_detected",
-        allowedUntil: Date.now() + durationMinutes * 60_000,
-      });
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, reason: "apply_failed", message: sanitizeErrorMessage(error) };
-    }
-  }
-
-  async function maybeHandleRabbitHoleDetected(ctx: ExtensionContext, proposal: ProposalRecord) {
-    const telemetry = getTelemetryForProposal(proposal);
-    const runId = telemetry.runId;
-
-    const existingIntervention = rabbitHoleInterventions.get(runId);
-    if (existingIntervention?.allowedUntil) {
-      if (Date.now() < existingIntervention.allowedUntil) {
-        return;
-      }
-
-      rabbitHoleInterventions.delete(runId);
-    } else if (existingIntervention?.contained) {
-      return;
-    }
-
-    const rabbitHoleEvent = await getLatestAgentRunEventSafe(
-      ctx,
-      proposal.id,
-      "agent_run.rabbit_hole_detected",
-    );
-    const resolvedEvent = await getLatestAgentRunEventSafe(
-      ctx,
-      proposal.id,
-      "intervention.resolved",
-    );
-    const overview = await getAgentControlOverviewSafe(ctx);
-    const detection = detectRabbitHoleFromOverview(overview, [runId, proposal.id]);
-
-    const activeRabbitHole =
-      detection.detected ||
-      (unresolvedRabbitHoleEvent(rabbitHoleEvent, resolvedEvent) &&
-        !runSummaryResolvedRabbitHole(detection.runSummary));
-
-    if (!activeRabbitHole) {
-      return;
-    }
-
-    const activeCallKey = "rabbit_hole_detected";
-
-    rabbitHoleInterventions.set(runId, {
-      contained: true,
-      sourceState: "rabbit_hole_detected",
-    });
-
-    if (!shouldEmitRabbitHoleGuidance(rabbitHoleSessionMode)) {
-      return;
-    }
-
-    if (rabbitHoleSessionMode === "off") {
-      const softNarrative = buildRabbitHoleSoftNarrative({
-        call: detection.call,
-        runSummary: detection.runSummary,
-      });
-
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          "[HeadsDown] Rabbit-hole hard stops are disabled for this session. Keep scope tight.",
-          "info",
-        );
-      }
-
-      pi.sendMessage(
-        {
-          customType: "headsdown-rabbit-hole-soft",
-          content: softNarrative,
-          display: false,
-          details: {
-            runId,
-            callKey: activeCallKey,
-            sessionMode: rabbitHoleSessionMode,
-            reasonCodes: detection.runSummary?.reasonCodes ?? detection.call?.reasonCodes ?? [],
-          },
-        },
-        { deliverAs: "steer" },
-      );
-      return;
-    }
-
-    const narrative = buildRabbitHoleNarrative({
-      call: detection.call,
-      runSummary: detection.runSummary,
-      activeCallKey,
-    });
-
-    if (ctx.hasUI) {
-      const allowedActionKeys = normalizeActionKeyList(
-        (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
-      );
-      const message = allowedActionKeys.includes("pause_and_summarize")
-        ? "[HeadsDown] Rabbit hole detected. Pause + summarize before continuing."
-        : "[HeadsDown] Rabbit hole detected. Stop mutating edits and re-check the current call before acting.";
-      ctx.ui.notify(message, "warning");
-    }
-
-    pi.sendMessage(
-      {
-        customType: "headsdown-rabbit-hole",
-        content: narrative,
-        display: false,
-        details: {
-          runId,
-          callKey: activeCallKey,
-          reasonCodes: detection.runSummary?.reasonCodes ?? detection.call?.reasonCodes ?? [],
-        },
-      },
-      { deliverAs: "steer" },
-    );
-
-    await saveAutomaticContinuation("rabbit_hole_detected", ctx);
-
-    const allowedActionKeys = normalizeActionKeyList(
-      (detection.runSummary as { allowedActionKeys?: unknown } | null)?.allowedActionKeys,
-    );
-    const escalation = allowedActionKeys.includes("pause_and_summarize")
-      ? "HeadsDown call: rabbit_hole_detected. Stop further file edits and use /headsdown pause if you choose the backend-allowed pause action."
-      : "HeadsDown call: rabbit_hole_detected. Stop further file edits and re-check the current call before choosing a backend-allowed action.";
-    pi.sendUserMessage(escalation, { deliverAs: "steer" });
-  }
-
   async function reportPiAgentRunEvent(_ctx: ExtensionContext, input: Record<string, unknown>) {
     try {
       const client = await getClient();
@@ -3044,8 +2536,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         proposal.estimatedMinutes,
       ),
     );
-
-    await maybeHandleRabbitHoleDetected(ctx, proposal);
   }
 
   function defaultLocalRefereeOutcomeSharingState(): LocalRefereeOutcomeSharingState {
@@ -4023,51 +3513,53 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             title: overview.headsdownCall.title,
             body: overview.headsdownCall.body,
           });
-          const activeProposalRunIds = activeProposal
-            ? [
-                getTelemetryForProposal(activeProposal).runId,
-                activeProposal.id,
-                runIdForProposal(activeProposal.id),
-              ]
-            : [];
-          const renderedCall = filterRenderedCallActions(
-            renderedCallCopy,
-            allowedActionKeysForCallPrompt(overview, renderedCallCopy.key, activeProposalRunIds),
-          );
-          instructionBlocks.push(formatHeadsDownCallForPrompt(renderedCall));
+          if (renderedCallCopy) {
+            const activeProposalRunIds = activeProposal
+              ? [
+                  getTelemetryForProposal(activeProposal).runId,
+                  activeProposal.id,
+                  runIdForProposal(activeProposal.id),
+                ]
+              : [];
+            const renderedCall = filterRenderedCallActions(
+              renderedCallCopy,
+              allowedActionKeysForCallPrompt(overview, renderedCallCopy.key, activeProposalRunIds),
+            );
+            instructionBlocks.push(formatHeadsDownCallForPrompt(renderedCall));
 
-          if (renderedCall.key === "off_the_clock") {
-            const queueTarget = pickQueueForMorningRun(overview.runSummaries);
-            if (queueTarget) {
-              if (shouldAutoQueueForMorning(queueTarget, autoQueuedRunIds)) {
-                const queueResult = await queueForMorningWithHandoff({
-                  actorClient,
-                  runSummary: queueTarget,
-                  branch: await currentBranchName(),
-                  saveContinuation: saveContinuationArtifact,
-                });
+            if (renderedCall.key === "off_the_clock") {
+              const queueTarget = pickQueueForMorningRun(overview.runSummaries);
+              if (queueTarget) {
+                if (shouldAutoQueueForMorning(queueTarget, autoQueuedRunIds)) {
+                  const queueResult = await queueForMorningWithHandoff({
+                    actorClient,
+                    runSummary: queueTarget,
+                    branch: await currentBranchName(),
+                    saveContinuation: saveContinuationArtifact,
+                  });
 
-                instructionBlocks.push(`[HeadsDown] ${queueResult.message}`);
-                if (queueResult.queued) {
-                  autoQueuedRunIds.add(queueTarget.runId);
+                  instructionBlocks.push(`[HeadsDown] ${queueResult.message}`);
+                  if (queueResult.queued) {
+                    autoQueuedRunIds.add(queueTarget.runId);
+                  }
+                  if (ctx.hasUI) {
+                    ctx.ui.notify(`[HeadsDown] ${queueResult.message}`, "info");
+                  }
+                } else {
+                  instructionBlocks.push(
+                    "[HeadsDown] Off the clock. Keep queued. Ready to resume guidance is active when work windows reopen.",
+                  );
                 }
-                if (ctx.hasUI) {
-                  ctx.ui.notify(`[HeadsDown] ${queueResult.message}`, "info");
-                }
-              } else {
-                instructionBlocks.push(
-                  "[HeadsDown] Off the clock. Keep queued. Ready to resume guidance is active when work windows reopen.",
-                );
               }
             }
-          }
 
-          if (renderedCall.key === "ready_to_resume") {
-            const resumeInstruction =
-              renderedCall.primaryActionKey === "resume_run"
-                ? "[HeadsDown] Ready to resume. Load saved context with headsdown_continuation action=load before continuing."
-                : "[HeadsDown] Ready to resume state is visible, but the backend has not allowed a resume action yet. Re-check before continuing.";
-            instructionBlocks.push(resumeInstruction);
+            if (renderedCall.key === "ready_to_resume") {
+              const resumeInstruction =
+                renderedCall.primaryActionKey === "resume_run"
+                  ? "[HeadsDown] Ready to resume. Load saved context with headsdown_continuation action=load before continuing."
+                  : "[HeadsDown] Ready to resume state is visible, but the backend has not allowed a resume action yet. Re-check before continuing.";
+              instructionBlocks.push(resumeInstruction);
+            }
           }
         }
       } catch (error) {
@@ -4106,39 +3598,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     let mutating = false;
     let filePath = "";
     let command = "";
-
-    if (activeProposal) {
-      const runId = getTelemetryForProposal(activeProposal).runId;
-      const attemptedTool = event.toolName;
-      const isMutatingAttempt =
-        attemptedTool === "write" ||
-        attemptedTool === "edit" ||
-        (attemptedTool === "bash" &&
-          isPotentiallyMutatingBashCommand((event.input as { command?: string }).command ?? ""));
-
-      if (isMutatingAttempt) {
-        const intervention = rabbitHoleInterventions.get(runId);
-        const decision = shouldBlockRabbitHoleMutation(
-          rabbitHoleSessionMode,
-          intervention,
-          Date.now(),
-        );
-
-        if (decision.expiredAllowance) {
-          rabbitHoleInterventions.set(runId, {
-            contained: true,
-            sourceState: "rabbit_hole_detected",
-          });
-        }
-
-        if (decision.block) {
-          return {
-            block: true,
-            reason: decision.reason,
-          };
-        }
-      }
-    }
 
     if (event.toolName === "write" || event.toolName === "edit") {
       filePath = normalizeToolPath((event.input as { path?: string }).path);
@@ -5273,8 +4732,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
               params.tests_passed,
             ),
           );
-
-          rabbitHoleInterventions.delete(telemetry.runId);
         }
 
         approvedProposals = approvedProposals.map((proposal) =>
@@ -5441,48 +4898,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (
-      normalizedArgs === "rabbit-hole" ||
-      normalizedArgs === "rabbit" ||
-      normalizedArgs.startsWith("rabbit-hole ") ||
-      normalizedArgs.startsWith("rabbit ")
-    ) {
-      const [, modeArgRaw] = normalizedArgs.split(/\s+/, 2);
-      const modeArg = modeArgRaw?.trim() || "status";
-      const proposal = getLatestApprovedProposal();
-      const runId = proposal ? getTelemetryForProposal(proposal).runId : null;
-      const intervention = runId ? rabbitHoleInterventions.get(runId) : null;
-
-      if (modeArg === "status") {
-        ctx.ui.notify(
-          formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
-          "info",
-        );
-        return;
-      }
-
-      const parsedMode = normalizeRabbitHoleSessionMode(modeArg);
-      if (!parsedMode) {
-        ctx.ui.notify(
-          "[HeadsDown] Unknown rabbit-hole mode. Use /headsdown rabbit-hole <status|off|quiet|on>.",
-          "warning",
-        );
-        return;
-      }
-
-      rabbitHoleSessionMode = parsedMode;
-      ctx.ui.notify(
-        formatRabbitHoleSessionStatus(rabbitHoleSessionMode, runId, intervention),
-        "info",
-      );
-      return;
-    }
-
     const requiresClient =
       normalizedArgs === "" ||
       normalizedArgs === "digest" ||
-      normalizedArgs.startsWith("pause") ||
-      normalizedArgs.startsWith("allow") ||
       normalizedArgs.startsWith("theme") ||
       normalizedArgs.startsWith("details");
 
@@ -5505,139 +4923,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const summaries = await actorClient.listDigestSummaries({ latest: 10 });
       const noun = summaries.length === 1 ? "summary" : "summaries";
       ctx.ui.notify(`[HeadsDown] ${summaries.length} digest ${noun} available.`, "info");
-      return;
-    }
-
-    if (normalizedArgs.startsWith("pause")) {
-      const proposal = getLatestApprovedProposal();
-      if (!proposal) {
-        ctx.ui.notify("[HeadsDown] No active approved run found to pause.", "warning");
-        return;
-      }
-
-      const runId = getTelemetryForProposal(proposal).runId;
-      const actorClient = withActorContext(client, ctx);
-      const overviewResult = await getAgentControlOverviewResult(actorClient);
-      if (!overviewResult.ok) {
-        ctx.ui.notify(
-          `[HeadsDown] Cannot verify backend-allowed actions for pause + summarize because HeadsDown could not load the current call: ${overviewResult.message}`,
-          "warning",
-        );
-        return;
-      }
-
-      const resolution = resolveAllowedRunAction({
-        overview: overviewResult.overview,
-        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
-        actionKey: "pause_and_summarize",
-        expectedCallKeys: ["rabbit_hole_detected"],
-      });
-
-      if (!resolution.allowed || !resolution.runSummary) {
-        ctx.ui.notify(allowedRunActionFailureMessage("pause + summarize", resolution), "warning");
-        return;
-      }
-
-      const paused = await applyPauseAndSummarize(ctx, resolution.runSummary.runId);
-      const handoffSaved = await saveAutomaticContinuation("rabbit_hole_pause_requested", ctx);
-      rabbitHoleInterventions.set(runId, {
-        contained: true,
-        sourceState: "rabbit_hole_detected",
-        pausedAt: Date.now(),
-      });
-
-      if (!paused.ok) {
-        ctx.ui.notify(
-          `[HeadsDown] Could not apply pause-and-summarize through the API (${formatHeadsDownActionAttemptFailure(paused)}). Run remains locally contained${handoffSaved ? " with a saved handoff" : ", but the handoff was not saved"}.`,
-          "warning",
-        );
-        return;
-      }
-
-      ctx.ui.notify(
-        handoffSaved
-          ? "[HeadsDown] Pause + summarize applied. Handoff saved and run is ready to resume with a narrower slice."
-          : "[HeadsDown] Pause + summarize applied, but the handoff could not be saved. Keep the run contained and save a handoff before resuming.",
-        handoffSaved ? "info" : "warning",
-      );
-      return;
-    }
-
-    if (normalizedArgs.startsWith("allow")) {
-      const [, minutesArg] = normalizedArgs.split(/\s+/, 2);
-      const parsedMinutes = Number(minutesArg ?? "15");
-      const durationMinutes = Number.isFinite(parsedMinutes)
-        ? Math.max(1, Math.min(240, Math.floor(parsedMinutes)))
-        : 15;
-
-      const proposal = getLatestApprovedProposal();
-      if (!proposal) {
-        ctx.ui.notify(
-          "[HeadsDown] No active approved run found for allow-for-duration.",
-          "warning",
-        );
-        return;
-      }
-
-      const runId = getTelemetryForProposal(proposal).runId;
-      const intervention = rabbitHoleInterventions.get(runId);
-      if (!intervention?.contained) {
-        ctx.ui.notify(
-          "[HeadsDown] No active rabbit-hole intervention is waiting for an allow-for-duration decision.",
-          "warning",
-        );
-        return;
-      }
-
-      if (intervention.pausedAt) {
-        ctx.ui.notify(
-          "[HeadsDown] This run has already been paused. Use a ready-to-resume action instead of allow-for-duration.",
-          "warning",
-        );
-        return;
-      }
-
-      const actorClient = withActorContext(client, ctx);
-      const overviewResult = await getAgentControlOverviewResult(actorClient);
-      if (!overviewResult.ok) {
-        ctx.ui.notify(
-          `[HeadsDown] Cannot verify backend-allowed actions for allow for duration because HeadsDown could not load the current call: ${overviewResult.message}`,
-          "warning",
-        );
-        return;
-      }
-
-      const resolution = resolveAllowedRunAction({
-        overview: overviewResult.overview,
-        candidateRunIds: [runId, proposal.id, runIdForProposal(proposal.id)],
-        actionKey: "allow_for_duration",
-        expectedCallKeys: ["rabbit_hole_detected"],
-      });
-
-      if (!resolution.allowed || !resolution.runSummary) {
-        ctx.ui.notify(allowedRunActionFailureMessage("allow for duration", resolution), "warning");
-        return;
-      }
-
-      const allowed = await allowRunForDuration(
-        ctx,
-        resolution.runSummary.runId,
-        runId,
-        durationMinutes,
-      );
-
-      if (!allowed.ok) {
-        ctx.ui.notify(
-          `[HeadsDown] Could not apply allow-for-duration (${formatHeadsDownActionAttemptFailure(allowed)}). Keep run paused or retry when API support is available.`,
-          "warning",
-        );
-        return;
-      }
-
-      ctx.ui.notify(
-        `[HeadsDown] Allowed run ${runId} for ${durationMinutes}m. Keep scope tight and re-check before expanding.`,
-        "info",
-      );
       return;
     }
 

@@ -9,8 +9,7 @@ When installed, Pi will:
 4. **Track realized scope drift** from successful file mutations against approved proposal estimates
 5. **Preserve continuity** across compaction, tree navigation, and session shutdown/switch
 6. **Support resumable work** with continuation artifacts and digest triage for missed updates
-7. **Contain rabbit holes** by pausing/summarizing detected drift and allowing explicit duration overrides when approved
-8. **Optionally tune pi thinking level** before each turn with a configurable HeadsDown-aware auto-thinking policy
+7. **Optionally tune pi thinking level** before each turn with a configurable HeadsDown-aware auto-thinking policy
 
 ## Install
 
@@ -102,21 +101,6 @@ Sensitive paths (`.env*`, `.ssh/*`, `package.json`, `Dockerfile*`, `.github/**`,
 
 On `tool_result`, successful `write`/`edit` operations are tracked as realized modified files for the active approved proposal. If touched files exceed the approved estimate by more than 50%, Pi emits a scope-drift warning and prompts re-proposal.
 
-### Rabbit-Hole Containment
-
-During approved runs, Pi reports privacy-safe progress metadata (counts, buckets, validation state, and timing only). If HeadsDown raises `rabbit_hole_detected` or `finish_line_friction`, Pi emits Call/Trap/Play/Escalation guidance, saves a continuation handoff, and locally blocks further mutating edits while the backend call is still available for the next action.
-
-Use `/headsdown pause` to apply `pause_and_summarize`, or `/headsdown allow <minutes>` to apply an `allow_for_duration` override when you intentionally want to continue instead of pausing. Use `/headsdown help` to see grouped usage, or `/headsdown menu` to open an interactive picker for common HeadsDown controls.
-
-If rabbit-hole guidance is miscalibrated for the current Pi session, use a session-scoped override instead of disabling telemetry or changing global settings:
-
-- `/headsdown rabbit-hole off` disables rabbit-hole hard stops for this session. Mutating tools are no longer blocked by a local rabbit-hole containment, but Pi still receives soft guidance to keep the run tight.
-- `/headsdown rabbit-hole quiet` disables both rabbit-hole hard stops and repeated rabbit-hole guidance for this session. Progress telemetry continues quietly.
-- `/headsdown rabbit-hole on` restores normal rabbit-hole hard stops and guidance for future calls in this session.
-- `/headsdown rabbit-hole status` shows whether normal handling, hard-stop-disabled mode, or quiet mode is active.
-
-Other HeadsDown policies still apply while a rabbit-hole session override is active.
-
 ### Session Time Box
 
 Use `/headsdown box <duration>` to declare a local time box for the current Pi session. Examples:
@@ -169,7 +153,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 - `headsdown_report` - report approved task outcome
 - `headsdown_auth` - authenticate via Device Flow
 
-The package also registers `/headsdown` for quick status checks, local Referee verification, and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Local verification uses `/headsdown referee`. Session controls include `/headsdown box <duration|status|clear>` for local session time boxes and `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
+The package also registers `/headsdown` for quick status checks, local Referee verification, and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Local verification uses `/headsdown referee`. Session controls include `/headsdown box <duration|status|clear>` for local session time boxes.
 
 ## Skill
 

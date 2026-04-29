@@ -11,6 +11,7 @@ export const CANONICAL_HEADSDOWN_CALL_KEYS = [
 ] as const;
 
 export type CanonicalHeadsDownCallKey = (typeof CANONICAL_HEADSDOWN_CALL_KEYS)[number];
+export type RenderableHeadsDownCallKey = Exclude<CanonicalHeadsDownCallKey, "rabbit_hole_detected">;
 
 export type HeadsDownActionKey =
   | "continue"
@@ -72,12 +73,12 @@ export interface RenderHeadsDownCallInput {
 }
 
 export interface RenderedHeadsDownCallCopy extends RenderLabels {
-  key: CanonicalHeadsDownCallKey;
+  key: RenderableHeadsDownCallKey;
   sourceKey: string | null;
   fallbackApplied: boolean;
 }
 
-const CANONICAL_CALL_COPY: Record<CanonicalHeadsDownCallKey, RenderLabels> = {
+const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
   good_to_run: {
     title: "Good to run",
     body: "This task fits the time, scope, and attention available right now. Let the agent proceed within the approved bounds.",
@@ -117,16 +118,6 @@ const CANONICAL_CALL_COPY: Record<CanonicalHeadsDownCallKey, RenderLabels> = {
     secondaryLabel: "Why this call?",
     secondaryActionKey: null,
     secondaryUiIntent: "view_details",
-  },
-  rabbit_hole_detected: {
-    title: "Rabbit hole detected",
-    body: "The work is growing past the size that was worth approving. Pause, save the handoff, and re-scope before it becomes cleanup work.",
-    primaryLabel: "Pause + summarize",
-    primaryActionKey: "pause_and_summarize",
-    primaryUiIntent: null,
-    secondaryLabel: "Allow 15m",
-    secondaryActionKey: "allow_for_duration",
-    secondaryUiIntent: null,
   },
   finish_line_friction: {
     title: "Finish-line friction",
@@ -170,13 +161,16 @@ const CANONICAL_CALL_COPY: Record<CanonicalHeadsDownCallKey, RenderLabels> = {
   },
 };
 
-function isCanonicalHeadsDownCallKey(key: string): key is CanonicalHeadsDownCallKey {
-  return (CANONICAL_HEADSDOWN_CALL_KEYS as readonly string[]).includes(key);
+function isRenderableHeadsDownCallKey(key: string): key is RenderableHeadsDownCallKey {
+  return (
+    (CANONICAL_HEADSDOWN_CALL_KEYS as readonly string[]).includes(key) &&
+    key !== "rabbit_hole_detected"
+  );
 }
 
 export function resolveUnknownHeadsDownCallFallback(
   signals?: UnknownCallFallbackSignals,
-): CanonicalHeadsDownCallKey {
+): RenderableHeadsDownCallKey {
   const hasActionRiskOrBoundarySignal =
     signals?.actionRequired === true ||
     signals?.approvalRequired === true ||
@@ -212,10 +206,14 @@ export function resolveUnknownHeadsDownCallFallback(
 
 export function renderHeadsDownCallCopy(
   input: RenderHeadsDownCallInput,
-): RenderedHeadsDownCallCopy {
+): RenderedHeadsDownCallCopy | null {
   const normalizedKey = normalizeCallKey(input.key);
 
-  if (normalizedKey && isCanonicalHeadsDownCallKey(normalizedKey)) {
+  if (normalizedKey === "rabbit_hole_detected") {
+    return null;
+  }
+
+  if (normalizedKey && isRenderableHeadsDownCallKey(normalizedKey)) {
     const copy = CANONICAL_CALL_COPY[normalizedKey];
     return {
       key: normalizedKey,
@@ -243,7 +241,7 @@ export function renderHeadsDownCallCopy(
   };
 }
 
-function unknownFallbackCopy(key: CanonicalHeadsDownCallKey): RenderLabels {
+function unknownFallbackCopy(key: RenderableHeadsDownCallKey): RenderLabels {
   if (key === "needs_your_yes") {
     return {
       ...CANONICAL_CALL_COPY.needs_your_yes,
