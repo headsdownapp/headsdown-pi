@@ -49,6 +49,17 @@ Use the schedule and wrap-up guidance from `headsdown_status`:
 - Prefer natural boundaries (module, layer, test pass) over arbitrary partial work.
 - Keep each slice independently valid and reviewable.
 
+## Local Session Time Boxes
+
+When the user declares a session time box with `/headsdown box <duration>`, treat it as local prompt guidance for landing cleanly inside the window. Examples include `/headsdown box 15m`, `/headsdown box 1h`, `/headsdown box 90m`, and `/headsdown box 1h30m`.
+
+- `/headsdown box status`: inspect the active box, including declaration, wind-down, and expiration times.
+- `/headsdown box clear`: cancel the active box.
+- Wind-down guidance is prompt-only. It tells you to stop opening new threads, summarize landed and open work, and offer to commit, stash, or write a handoff note.
+- Expiration guidance asks you to wrap up immediately and clears the box.
+- Short boxes can skip wind-down and go straight to expiration.
+- Time boxes are local-only, account-optional, and non-blocking. They do not block tools or create hosted HeadsDown state.
+
 ## Mid-Task Scope Drift
 
 If realized edits exceed the approved estimate, pause and re-propose with updated `estimated_files`, `estimated_minutes`, and `scope_summary`. Do not silently overrun approved scope.

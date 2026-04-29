@@ -117,6 +117,26 @@ If rabbit-hole guidance is miscalibrated for the current Pi session, use a sessi
 
 Other HeadsDown policies still apply while a rabbit-hole session override is active.
 
+### Session Time Box
+
+Use `/headsdown box <duration>` to declare a local time box for the current Pi session. Examples:
+
+- `/headsdown box 15m`
+- `/headsdown box 1h`
+- `/headsdown box 90m`
+- `/headsdown box 1h30m`
+
+Pi confirms the wind-down moment and expiration moment as clock times. Declaring a new box replaces the active box; only one box is active per session.
+
+With about three minutes left, the next Pi turn gets prompt-only wind-down guidance: stop opening new threads, summarize what has landed and what is still open, and offer to commit, stash, or write a handoff note. When the box expires, the next Pi turn gets a clear wrap-up-now instruction and the box clears. Short boxes under the wind-down threshold skip wind-down and go straight to expiration.
+
+Inspect or cancel the active box at any time:
+
+- `/headsdown box status`
+- `/headsdown box clear`
+
+Time boxes are local-only, account-optional, and non-blocking. They do not block tools, create hosted state, or change HeadsDown call/play behavior.
+
 ### Auto-Thinking Policy
 
 Auto-thinking is an optional policy that lets the extension choose a pi thinking level before each agent turn. It uses the current prompt, active HeadsDown availability context, and approved proposal state that the extension already has locally. It does not make extra telemetry calls.
@@ -149,7 +169,7 @@ It also auto-saves continuation artifacts for unfinished approved work when swit
 - `headsdown_report` - report approved task outcome
 - `headsdown_auth` - authenticate via Device Flow
 
-The package also registers `/headsdown` for quick status checks, local Referee verification, and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Local verification uses `/headsdown referee`. Session controls include `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
+The package also registers `/headsdown` for quick status checks, local Referee verification, and session controls. Type `/headsdown ` and use tab completion to discover subcommands, `/headsdown help` for grouped usage, or `/headsdown menu` for an interactive picker. Local verification uses `/headsdown referee`. Session controls include `/headsdown box <duration|status|clear>` for local session time boxes and `/headsdown rabbit-hole <off|quiet|on|status>` for local rabbit-hole guidance overrides.
 
 ## Skill
 

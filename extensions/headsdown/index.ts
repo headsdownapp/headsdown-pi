@@ -64,6 +64,14 @@ import {
   type LocalRefereeOutcomeShareChoice,
   type LocalRefereeOutcomeSharingPreference,
 } from "./referee/outcome-sharing.js";
+import {
+  advanceTimeBoxForPrompt,
+  createTimeBox,
+  formatTimeBoxConfirmation,
+  formatTimeBoxStatus,
+  parseTimeBoxDuration,
+  type TimeBoxState,
+} from "./time-box.js";
 
 // === State ===
 
@@ -2389,6 +2397,30 @@ const HEADSDOWN_COMMAND_OPTIONS: HeadsDownCommandOption[] = [
     menu: true,
   },
   {
+    value: "box 15m",
+    label: "Time box: 15 minutes",
+    description: "Set a local session time box for 15 minutes",
+    menu: true,
+  },
+  {
+    value: "box 1h",
+    label: "Time box: 1 hour",
+    description: "Set a local session time box for 1 hour",
+    menu: true,
+  },
+  {
+    value: "box status",
+    label: "Time box status",
+    description: "Show the active local session time box",
+    menu: true,
+  },
+  {
+    value: "box clear",
+    label: "Clear time box",
+    description: "Cancel the active local session time box",
+    menu: true,
+  },
+  {
     value: "rabbit-hole status",
     label: "Rabbit-hole status",
     description: "Show current rabbit-hole session handling",
@@ -2496,6 +2528,11 @@ function buildHeadsDownCommandHelp(): string {
     "  /headsdown pause",
     "  /headsdown allow <minutes>",
     "",
+    "Local time box",
+    "  /headsdown box <duration>  (examples: 15m, 1h, 90m, 1h30m)",
+    "  /headsdown box status",
+    "  /headsdown box clear",
+    "",
     "Rabbit-hole controls",
     "  /headsdown rabbit-hole status",
     "  /headsdown rabbit-hole off",
@@ -2575,6 +2612,11 @@ export const __internal = {
   shouldEmitRabbitHoleGuidance,
   buildPauseAndSummarizeActionInput,
   buildAllowForDurationInput,
+  advanceTimeBoxForPrompt,
+  createTimeBox,
+  formatTimeBoxConfirmation,
+  formatTimeBoxStatus,
+  parseTimeBoxDuration,
   HEADSDOWN_COMMAND_OPTIONS,
   buildHeadsDownCommandHelp,
   getHeadsDownCommandCompletions,
@@ -2594,6 +2636,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let availabilitySnapshot: AvailabilitySnapshot | null = null;
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
+  let activeTimeBox: TimeBoxState | null = null;
   let rabbitHoleSessionMode: RabbitHoleSessionMode = "on";
   const rabbitHoleInterventions = new Map<string, RabbitHoleInterventionState>();
   const pendingOutcomeSharePreviews = new Map<
@@ -3855,6 +3898,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     cachedClient = null;
     availabilitySnapshot = null;
     autoQueuedRunIds = new Set<string>();
+    activeTimeBox = null;
 
     await refreshAvailability(ctx, { force: true });
     await updateStatusUI(ctx);
@@ -3957,6 +4001,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     const instructionBlocks: string[] = [];
+    const timeBoxResult = advanceTimeBoxForPrompt(activeTimeBox);
+    activeTimeBox = timeBoxResult.state;
+    if (timeBoxResult.instruction) {
+      instructionBlocks.push(timeBoxResult.instruction);
+    }
+
     const policyInstruction = policyInstructionForPrompt();
     if (policyInstruction) {
       instructionBlocks.push(policyInstruction);
@@ -5356,6 +5406,38 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         result.renderedReceipt,
         result.evaluation.verdict === "passed" ? "info" : "warning",
       );
+      return;
+    }
+
+    if (normalizedArgs === "box" || normalizedArgs.startsWith("box ")) {
+      const boxArgs = normalizedArgs.slice("box".length).trim();
+      if (activeTimeBox && Date.now() >= activeTimeBox.expiresAt) {
+        activeTimeBox = null;
+      }
+
+      if (boxArgs === "" || boxArgs === "status") {
+        ctx.ui.notify(formatTimeBoxStatus(activeTimeBox), "info");
+        return;
+      }
+
+      if (boxArgs === "clear") {
+        activeTimeBox = null;
+        ctx.ui.notify("[HeadsDown] Time box cleared. No active time box.", "info");
+        return;
+      }
+
+      const durationMs = parseTimeBoxDuration(boxArgs);
+      if (!durationMs) {
+        ctx.ui.notify(
+          "[HeadsDown] Invalid time box duration. Use forms like /headsdown box 15m, /headsdown box 1h, /headsdown box 90m, or /headsdown box 1h30m.",
+          "warning",
+        );
+        return;
+      }
+
+      const replaced = activeTimeBox !== null;
+      activeTimeBox = createTimeBox(durationMs);
+      ctx.ui.notify(formatTimeBoxConfirmation(activeTimeBox, replaced), "info");
       return;
     }
 
