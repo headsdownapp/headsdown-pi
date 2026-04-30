@@ -546,6 +546,24 @@ describe("formatWrapUpInstruction", () => {
     expect(instruction).toContain("Execution policy for this task");
     expect(instruction).toContain("full implementation depth");
   });
+
+  it("includes semicolon-delimited hints when active guidance provides them", () => {
+    const instruction = formatWrapUpInstruction({
+      active: true,
+      deadlineAt: "2026-04-22T01:00:00Z",
+      remainingMinutes: 12,
+      profile: "wrap_up",
+      source: "threshold",
+      reason: "Approaching deadline",
+      hints: ["completion_first", "defer_non_critical", "concise_output", "ship_handoff_if_needed"],
+      thresholdMinutes: 30,
+      selectedMode: "wrap_up",
+    });
+
+    expect(instruction).toContain(
+      "Hints: completion_first; defer_non_critical; concise_output; ship_handoff_if_needed",
+    );
+  });
 });
 
 describe("formatSummary", () => {

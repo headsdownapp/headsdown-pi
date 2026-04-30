@@ -74,8 +74,8 @@ describe("HeadsDown command discovery", () => {
     expect(values).not.toContain("rabbit-hole off");
     expect(values).not.toContain("rabbit-hole quiet");
     expect(values).not.toContain("rabbit-hole on");
-    expect(values).not.toContain("pause");
-    expect(values).not.toContain("allow 15");
+    expect(values).toContain("extend 15m");
+    expect(values).toContain("wrap");
     expect(values).toContain("details toggle");
     expect(values).toContain("theme neo");
   });
@@ -98,9 +98,9 @@ describe("HeadsDown command discovery", () => {
     expect(help).toContain("/headsdown digest");
     expect(help).toContain("Local verification");
     expect(help).toContain("/headsdown referee");
-    expect(help).not.toContain("Run actions");
-    expect(help).not.toContain("/headsdown pause");
-    expect(help).not.toContain("/headsdown allow <minutes>");
+    expect(help).toContain("Run actions");
+    expect(help).toContain("/headsdown extend [duration]");
+    expect(help).toContain("/headsdown wrap");
     expect(help).toContain("Local time box");
     expect(help).toContain("/headsdown box <duration>");
     expect(help).toContain("/headsdown box status");
@@ -129,7 +129,8 @@ describe("HeadsDown command discovery", () => {
     expect(menuValues).toContain("box status");
     expect(menuValues).toContain("box clear");
     expect(menuValues).not.toContain("rabbit-hole status");
-    expect(menuValues).not.toContain("allow 15");
+    expect(menuValues).toContain("extend 15m");
+    expect(menuValues).toContain("wrap");
     expect(menuValues).not.toContain("rabbit");
   });
 

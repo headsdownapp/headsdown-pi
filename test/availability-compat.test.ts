@@ -428,6 +428,78 @@ describe("agent control off-clock queue flow", () => {
     expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
   });
 
+  it("passes durationMinutes and idempotencyKey in GraphQL action fallback when present", async () => {
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    const client = {
+      graphql: {
+        async request(query: string, variables?: Record<string, unknown>) {
+          calls.push({ query, variables });
+          return {
+            applyHeadsdownAction: {
+              ok: true,
+              runSummary: { runId: "run-1", allowedActionKeys: ["ALLOW_FOR_DURATION"] },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await __internal.applyHeadsDownActionCompat(client as any, {
+      runId: "run-1",
+      actionKey: "allow_for_duration",
+      durationMinutes: 15,
+      idempotencyKey: "run-1:deadline:allow_for_duration:15",
+      source: "pi_extend_command",
+      client: "headsdown-pi/0.2.0",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls[0]!.variables).toEqual({
+      input: {
+        runId: "run-1",
+        actionKey: "allow_for_duration",
+        source: "pi_extend_command",
+        client: "headsdown-pi/0.2.0",
+        durationMinutes: 15,
+        idempotencyKey: "run-1:deadline:allow_for_duration:15",
+      },
+    });
+  });
+
+  it("omits durationMinutes and idempotencyKey in GraphQL action fallback when absent", async () => {
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    const client = {
+      graphql: {
+        async request(query: string, variables?: Record<string, unknown>) {
+          calls.push({ query, variables });
+          return {
+            applyHeadsdownAction: {
+              ok: true,
+              runSummary: { runId: "run-2", allowedActionKeys: ["PAUSE_AND_SUMMARIZE"] },
+            },
+          };
+        },
+      },
+    };
+
+    const result = await __internal.applyHeadsDownActionCompat(client as any, {
+      runId: "run-2",
+      actionKey: "pause_and_summarize",
+      source: "pi_wrap_command",
+      client: "headsdown-pi/0.2.0",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls[0]!.variables).toEqual({
+      input: {
+        runId: "run-2",
+        actionKey: "pause_and_summarize",
+        source: "pi_wrap_command",
+        client: "headsdown-pi/0.2.0",
+      },
+    });
+  });
+
   it("does not auto-queue queue_for_morning on non-off-clock runs", () => {
     const run = {
       runId: "run-needs-yes",
@@ -777,5 +849,123 @@ describe("agent control off-clock queue flow", () => {
     ).rejects.toThrow("disk full");
 
     expect(actionCalls).toHaveLength(0);
+  });
+});
+
+describe("attention window helpers", () => {
+  it("resolves attention window run from proposal-derived run id first", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run_proposal-123",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+      ],
+    });
+
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: "proposal-123",
+      overview,
+    });
+
+    expect(resolved).toEqual({
+      runId: "run_proposal-123",
+      runSummary: expect.objectContaining({ runId: "run_proposal-123" }),
+      reason: "matched_proposal_run",
+    });
+  });
+
+  it("falls back to a single attention_window_closing run when proposal run is missing", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-warning",
+          callKey: "ATTENTION_WINDOW_CLOSING",
+          allowedActionKeys: ["ALLOW_FOR_DURATION", "PAUSE_AND_SUMMARIZE"],
+        },
+      ],
+    });
+
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: "proposal-missing",
+      overview,
+    });
+
+    expect(resolved.runId).toBe("run-warning");
+    expect(resolved.reason).toBe("single_attention_window_run");
+  });
+
+  it("returns ambiguous_attention_window_runs when multiple warning runs exist", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-warning-1",
+          callKey: "ATTENTION_WINDOW_CLOSING",
+          allowedActionKeys: ["ALLOW_FOR_DURATION"],
+        },
+        {
+          runId: "run-warning-2",
+          callKey: "ATTENTION_WINDOW_CLOSING",
+          allowedActionKeys: ["ALLOW_FOR_DURATION"],
+        },
+      ],
+    });
+
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: null,
+      overview,
+    });
+
+    expect(resolved).toEqual({
+      runId: null,
+      runSummary: null,
+      reason: "ambiguous_attention_window_runs",
+    });
+  });
+
+  it("returns no_matching_run when no warning runs are available", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-ready",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+      ],
+    });
+
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: null,
+      overview,
+    });
+
+    expect(resolved).toEqual({ runId: null, runSummary: null, reason: "no_matching_run" });
+  });
+
+  it("returns overview_unavailable when overview payload is missing", () => {
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: null,
+      overview: null,
+    });
+
+    expect(resolved).toEqual({ runId: null, runSummary: null, reason: "overview_unavailable" });
+  });
+
+  it("parses extend duration defaults and shorthand", () => {
+    expect(__internal.parseExtendDurationMinutes("")).toBe(15);
+    expect(__internal.parseExtendDurationMinutes("15m")).toBe(15);
+    expect(__internal.parseExtendDurationMinutes("1h")).toBe(60);
+    expect(__internal.parseExtendDurationMinutes("90s")).toBe(2);
+    expect(__internal.parseExtendDurationMinutes("not-a-duration")).toBeNull();
+  });
+
+  it("formats persistent attention window status text", () => {
+    expect(__internal.attentionWindowStatusText(12)).toBe(
+      "Window closing: 12m left. /headsdown extend or /headsdown wrap",
+    );
+    expect(__internal.attentionWindowStatusText(null)).toBe(
+      "Window closing: Closing soon. /headsdown extend or /headsdown wrap",
+    );
   });
 });
