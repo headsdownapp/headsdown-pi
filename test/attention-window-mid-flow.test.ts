@@ -412,6 +412,64 @@ describe("attention window mid-flow polling", () => {
     },
   );
 
+  it("injects wrap-up and autopilot guidance together when both are active", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const contextHandler = handlers.get("context")?.at(0);
+    if (!sessionStart || !contextHandler) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "limited", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: true,
+            remainingMinutes: 12,
+            deadlineAt: "2026-04-28T10:30:00.000Z",
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({ headsdownCall: null, runSummaries: [] })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    await sessionStart({ reason: "new" }, ctx);
+
+    const injected = await contextHandler(
+      { messages: [{ role: "user", content: "continue" }] },
+      ctx,
+    );
+    expect(injected?.messages).toHaveLength(3);
+    expect(injected?.messages[1]).toMatchObject({
+      role: "custom",
+      customType: "headsdown-wrap-up-guidance",
+      display: false,
+    });
+    expect(injected?.messages[2]).toMatchObject({
+      role: "custom",
+      customType: "headsdown-autopilot-guidance",
+      display: false,
+    });
+    expect(String(injected?.messages[1].content)).toContain("window closing");
+    expect(String(injected?.messages[2].content)).toContain("Autopilot active");
+  });
+
   it("does not inject autopilot guidance for busy mode", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
