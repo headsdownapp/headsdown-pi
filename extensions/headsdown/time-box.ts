@@ -13,6 +13,13 @@ export interface TimeBoxPromptResult {
   instruction: string | null;
 }
 
+export interface EffectiveDeadlineResolution {
+  effectiveDeadlineAt: string | null;
+  deadlineMs: number | null;
+  remainingMinutes: number | null;
+  source: "box" | "backend" | "none";
+}
+
 export function parseTimeBoxDuration(input: string): number | null {
   const value = input.trim().toLowerCase();
   if (!value) return null;
@@ -86,7 +93,11 @@ export function formatTimeBoxConfirmation(state: TimeBoxState, replaced: boolean
   return `${prefix} Wind-down begins at ${formatTimeBoxClock(state.windDownAt)}. ${expires}`;
 }
 
-export function formatTimeBoxStatus(state: TimeBoxState | null, now = Date.now()): string {
+export function formatTimeBoxStatus(
+  state: TimeBoxState | null,
+  now = Date.now(),
+  backendDeadlineAt: string | null = null,
+): string {
   if (!state) return "[HeadsDown] No active time box.";
 
   const started = `Declared at ${formatTimeBoxClock(state.startedAt)}.`;
@@ -99,8 +110,67 @@ export function formatTimeBoxStatus(state: TimeBoxState | null, now = Date.now()
   const remainingMinutes = Math.ceil(remainingMs / 60_000);
   const remaining =
     remainingMinutes <= 1 ? "Less than 1 minute left." : `${remainingMinutes} minutes left.`;
+  const relationship = formatTimeBoxDeadlineRelationship(state, now, backendDeadlineAt);
 
-  return `[HeadsDown] Active time box. ${started} ${windDown} ${expires} ${remaining}`;
+  return `[HeadsDown] Active time box. ${started} ${windDown} ${expires} ${remaining} ${relationship}`;
+}
+
+export function resolveEffectiveDeadline(
+  box: TimeBoxState | null,
+  backendDeadlineAt: string | null | undefined,
+  now = Date.now(),
+): EffectiveDeadlineResolution {
+  const boxDeadlineMs = box && box.expiresAt > now ? box.expiresAt : null;
+  const backendDeadlineMs = parseActiveDeadlineMs(backendDeadlineAt, now);
+
+  if (boxDeadlineMs === null && backendDeadlineMs === null) {
+    return {
+      effectiveDeadlineAt: null,
+      deadlineMs: null,
+      remainingMinutes: null,
+      source: "none",
+    };
+  }
+
+  const source =
+    boxDeadlineMs !== null && (backendDeadlineMs === null || boxDeadlineMs <= backendDeadlineMs)
+      ? "box"
+      : "backend";
+  const deadlineMs = source === "box" ? boxDeadlineMs! : backendDeadlineMs!;
+
+  return {
+    effectiveDeadlineAt: new Date(deadlineMs).toISOString(),
+    deadlineMs,
+    remainingMinutes: Math.max(0, Math.ceil((deadlineMs - now) / 60_000)),
+    source,
+  };
+}
+
+function parseActiveDeadlineMs(deadlineAt: string | null | undefined, now: number): number | null {
+  if (!deadlineAt) return null;
+  const parsed = Date.parse(deadlineAt);
+  if (!Number.isFinite(parsed) || parsed <= now) return null;
+  return parsed;
+}
+
+function formatTimeBoxDeadlineRelationship(
+  state: TimeBoxState,
+  now: number,
+  backendDeadlineAt: string | null,
+): string {
+  const backendDeadlineMs = parseActiveDeadlineMs(backendDeadlineAt, now);
+  if (backendDeadlineMs === null) return "Service deadline not active.";
+
+  const deltaMinutes = Math.ceil(Math.abs(backendDeadlineMs - state.expiresAt) / 60_000);
+  if (state.expiresAt < backendDeadlineMs) {
+    return `Box is tighter than service deadline by ${deltaMinutes}m.`;
+  }
+
+  if (backendDeadlineMs < state.expiresAt) {
+    return `Service deadline is tighter by ${deltaMinutes}m; box has no warning effect.`;
+  }
+
+  return "Box matches the service deadline.";
 }
 
 export function buildTimeBoxWindDownInstruction(state: TimeBoxState): string {
