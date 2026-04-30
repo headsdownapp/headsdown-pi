@@ -896,7 +896,7 @@ describe("attention window helpers", () => {
     expect(resolved.reason).toBe("single_attention_window_run");
   });
 
-  it("returns missing_run when no unique attention window run can be resolved", () => {
+  it("returns ambiguous_attention_window_runs when multiple warning runs exist", () => {
     const overview = __internal.normalizeAgentControlOverviewPayload({
       runSummaries: [
         {
@@ -917,7 +917,39 @@ describe("attention window helpers", () => {
       overview,
     });
 
-    expect(resolved).toEqual({ runId: null, runSummary: null, reason: "missing_run" });
+    expect(resolved).toEqual({
+      runId: null,
+      runSummary: null,
+      reason: "ambiguous_attention_window_runs",
+    });
+  });
+
+  it("returns no_matching_run when no warning runs are available", () => {
+    const overview = __internal.normalizeAgentControlOverviewPayload({
+      runSummaries: [
+        {
+          runId: "run-ready",
+          callKey: "READY_TO_RESUME",
+          allowedActionKeys: ["RESUME_RUN"],
+        },
+      ],
+    });
+
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: null,
+      overview,
+    });
+
+    expect(resolved).toEqual({ runId: null, runSummary: null, reason: "no_matching_run" });
+  });
+
+  it("returns overview_unavailable when overview payload is missing", () => {
+    const resolved = __internal.resolveAttentionWindowRun({
+      activeProposalId: null,
+      overview: null,
+    });
+
+    expect(resolved).toEqual({ runId: null, runSummary: null, reason: "overview_unavailable" });
   });
 
   it("parses extend duration defaults and shorthand", () => {

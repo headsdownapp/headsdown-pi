@@ -231,6 +231,127 @@ describe("attention window mid-flow polling", () => {
     );
   });
 
+  it("respects polling cooldown before re-fetching attention-window overview", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: true,
+            remainingMinutes: 12,
+            deadlineAt: "2026-04-28T10:30:00.000Z",
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: {
+          key: "ATTENTION_WINDOW_CLOSING",
+          allowedActionKeys: ["ALLOW_FOR_DURATION"],
+        },
+        runSummaries: [
+          {
+            runId: "run_proposal-1",
+            callKey: "ATTENTION_WINDOW_CLOSING",
+            actionState: "AWAITING_ACTION",
+            allowedActionKeys: ["ALLOW_FOR_DURATION", "PAUSE_AND_SUMMARIZE"],
+          },
+        ],
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    vi.setSystemTime(new Date("2026-04-28T10:00:10.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    vi.setSystemTime(new Date("2026-04-28T10:00:31.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(client.getAgentControlOverview).toHaveBeenCalledTimes(2);
+  });
+
+  it("injects context hints only when guidance is fresh", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const contextHandler = handlers.get("context")?.at(0);
+    if (!sessionStart || !contextHandler) throw new Error("required handlers were not registered");
+
+    let failAvailability = false;
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => {
+        if (failAvailability) throw new Error("availability timeout");
+
+        return {
+          contract: { id: "contract-1", mode: "busy", lock: false },
+          schedule: {
+            inReachableHours: true,
+            nextTransitionAt: "2026-04-28T11:00:00.000Z",
+            wrapUpGuidance: {
+              active: true,
+              remainingMinutes: 12,
+              deadlineAt: "2026-04-28T10:30:00.000Z",
+              thresholdMinutes: 15,
+              profile: "wrap_up",
+              source: "threshold",
+              reason: "window closing",
+              hints: ["completion_first"],
+              selectedMode: "wrap_up",
+            },
+          },
+        };
+      }),
+      getAgentControlOverview: vi.fn(async () => ({ headsdownCall: null, runSummaries: [] })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    await sessionStart({ reason: "new" }, ctx);
+
+    const injected = await contextHandler(
+      { messages: [{ role: "user", content: "continue" }] },
+      ctx,
+    );
+    expect(injected?.messages).toHaveLength(2);
+    expect(injected?.messages[1]).toMatchObject({
+      role: "custom",
+      customType: "headsdown-wrap-up-guidance",
+      display: false,
+    });
+
+    failAvailability = true;
+    const stale = await contextHandler({ messages: [{ role: "user", content: "continue" }] }, ctx);
+    expect(stale).toBeUndefined();
+  });
+
   it("does not block tool execution when overview polling fails", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
@@ -279,5 +400,9 @@ describe("attention window mid-flow polling", () => {
         ? (result as { block?: boolean }).block
         : false;
     expect(blocked).not.toBe(true);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Warning checks are temporarily unavailable"),
+      "warning",
+    );
   });
 });

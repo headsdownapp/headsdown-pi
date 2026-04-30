@@ -912,7 +912,7 @@ async function applyHeadsDownActionCompat(
       reason: input.reason,
       source: input.source,
       client: input.client,
-      durationMinutes: input.durationMinutes,
+      durationMinutes: normalizeDurationMinutes(input.durationMinutes),
       idempotencyKey: input.idempotencyKey,
       nextWorkWindowStartsAt: input.nextWorkWindowStartsAt,
       handoffAvailable: input.handoffAvailable,
@@ -1105,7 +1105,12 @@ function pickReadyToResumeRun(
 interface AttentionWindowRunResolution {
   runId: string | null;
   runSummary: AgentRunSummaryPayload | null;
-  reason: "matched_proposal_run" | "single_attention_window_run" | "missing_run";
+  reason:
+    | "matched_proposal_run"
+    | "single_attention_window_run"
+    | "no_matching_run"
+    | "ambiguous_attention_window_runs"
+    | "overview_unavailable";
 }
 
 function resolveAttentionWindowRun(input: {
@@ -1113,7 +1118,7 @@ function resolveAttentionWindowRun(input: {
   overview: AgentControlOverviewPayload | null | undefined;
 }): AttentionWindowRunResolution {
   if (!input.overview) {
-    return { runId: null, runSummary: null, reason: "missing_run" };
+    return { runId: null, runSummary: null, reason: "overview_unavailable" };
   }
 
   const proposalRunId = input.activeProposalId ? runIdForProposal(input.activeProposalId) : null;
@@ -1140,7 +1145,19 @@ function resolveAttentionWindowRun(input: {
     };
   }
 
-  return { runId: null, runSummary: null, reason: "missing_run" };
+  if (attentionWindowRuns.length > 1) {
+    return { runId: null, runSummary: null, reason: "ambiguous_attention_window_runs" };
+  }
+
+  return { runId: null, runSummary: null, reason: "no_matching_run" };
+}
+
+function normalizeDurationMinutes(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(value)) return undefined;
+  const rounded = Math.ceil(value);
+  if (rounded <= 0) return undefined;
+  return rounded;
 }
 
 function parseExtendDurationMinutes(args: string): number | null {
@@ -2437,6 +2454,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let activeTimeBox: TimeBoxState | null = null;
   const attentionWindowDedupe = new Map<string, string>();
   let lastAttentionWindowPollAt = 0;
+  let lastAttentionWindowPollFailureNoticeAt = 0;
   const pendingOutcomeSharePreviews = new Map<
     string,
     {
@@ -3413,12 +3431,37 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return policyLines.join("\n");
   }
 
+  function clearAttentionWindowWarning(ctx: ExtensionContext, runId?: string | null): void {
+    if (runId) {
+      attentionWindowDedupe.delete(runId);
+    } else {
+      attentionWindowDedupe.clear();
+    }
+
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(ATTENTION_WINDOW_STATUS_KEY, undefined);
+    }
+  }
+
+  function buildWrapUpGuidanceContextMessage(wrapUpHintInstruction: string) {
+    return {
+      role: "custom" as const,
+      customType: "headsdown-wrap-up-guidance",
+      content: `[HeadsDown] Wrap-Up hints: ${wrapUpHintInstruction}`,
+      display: false,
+      timestamp: Date.now(),
+    };
+  }
+
   async function pollAttentionWindowWarning(
     ctx: ExtensionContext,
     options: { force?: boolean } = {},
   ): Promise<void> {
     const activeProposal = getLatestApprovedProposal();
-    if (!activeProposal) return;
+    if (!activeProposal) {
+      clearAttentionWindowWarning(ctx);
+      return;
+    }
 
     const now = Date.now();
     if (!options.force && now - lastAttentionWindowPollAt < ATTENTION_WINDOW_POLL_COOLDOWN_MS) {
@@ -3446,8 +3489,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         resolution.runSummary?.callKey === "attention_window_closing";
 
       if (!warningActive) {
-        if (resolution.runId) attentionWindowDedupe.delete(resolution.runId);
-        if (ctx.hasUI) ctx.ui.setStatus(ATTENTION_WINDOW_STATUS_KEY, undefined);
+        clearAttentionWindowWarning(ctx, resolution.runId);
         return;
       }
 
@@ -3469,8 +3511,18 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           );
         }
       }
-    } catch {
-      lastAttentionWindowPollAt = now;
+    } catch (error) {
+      if (
+        ctx.hasUI &&
+        (options.force === true ||
+          now - lastAttentionWindowPollFailureNoticeAt >= ATTENTION_WINDOW_POLL_COOLDOWN_MS)
+      ) {
+        lastAttentionWindowPollFailureNoticeAt = now;
+        ctx.ui.notify(
+          `[HeadsDown] Warning checks are temporarily unavailable: ${sanitizeErrorMessage(error)}.`,
+          "warning",
+        );
+      }
     }
   }
 
@@ -3537,7 +3589,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     activeTimeBox = null;
     attentionWindowDedupe.clear();
     lastAttentionWindowPollAt = 0;
-    if (ctx.hasUI) ctx.ui.setStatus(ATTENTION_WINDOW_STATUS_KEY, undefined);
+    lastAttentionWindowPollFailureNoticeAt = 0;
+    clearAttentionWindowWarning(ctx);
 
     await refreshAvailability(ctx, { force: true });
     await updateStatusUI(ctx);
@@ -3738,20 +3791,21 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event, ctx) => {
-    await refreshAvailability(ctx, { force: true });
+    const snapshotBeforeRefresh = availabilitySnapshot;
+    const refreshedSnapshot = await refreshAvailability(ctx, { force: true });
+    const staleAfterRefresh =
+      snapshotBeforeRefresh !== null && refreshedSnapshot === snapshotBeforeRefresh;
+    if (staleAfterRefresh) {
+      return undefined;
+    }
+
     const wrapUpHintInstruction = formatWrapUpInstruction(
-      availabilitySnapshot?.schedule?.wrapUpGuidance,
+      refreshedSnapshot?.schedule?.wrapUpGuidance,
     );
     if (!wrapUpHintInstruction) return undefined;
 
     const messages = [...event.messages];
-    messages.push({
-      role: "custom",
-      customType: "headsdown-wrap-up-guidance",
-      content: `[HeadsDown] Wrap-Up hints: ${wrapUpHintInstruction}`,
-      display: false,
-      timestamp: Date.now(),
-    } as any);
+    messages.push(buildWrapUpGuidanceContextMessage(wrapUpHintInstruction));
 
     return { messages };
   });
@@ -5121,6 +5175,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         overview: overviewResult.overview,
       });
       if (!resolution.runId || !resolution.runSummary) {
+        if (resolution.reason === "overview_unavailable") {
+          ctx.ui.notify(
+            "[HeadsDown] Unable to verify warning actions with the current client/backend support. Re-check with /headsdown status.",
+            "warning",
+          );
+          return;
+        }
+
+        if (resolution.reason === "ambiguous_attention_window_runs") {
+          ctx.ui.notify(
+            "[HeadsDown] Multiple window-closing runs are active. Re-check with /headsdown status before choosing Extend or Wrap.",
+            "warning",
+          );
+          return;
+        }
+
         ctx.ui.notify(
           "[HeadsDown] No active window-closing run found. Re-check with /headsdown status.",
           "warning",
@@ -5161,23 +5231,34 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
         const guidance = availabilitySnapshot?.schedule?.wrapUpGuidance;
         const idempotencyKey = `attention-window:${resolution.runId}:${guidance?.deadlineAt ?? "none"}:allow_for_duration:${durationMinutes}`;
-        const result = await applyHeadsDownActionCompat(actorClient, {
-          runId: resolution.runId,
-          actionKey: "allow_for_duration",
-          durationMinutes,
-          idempotencyKey,
-          source: "pi_extend_command",
-          client: `headsdown-pi/${HEADSDOWN_PI_CLIENT_VERSION}`,
-          reason: `Window closing warning acknowledged. Extend by ${durationMinutes} minutes.`,
-        });
 
-        if (!result.ok) {
-          ctx.ui.notify("[HeadsDown] Extend did not complete. Please retry.", "warning");
+        try {
+          const result = await applyHeadsDownActionCompat(actorClient, {
+            runId: resolution.runId,
+            actionKey: "allow_for_duration",
+            durationMinutes,
+            idempotencyKey,
+            source: "pi_extend_command",
+            client: `headsdown-pi/${HEADSDOWN_PI_CLIENT_VERSION}`,
+            reason: `Window closing warning acknowledged. Extend by ${durationMinutes} minutes.`,
+          });
+
+          if (!result.ok) {
+            ctx.ui.notify(
+              `[HeadsDown] Extend did not complete for run ${resolution.runId}. Please retry.`,
+              "warning",
+            );
+            return;
+          }
+        } catch (error) {
+          ctx.ui.notify(
+            `[HeadsDown] Extend failed for run ${resolution.runId}: ${sanitizeErrorMessage(error)}`,
+            "warning",
+          );
           return;
         }
 
-        attentionWindowDedupe.delete(resolution.runId);
-        if (ctx.hasUI) ctx.ui.setStatus(ATTENTION_WINDOW_STATUS_KEY, undefined);
+        clearAttentionWindowWarning(ctx, resolution.runId);
         await refreshAvailability(ctx, { force: true });
         await pollAttentionWindowWarning(ctx, { force: true });
         ctx.ui.notify(`[HeadsDown] Extend submitted for ${durationMinutes} minutes.`, "info");
@@ -5198,21 +5279,31 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const result = await applyHeadsDownActionCompat(actorClient, {
-        runId: resolution.runId,
-        actionKey: "pause_and_summarize",
-        source: "pi_wrap_command",
-        client: `headsdown-pi/${HEADSDOWN_PI_CLIENT_VERSION}`,
-        reason: "Window closing warning acknowledged. Pause and summarize.",
-      });
+      try {
+        const result = await applyHeadsDownActionCompat(actorClient, {
+          runId: resolution.runId,
+          actionKey: "pause_and_summarize",
+          source: "pi_wrap_command",
+          client: `headsdown-pi/${HEADSDOWN_PI_CLIENT_VERSION}`,
+          reason: "Window closing warning acknowledged. Pause and summarize.",
+        });
 
-      if (!result.ok) {
-        ctx.ui.notify("[HeadsDown] Wrap did not complete. Please retry.", "warning");
+        if (!result.ok) {
+          ctx.ui.notify(
+            `[HeadsDown] Wrap did not complete for run ${resolution.runId}. Please retry.`,
+            "warning",
+          );
+          return;
+        }
+      } catch (error) {
+        ctx.ui.notify(
+          `[HeadsDown] Wrap failed for run ${resolution.runId}: ${sanitizeErrorMessage(error)}`,
+          "warning",
+        );
         return;
       }
 
-      attentionWindowDedupe.delete(resolution.runId);
-      if (ctx.hasUI) ctx.ui.setStatus(ATTENTION_WINDOW_STATUS_KEY, undefined);
+      clearAttentionWindowWarning(ctx, resolution.runId);
       ctx.ui.notify("[HeadsDown] Wrap submitted. Saving handoff.", "info");
       return;
     }
