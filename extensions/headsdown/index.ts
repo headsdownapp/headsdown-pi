@@ -37,6 +37,7 @@ import type {
 import {
   applyTrustPolicy,
   decideAutoThinking,
+  formatAutopilotGuidance,
   formatSummary,
   formatWrapUpInstruction,
   isSensitivePath,
@@ -3453,6 +3454,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     };
   }
 
+  function buildAutopilotGuidanceContextMessage(autopilotGuidance: string) {
+    return {
+      role: "custom" as const,
+      customType: "headsdown-autopilot-guidance",
+      content: `[HeadsDown] ${autopilotGuidance}`,
+      display: false,
+      timestamp: Date.now(),
+    };
+  }
+
   async function pollAttentionWindowWarning(
     ctx: ExtensionContext,
     options: { force?: boolean } = {},
@@ -3802,10 +3813,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const wrapUpHintInstruction = formatWrapUpInstruction(
       refreshedSnapshot?.schedule?.wrapUpGuidance,
     );
-    if (!wrapUpHintInstruction) return undefined;
+    const autopilotGuidance = formatAutopilotGuidance({
+      mode: refreshedSnapshot?.contract?.mode ?? null,
+      hasActiveProposal: hasApprovedProposal(),
+    });
+    if (!wrapUpHintInstruction && !autopilotGuidance) return undefined;
 
     const messages = [...event.messages];
-    messages.push(buildWrapUpGuidanceContextMessage(wrapUpHintInstruction));
+    if (wrapUpHintInstruction) {
+      messages.push(buildWrapUpGuidanceContextMessage(wrapUpHintInstruction));
+    }
+    if (autopilotGuidance) {
+      messages.push(buildAutopilotGuidanceContextMessage(autopilotGuidance));
+    }
 
     return { messages };
   });

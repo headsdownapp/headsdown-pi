@@ -213,6 +213,22 @@ export interface PolicyDecision {
   reason: string;
 }
 
+export interface AutopilotGuidanceInput {
+  mode?: string | null;
+  hasActiveProposal?: boolean;
+}
+
+export function formatAutopilotGuidance(input: AutopilotGuidanceInput): string | null {
+  const mode = input.mode?.trim().toLowerCase();
+  if (mode !== "limited" && mode !== "offline") return null;
+
+  const scopePhrase = input.hasActiveProposal
+    ? "inside the approved scope"
+    : "inside the smallest safe scope until a proposal is approved";
+
+  return `Autopilot active for this mode: keep the run moving ${scopePhrase}, and preserve a concise review note for decisions that should wait for the user.`;
+}
+
 /**
  * Determine whether a file write should be blocked based on trust level,
  * availability mode, lock status, and proposal state.

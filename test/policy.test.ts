@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   applyTrustPolicy,
   decideAutoThinking,
+  formatAutopilotGuidance,
   isSensitivePath,
   matchGlob,
   formatSummary,
@@ -173,6 +174,26 @@ describe("applyTrustPolicy", () => {
       expect(result!.reason).toMatch(/^\[HeadsDown\]/);
     }
   });
+});
+
+// === Autopilot guidance ===
+
+describe("formatAutopilotGuidance", () => {
+  it.each(["limited", "offline"])("returns non-blocking autopilot guidance for %s mode", (mode) => {
+    const guidance = formatAutopilotGuidance({ mode, hasActiveProposal: true });
+
+    expect(guidance).toContain("Autopilot active");
+    expect(guidance).toContain("keep the run moving inside the approved scope");
+    expect(guidance).toContain("preserve a concise review note");
+    expect(guidance).not.toMatch(/automatic stop|rabbit[- ]hole/i);
+  });
+
+  it.each(["online", "busy", "none", null, undefined])(
+    "returns no autopilot guidance for %s mode",
+    (mode) => {
+      expect(formatAutopilotGuidance({ mode, hasActiveProposal: true })).toBeNull();
+    },
+  );
 });
 
 // === Auto-thinking policy ===
