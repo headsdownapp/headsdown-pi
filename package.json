@@ -55,7 +55,7 @@
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*",
-    "@types/node": "^20.17.0",
+    "@types/node": "^24.0.0",
     "esbuild": "^0.25.12",
     "prettier": "^3.4.0",
     "typescript": "^5.7.0",
