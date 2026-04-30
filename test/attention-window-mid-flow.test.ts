@@ -3,9 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
 
 function registerHeadsDownHarness() {
+  const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
   const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any>>>();
   const pi = {
-    registerCommand: vi.fn(),
+    registerCommand: vi.fn(
+      (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+    ),
     registerTool: vi.fn(),
     on: vi.fn((eventName: string, handler: (event: any, ctx: any) => Promise<any>) => {
       const existing = handlers.get(eventName) ?? [];
@@ -18,7 +23,9 @@ function registerHeadsDownHarness() {
   };
 
   headsdownExtension(pi as any);
-  return { handlers, pi };
+  const command = commands.get("headsdown");
+  if (!command) throw new Error("headsdown command was not registered");
+  return { command, handlers, pi };
 }
 
 function makeSessionEntryWithApprovedProposal() {
@@ -159,6 +166,269 @@ describe("attention window mid-flow polling", () => {
       String(call[0]).includes("Window closing"),
     );
     expect(warningCallsAfterTightening).toHaveLength(2);
+  });
+
+  it("uses a tighter local time box for mid-flow warnings", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { command, handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: true,
+            remainingMinutes: 30,
+            deadlineAt: "2026-04-28T10:30:00.000Z",
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    await sessionStart({ reason: "new" }, ctx);
+    await command.handler("box 12m", ctx);
+
+    const result = await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(result).toBeUndefined();
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(__internal.TIME_BOX_STATUS_KEY, "Box: 12m left");
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      __internal.ATTENTION_WINDOW_STATUS_KEY,
+      "Box deadline: 12m left. Wrap cleanly or clear with /headsdown box clear",
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Box deadline closing"),
+      "warning",
+    );
+  });
+
+  it("uses source-aware widget copy when the service deadline is tighter than the box", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { command, handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    if (!sessionStart) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: true,
+            remainingMinutes: 2,
+            deadlineAt: "2026-04-28T10:02:00.000Z",
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({ headsdownCall: null, runSummaries: [] })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    await sessionStart({ reason: "new" }, ctx);
+    await command.handler("box 10m", ctx);
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(__internal.TIME_BOX_STATUS_KEY, "Box: 10m left");
+    expect(ctx.ui.setWidget).toHaveBeenCalledWith(__internal.TIME_BOX_WIDGET_KEY, [
+      "Service deadline arrives in 2m",
+      "/headsdown extend 15m  /  /headsdown wrap",
+    ]);
+  });
+
+  it("suppresses local threshold notifications while the user is not idle", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { command, handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: false,
+            remainingMinutes: null,
+            deadlineAt: null,
+            thresholdMinutes: 15,
+            profile: "normal",
+            source: "threshold",
+            reason: null,
+            hints: [],
+            selectedMode: "auto",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({ headsdownCall: null, runSummaries: [] })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = { ...makeContext(), isIdle: vi.fn(() => false) };
+    await sessionStart({ reason: "new" }, ctx);
+    await command.handler("box 12m", ctx);
+
+    const result = await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(result).toBeUndefined();
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      __internal.ATTENTION_WINDOW_STATUS_KEY,
+      "Box deadline: 12m left. Wrap cleanly or clear with /headsdown box clear",
+    );
+    const warningCalls = ctx.ui.notify.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("Box deadline closing"),
+    );
+    expect(warningCalls).toHaveLength(0);
+  });
+
+  it("retries suppressed backend threshold notifications after the user becomes idle", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: true,
+            remainingMinutes: 12,
+            deadlineAt: null,
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: {
+          key: "ATTENTION_WINDOW_CLOSING",
+          allowedActionKeys: ["ALLOW_FOR_DURATION"],
+        },
+        runSummaries: [
+          {
+            runId: "run_proposal-1",
+            callKey: "ATTENTION_WINDOW_CLOSING",
+            actionState: "AWAITING_ACTION",
+            allowedActionKeys: ["ALLOW_FOR_DURATION", "PAUSE_AND_SUMMARIZE"],
+          },
+        ],
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = { ...makeContext(), isIdle: vi.fn(() => false) };
+    await sessionStart({ reason: "new" }, ctx);
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      __internal.ATTENTION_WINDOW_STATUS_KEY,
+      "Window closing: 12m left. /headsdown extend or /headsdown wrap",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("Window closing"),
+      "warning",
+    );
+
+    ctx.isIdle.mockReturnValue(true);
+    vi.setSystemTime(new Date("2026-04-28T10:00:31.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Window closing"),
+      "warning",
+    );
+  });
+
+  it("refreshes standalone time-box warnings without an active proposal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { command, handlers } = registerHeadsDownHarness();
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!toolCall) throw new Error("required handlers were not registered");
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockRejectedValue(new Error("not signed in"));
+
+    const ctx = {
+      ...makeContext(),
+      sessionManager: {
+        getBranch: vi.fn(() => []),
+        getSessionId: vi.fn(() => "session-1"),
+      },
+    };
+    await command.handler("box 12m", ctx);
+    ctx.ui.setStatus.mockClear();
+    ctx.ui.notify.mockClear();
+
+    const result = await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(result).toBeUndefined();
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(__internal.TIME_BOX_STATUS_KEY, "Box: 12m left");
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      __internal.ATTENTION_WINDOW_STATUS_KEY,
+      "Box deadline: 12m left. Wrap cleanly or clear with /headsdown box clear",
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Box deadline closing"),
+      "warning",
+    );
   });
 
   it("clears persistent status when wrap-up guidance deactivates", async () => {
