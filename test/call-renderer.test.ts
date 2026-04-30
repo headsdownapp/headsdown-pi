@@ -76,6 +76,19 @@ describe("renderHeadsDownCallCopy", () => {
     expect(rendered?.body).toContain("Your night stays yours");
   });
 
+  it("renders attention_window_closing with extend and wrap actions", () => {
+    const rendered = renderHeadsDownCallCopy({ key: "attention_window_closing" });
+    expect(rendered?.key).toBe("attention_window_closing");
+    expect(rendered?.title).toBe("Window closing");
+    expect(rendered?.primaryLabel).toBe("Extend");
+    expect(rendered?.primaryActionKey).toBe("allow_for_duration");
+    expect(rendered?.secondaryLabel).toBe("Wrap");
+    expect(rendered?.secondaryActionKey).toBe("pause_and_summarize");
+    const output = formatHeadsDownCallForPrompt(rendered!);
+    expect(output).toContain("Primary: Extend (action=allow_for_duration)");
+    expect(output).toContain("Secondary: Wrap (action=pause_and_summarize)");
+  });
+
   it("falls back to needs_your_yes for unknown action/risk/boundary signals", () => {
     const rendered = renderHeadsDownCallCopy({
       key: "future_call_key",

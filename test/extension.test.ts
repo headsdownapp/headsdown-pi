@@ -105,6 +105,9 @@ describe("Extension file", () => {
     expect(content).toContain("systemPrompt:");
     expect(content).toContain('pi.on("tool_result"');
     expect(content).toContain("maybeWarnScopeDrift");
+    expect(content).toContain('pi.on("context"');
+    expect(content).toContain("headsdown-wrap-up-guidance");
+    expect(content).toContain("availabilitySnapshot?.schedule?.wrapUpGuidance");
   });
 
   it("uses StringEnum for tool string choices instead of literal unions", async () => {
@@ -150,6 +153,17 @@ describe("Extension file", () => {
     expect(content).toContain("/headsdown details <on|off|toggle>");
     expect(content).toContain("detailsWidgetVisible && detailsWidget.length > 0");
     expect(content).toContain("formatCompactDuration");
+  });
+
+  it("includes extend and wrap command/menu run actions", async () => {
+    const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
+    expect(content).toContain('value: "extend 15m"');
+    expect(content).toContain('value: "wrap"');
+    expect(content).toContain('normalizedArgs.startsWith("extend")');
+    expect(content).toContain('normalizedArgs === "wrap"');
+    expect(content).toContain('actionKey: "allow_for_duration"');
+    expect(content).toContain('actionKey: "pause_and_summarize"');
+    expect(content).toContain("ATTENTION_WINDOW_STATUS_KEY");
   });
 });
 

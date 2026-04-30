@@ -8,6 +8,7 @@ export const CANONICAL_HEADSDOWN_CALL_KEYS = [
   "ready_to_resume",
   "all_contained",
   "needs_your_yes",
+  "attention_window_closing",
 ] as const;
 
 export type CanonicalHeadsDownCallKey = (typeof CANONICAL_HEADSDOWN_CALL_KEYS)[number];
@@ -157,6 +158,16 @@ const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
     primaryUiIntent: "review_request",
     secondaryLabel: "Keep queued",
     secondaryActionKey: "keep_queued",
+    secondaryUiIntent: null,
+  },
+  attention_window_closing: {
+    title: "Window closing",
+    body: "Your focus window is nearly over. Extend if you need more time, or wrap now to leave a clean handoff.",
+    primaryLabel: "Extend",
+    primaryActionKey: "allow_for_duration",
+    primaryUiIntent: null,
+    secondaryLabel: "Wrap",
+    secondaryActionKey: "pause_and_summarize",
     secondaryUiIntent: null,
   },
 };
