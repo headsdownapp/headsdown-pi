@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   applyTrustPolicy,
   decideAutoThinking,
+  formatAutopilotGuidance,
   isSensitivePath,
   matchGlob,
   formatSummary,
@@ -173,6 +174,47 @@ describe("applyTrustPolicy", () => {
       expect(result!.reason).toMatch(/^\[HeadsDown\]/);
     }
   });
+});
+
+// === Autopilot guidance ===
+
+describe("formatAutopilotGuidance", () => {
+  it.each(["limited", "offline"])("returns non-blocking autopilot guidance for %s mode", (mode) => {
+    const guidance = formatAutopilotGuidance({ mode, hasActiveProposal: true });
+
+    expect(guidance).toContain("Autopilot active");
+    expect(guidance).toContain("keep the run moving inside the approved scope");
+    expect(guidance).toContain("preserve a concise review note");
+    expect(guidance).not.toMatch(/automatic stop|rabbit[- ]hole/i);
+  });
+
+  it.each(["limited", "offline"])(
+    "uses smallest-safe-scope guidance for %s mode without an active proposal",
+    (mode) => {
+      const guidance = formatAutopilotGuidance({ mode, hasActiveProposal: false });
+
+      expect(guidance).toContain("Autopilot active");
+      expect(guidance).toContain("inside the smallest safe scope until a proposal is approved");
+      expect(guidance).toContain("preserve a concise review note");
+      expect(guidance).not.toContain("inside the approved scope");
+    },
+  );
+
+  it("normalizes supported mode values", () => {
+    expect(formatAutopilotGuidance({ mode: " Limited ", hasActiveProposal: true })).toContain(
+      "inside the approved scope",
+    );
+    expect(formatAutopilotGuidance({ mode: "OFFLINE", hasActiveProposal: true })).toContain(
+      "inside the approved scope",
+    );
+  });
+
+  it.each(["online", "busy", "none", null, undefined])(
+    "returns no autopilot guidance for %s mode",
+    (mode) => {
+      expect(formatAutopilotGuidance({ mode, hasActiveProposal: true })).toBeNull();
+    },
+  );
 });
 
 // === Auto-thinking policy ===
