@@ -112,7 +112,7 @@ describe("Extension file", () => {
 
   it("uses StringEnum for tool string choices instead of literal unions", async () => {
     const content = await readFile(join(ROOT, "extensions", "headsdown", "index.ts"), "utf-8");
-    expect(content).toContain('import { StringEnum } from "@mariozechner/pi-ai"');
+    expect(content).toContain('import { StringEnum, Type } from "@mariozechner/pi-ai"');
     expect(content).not.toContain("Type.Union(");
     expect(content).not.toContain("Type.Literal(");
   });

@@ -51,12 +51,12 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@headsdown/sdk": "^0.3.1",
+    "@headsdown/sdk": "^0.4.0",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.25.12",
+    "esbuild": "^0.28.0",
     "prettier": "^3.4.0",
     "typescript": "^5.7.0",
     "vitest": "^3.1.0"

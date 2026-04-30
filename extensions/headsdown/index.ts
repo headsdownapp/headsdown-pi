@@ -16,9 +16,8 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { StringEnum, Type } from "@mariozechner/pi-ai";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
 import * as HeadsDownSDK from "@headsdown/sdk";
 import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
 import type {
