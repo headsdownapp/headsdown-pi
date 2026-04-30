@@ -117,6 +117,7 @@ describe("headsdown compaction helper", () => {
     const compaction = __internal.buildHeadsDownCompaction({
       availabilitySummary: null,
       wrapUpInstruction: null,
+      timeBox: null,
       proposal: null,
       scope: null,
       firstKeptEntryId: "msg-1",
@@ -130,6 +131,7 @@ describe("headsdown compaction helper", () => {
     const compaction = __internal.buildHeadsDownCompaction({
       availabilitySummary: "Mode: busy, 12min remaining",
       wrapUpInstruction: "Execution policy: wrap up current slice.",
+      timeBox: null,
       proposal: {
         id: "proposal-1",
         decision: "approved",

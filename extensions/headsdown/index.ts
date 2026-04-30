@@ -278,7 +278,7 @@ interface HeadsDownCompactionDetails {
 interface HeadsDownCompactionInput {
   availabilitySummary: string | null;
   wrapUpInstruction: string | null;
-  timeBox?: TimeBoxState | null;
+  timeBox: TimeBoxState | null;
   proposal: ProposalRecord | null;
   scope: ProposalScopeSnapshot | null;
   firstKeptEntryId: string;
@@ -2584,17 +2584,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (!value || typeof value !== "object") return null;
     const state = value as Partial<TimeBoxState>;
     if (
-      typeof state.startedAt !== "number" ||
-      typeof state.windDownAt !== "number" ||
-      typeof state.expiresAt !== "number"
+      !Number.isFinite(state.startedAt) ||
+      !Number.isFinite(state.windDownAt) ||
+      !Number.isFinite(state.expiresAt) ||
+      state.startedAt! > state.windDownAt! ||
+      state.windDownAt! > state.expiresAt!
     ) {
       return null;
     }
 
     return {
-      startedAt: state.startedAt,
-      windDownAt: state.windDownAt,
-      expiresAt: state.expiresAt,
+      startedAt: state.startedAt!,
+      windDownAt: state.windDownAt!,
+      expiresAt: state.expiresAt!,
       windDownFired: state.windDownFired === true,
     };
   }
@@ -2627,14 +2629,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return normalizeTimeBoxState(details.headsdown.timeBox);
   }
 
-  function persistTimeBox() {
+  function persistTimeBox(): boolean {
     const appendEntry = (pi as ExtensionAPI & { appendEntry?: ExtensionAPI["appendEntry"] })
       .appendEntry;
-    if (typeof appendEntry !== "function") return;
+    if (typeof appendEntry !== "function") return false;
     appendEntry<TimeBoxSessionState>("headsdown-time-box", {
       state: activeTimeBox,
       updatedAt: new Date().toISOString(),
     });
+    return true;
   }
 
   function clearTimeBoxUI(ctx: ExtensionContext) {
@@ -2651,6 +2654,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return activeTimeBox;
   }
 
+  function formatRemainingMinutesLabel(remainingMinutes: number): string {
+    return remainingMinutes <= 1 ? "<1" : String(remainingMinutes);
+  }
+
   function updateTimeBoxUI(ctx: ExtensionContext, backendDeadlineAt: string | null = null) {
     if (!ctx.hasUI) return;
     const box = refreshActiveTimeBox();
@@ -2663,13 +2670,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const boxRemainingMinutes = Math.max(0, Math.ceil((box.expiresAt - now) / 60_000));
     ctx.ui.setStatus(
       TIME_BOX_STATUS_KEY,
-      `Box: ${boxRemainingMinutes <= 1 ? "<1" : boxRemainingMinutes}m left`,
+      `Box: ${formatRemainingMinutesLabel(boxRemainingMinutes)}m left`,
     );
 
     const effective = resolveEffectiveDeadline(box, backendDeadlineAt, now);
     if (
       effective.source === "none" ||
-      typeof effective.remainingMinutes !== "number" ||
       effective.remainingMinutes > TIME_BOX_WIDGET_THRESHOLD_MINUTES
     ) {
       ctx.ui.setWidget(TIME_BOX_WIDGET_KEY, undefined);
@@ -2678,14 +2684,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     if (effective.source === "backend") {
       ctx.ui.setWidget(TIME_BOX_WIDGET_KEY, [
-        `Service deadline arrives in ${effective.remainingMinutes <= 1 ? "<1" : effective.remainingMinutes}m`,
+        `Service deadline arrives in ${formatRemainingMinutesLabel(effective.remainingMinutes)}m`,
         "/headsdown extend 15m  /  /headsdown wrap",
       ]);
       return;
     }
 
     ctx.ui.setWidget(TIME_BOX_WIDGET_KEY, [
-      `Box expires in ${effective.remainingMinutes <= 1 ? "<1" : effective.remainingMinutes}m`,
+      `Box expires in ${formatRemainingMinutesLabel(effective.remainingMinutes)}m`,
       "Wrap cleanly, or clear the box with /headsdown box clear",
     ]);
   }
@@ -3607,9 +3613,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       activeWrapUpDeadlineAt(guidance),
       Date.now(),
     );
-    if (effective.source === "none") return formatWrapUpInstruction(guidance);
-
-    if (effective.source === "backend") return formatWrapUpInstruction(guidance);
+    if (effective.source !== "box") return formatWrapUpInstruction(guidance);
 
     const syntheticGuidance = {
       active: true,
@@ -3625,13 +3629,43 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const baseInstruction = formatWrapUpInstruction(
       syntheticGuidance as ScheduleResolution["wrapUpGuidance"],
     );
-    const prefix = `You declared a local work box; about ${effective.remainingMinutes ?? "unknown"} minutes remain. Treat that as the primary deadline.`;
+    const prefix = `You declared a local work box; about ${effective.remainingMinutes} minutes remain. Treat that as the primary deadline.`;
     return baseInstruction ? `${prefix} ${baseInstruction}` : prefix;
   }
 
   function shouldNotifyAttentionWindow(ctx: ExtensionContext): boolean {
     const isIdle = (ctx as ExtensionContext & { isIdle?: () => boolean }).isIdle;
     return typeof isIdle !== "function" || isIdle();
+  }
+
+  function deliverAttentionWindowWarning(
+    ctx: ExtensionContext,
+    input: {
+      source: "box" | "backend";
+      remainingMinutes: number | null | undefined;
+      runKey: string;
+      fingerprint: string;
+    },
+  ): void {
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(
+        ATTENTION_WINDOW_STATUS_KEY,
+        input.source === "box"
+          ? localTimeBoxStatusText(input.remainingMinutes)
+          : attentionWindowStatusText(input.remainingMinutes),
+      );
+    }
+
+    if (attentionWindowDedupe.get(input.runKey) === input.fingerprint) return;
+    if (!ctx.hasUI || !shouldNotifyAttentionWindow(ctx)) return;
+
+    ctx.ui.notify(
+      input.source === "box"
+        ? "[HeadsDown] Box deadline closing. Wrap cleanly, or clear the box with /headsdown box clear. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop."
+        : "[HeadsDown] Window closing. Extend with /headsdown extend [15m] or Wrap with /headsdown wrap. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop.",
+      "warning",
+    );
+    attentionWindowDedupe.set(input.runKey, input.fingerprint);
   }
 
   function buildAutopilotGuidanceContextMessage(autopilotGuidance: string) {
@@ -3648,21 +3682,46 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     options: { force?: boolean } = {},
   ): Promise<void> {
+    const now = Date.now();
+    updateTimeBoxUI(ctx);
+
+    const localOnlyEffective = resolveEffectiveDeadline(activeTimeBox, null, now);
+    const localOnlyWarningActive =
+      localOnlyEffective.source === "box" &&
+      localOnlyEffective.remainingMinutes <= DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES;
     const activeProposal = getLatestApprovedProposal();
+
     if (!activeProposal) {
+      if (localOnlyWarningActive) {
+        deliverAttentionWindowWarning(ctx, {
+          source: "box",
+          remainingMinutes: localOnlyEffective.remainingMinutes,
+          runKey: "local-time-box",
+          fingerprint: `${localOnlyEffective.effectiveDeadlineAt}:${DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES}`,
+        });
+        return;
+      }
+
       clearAttentionWindowWarning(ctx);
       return;
     }
 
-    const now = Date.now();
     if (!options.force && now - lastAttentionWindowPollAt < ATTENTION_WINDOW_POLL_COOLDOWN_MS) {
       return;
     }
 
-    updateTimeBoxUI(ctx);
-
     const client = await getClient();
-    if (!client) return;
+    if (!client) {
+      if (localOnlyWarningActive) {
+        deliverAttentionWindowWarning(ctx, {
+          source: "box",
+          remainingMinutes: localOnlyEffective.remainingMinutes,
+          runKey: runIdForProposal(activeProposal.id),
+          fingerprint: `${localOnlyEffective.effectiveDeadlineAt}:${DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES}`,
+        });
+      }
+      return;
+    }
 
     try {
       const actorClient = withActorContext(client, ctx);
@@ -3684,44 +3743,34 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         guidance?.active === true &&
         resolution.runId !== null &&
         resolution.runSummary?.callKey === "attention_window_closing";
-      const displayRemainingMinutes =
-        effective.source === "backend" && typeof guidance?.remainingMinutes === "number"
-          ? guidance.remainingMinutes
-          : effective.remainingMinutes;
       const localWarningActive =
-        effective.source === "box" &&
-        typeof displayRemainingMinutes === "number" &&
-        displayRemainingMinutes <= thresholdMinutes;
+        effective.source === "box" && effective.remainingMinutes <= thresholdMinutes;
       const warningActive = backendWarningActive || localWarningActive;
+      const runKey = resolution.runId ?? runIdForProposal(activeProposal.id);
 
-      if (!warningActive || effective.source === "none") {
-        clearAttentionWindowWarning(ctx, resolution.runId ?? runIdForProposal(activeProposal.id));
+      if (!warningActive) {
+        clearAttentionWindowWarning(ctx, runKey);
         return;
       }
 
-      if (ctx.hasUI) {
-        ctx.ui.setStatus(
-          ATTENTION_WINDOW_STATUS_KEY,
-          effective.source === "box"
-            ? localTimeBoxStatusText(displayRemainingMinutes)
-            : attentionWindowStatusText(displayRemainingMinutes),
-        );
-      }
+      const warningSource: "box" | "backend" = localWarningActive ? "box" : "backend";
+      const displayRemainingMinutes =
+        warningSource === "backend" && typeof guidance?.remainingMinutes === "number"
+          ? guidance.remainingMinutes
+          : effective.source === "none"
+            ? null
+            : effective.remainingMinutes;
+      const fingerprintDeadline =
+        effective.source === "none"
+          ? `backend:${runKey}:${displayRemainingMinutes ?? "soon"}`
+          : effective.effectiveDeadlineAt;
 
-      const runKey = resolution.runId ?? runIdForProposal(activeProposal.id);
-      const fingerprint = `${effective.effectiveDeadlineAt ?? "none"}:${thresholdMinutes}`;
-      const previous = attentionWindowDedupe.get(runKey);
-      if (previous !== fingerprint) {
-        attentionWindowDedupe.set(runKey, fingerprint);
-        if (ctx.hasUI && shouldNotifyAttentionWindow(ctx)) {
-          ctx.ui.notify(
-            effective.source === "box"
-              ? "[HeadsDown] Box deadline closing. Wrap cleanly, or clear the box with /headsdown box clear. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop."
-              : "[HeadsDown] Window closing. Extend with /headsdown extend [15m] or Wrap with /headsdown wrap. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop.",
-            "warning",
-          );
-        }
-      }
+      deliverAttentionWindowWarning(ctx, {
+        source: warningSource,
+        remainingMinutes: displayRemainingMinutes,
+        runKey,
+        fingerprint: `${fingerprintDeadline}:${thresholdMinutes}`,
+      });
     } catch (error) {
       if (
         ctx.hasUI &&
@@ -5355,10 +5404,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       if (boxArgs === "clear") {
         activeTimeBox = null;
-        persistTimeBox();
+        const persisted = persistTimeBox();
         clearTimeBoxUI(ctx);
         clearAttentionWindowWarning(ctx);
         ctx.ui.notify("[HeadsDown] Time box cleared. No active time box.", "info");
+        if (!persisted) {
+          ctx.ui.notify(
+            "[HeadsDown] Time box cleared for this session, but this Pi build could not persist the clear state.",
+            "warning",
+          );
+        }
         return;
       }
 
@@ -5373,10 +5428,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       const replaced = activeTimeBox !== null;
       activeTimeBox = createTimeBox(durationMs);
-      persistTimeBox();
+      const persisted = persistTimeBox();
       attentionWindowDedupe.clear();
       updateTimeBoxUI(ctx, activeWrapUpDeadlineAt(availabilitySnapshot?.schedule?.wrapUpGuidance));
       ctx.ui.notify(formatTimeBoxConfirmation(activeTimeBox, replaced), "info");
+      if (!persisted) {
+        ctx.ui.notify(
+          "[HeadsDown] Time box is active for this session, but this Pi build cannot persist it across resume.",
+          "warning",
+        );
+      }
       return;
     }
 

@@ -13,12 +13,14 @@ export interface TimeBoxPromptResult {
   instruction: string | null;
 }
 
-export interface EffectiveDeadlineResolution {
-  effectiveDeadlineAt: string | null;
-  deadlineMs: number | null;
-  remainingMinutes: number | null;
-  source: "box" | "backend" | "none";
-}
+export type EffectiveDeadlineResolution =
+  | { source: "none" }
+  | {
+      source: "box" | "backend";
+      effectiveDeadlineAt: string;
+      deadlineMs: number;
+      remainingMinutes: number;
+    };
 
 export function parseTimeBoxDuration(input: string): number | null {
   const value = input.trim().toLowerCase();
@@ -124,12 +126,7 @@ export function resolveEffectiveDeadline(
   const backendDeadlineMs = parseActiveDeadlineMs(backendDeadlineAt, now);
 
   if (boxDeadlineMs === null && backendDeadlineMs === null) {
-    return {
-      effectiveDeadlineAt: null,
-      deadlineMs: null,
-      remainingMinutes: null,
-      source: "none",
-    };
+    return { source: "none" };
   }
 
   const source =
