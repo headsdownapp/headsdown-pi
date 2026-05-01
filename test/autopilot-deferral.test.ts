@@ -43,10 +43,14 @@ describe("autopilot deferral detection", () => {
     }
   });
 
-  it("ignores plain assertions and code-fenced rhetorical questions", () => {
+  it("ignores plain assertions, generic closers, and code-fenced rhetorical questions", () => {
     const config = defaultConfig();
 
     expect(detectDeferral("I updated the tests and will continue.", config.patterns)).toEqual({
+      matched: false,
+      matchedPatternKey: null,
+    });
+    expect(detectDeferral("Let me know if you need anything else.", config.patterns)).toEqual({
       matched: false,
       matchedPatternKey: null,
     });

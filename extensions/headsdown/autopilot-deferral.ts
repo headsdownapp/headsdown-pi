@@ -75,7 +75,7 @@ export const DEFAULT_DETECTION_PATTERNS: Array<{ key: string; pattern: string }>
   },
   {
     key: "let_me_know",
-    pattern: String.raw`\blet\s+me\s+know\b`,
+    pattern: String.raw`\blet\s+me\s+know\b[^.!?]{0,120}\b(?:which|whether|if\s+you\s+(?:want|would|prefer)|if\s+you['’]?d\s+like|how|what|when)\b`,
   },
   {
     key: "please_confirm",
