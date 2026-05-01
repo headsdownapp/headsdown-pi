@@ -152,7 +152,7 @@ export function detectModeTransition(previousMode: unknown, currentMode: unknown
 
   if (!previous) return "first_observation";
   if (!current || previous === current) return "no_change";
-  if (isOfflineLikeMode(previous) && current === "online") return "online_arrival";
+  if (isOfflineLikeMode(previous) && isOnlineLikeMode(current)) return "online_arrival";
   if (isOfflineLikeMode(previous) && isOfflineLikeMode(current)) return "still_offline";
   if (isOnlineLikeMode(previous) && isOfflineLikeMode(current)) return "going_offline";
   if (isOnlineLikeMode(previous) && isOnlineLikeMode(current)) return "still_online";
@@ -160,9 +160,10 @@ export function detectModeTransition(previousMode: unknown, currentMode: unknown
 }
 
 export function shouldTriggerWakeUp(transition: ModeTransition, currentMode?: unknown): boolean {
+  const current = normalizeMode(currentMode);
   return (
     transition === "online_arrival" ||
-    (transition === "first_observation" && currentMode === "online")
+    (transition === "first_observation" && isOnlineLikeMode(current))
   );
 }
 
@@ -314,11 +315,19 @@ export function entryFromRecordedEvent(event: AgentRunEvent): DeferredDecisionEn
   };
 }
 
-function resolvedDecisionIds(events: ReadonlyArray<AgentRunEvent>): Set<string> {
+function deferredDecisionKey(runId: string, decisionId: string): string {
+  return `${runId}\0${decisionId}`;
+}
+
+function resolvedDecisionKeys(events: ReadonlyArray<AgentRunEvent>): Set<string> {
   return new Set(
     events
-      .map((event) => normalizeOpaqueToken(getString(event.payload ?? {}, "decision_id")))
-      .filter((decisionId): decisionId is string => decisionId !== null),
+      .map((event) => {
+        const runId = normalizeOpaqueToken(event.runId);
+        const decisionId = normalizeOpaqueToken(getString(event.payload ?? {}, "decision_id"));
+        return runId && decisionId ? deferredDecisionKey(runId, decisionId) : null;
+      })
+      .filter((key): key is string => key !== null),
   );
 }
 
@@ -358,12 +367,12 @@ export function selectUnresolvedDeferredDecisionEntries(input: {
 }): DeferredDecisionEntry[] {
   const now = input.now ?? new Date();
   const daysBack = input.daysBack ?? DEFAULT_DAYS_BACK;
-  const resolvedIds = resolvedDecisionIds(input.resolvedEvents);
+  const resolvedKeys = resolvedDecisionKeys(input.resolvedEvents);
 
   const entries = input.recordedEvents
     .map(entryFromRecordedEvent)
     .filter((entry): entry is DeferredDecisionEntry => entry !== null)
-    .filter((entry) => !resolvedIds.has(entry.decision_id))
+    .filter((entry) => !resolvedKeys.has(deferredDecisionKey(entry.run_id, entry.decision_id)))
     .filter((entry) => !isExpired(entry, now))
     .filter((entry) => !isStale(entry, now, daysBack))
     .filter((entry) => entry.local_session_summary?.stale !== true)
@@ -371,7 +380,11 @@ export function selectUnresolvedDeferredDecisionEntries(input: {
     .filter((entry) => input.flaggedOnly !== true || entry.flagged_for_review)
     .filter((entry) => input.excludeSurfaced !== true || !isSurfaced(entry, input.state));
 
-  return sortDeferredDecisionEntries(entries).slice(0, input.limit ?? entries.length);
+  const limit =
+    typeof input.limit === "number" && Number.isFinite(input.limit)
+      ? Math.max(0, Math.floor(input.limit))
+      : entries.length;
+  return sortDeferredDecisionEntries(entries).slice(0, limit);
 }
 
 export async function listUnresolvedDeferredDecisionEntries(

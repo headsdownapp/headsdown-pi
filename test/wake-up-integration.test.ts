@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension from "../extensions/headsdown/index.js";
 import {
   emptyAutopilotState,
+  markDecisionIdsSurfaced,
   saveAutopilotState,
 } from "../extensions/headsdown/autopilot-state.js";
 
@@ -116,8 +117,15 @@ describe("wake-up digest integration", () => {
   it("surfaces unresolved decisions once on online arrival and injects ready-to-resume guidance", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-01T10:00:00.000Z"));
-    await saveAutopilotState({ ...emptyAutopilotState(), lastObservedMode: "offline" });
+    await saveAutopilotState(
+      markDecisionIdsSurfaced(
+        { ...emptyAutopilotState(), lastObservedMode: "offline" },
+        [{ runId: "run-1", decisionId: "decision-previous" }],
+        new Date("2026-04-30T10:00:00.000Z"),
+      ),
+    );
     const recorded = [
+      makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-previous" }),
       makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-1" }),
       makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-2" }),
       makeEvent({
@@ -163,7 +171,7 @@ describe("wake-up digest integration", () => {
       expect.stringContaining("1 deferred decision queued"),
       "info",
     );
-    expect(promptResult.systemPrompt).toContain("Ready to resume: 1 deferred decision queued");
+    expect(promptResult.systemPrompt).toContain("Ready to resume: 2 deferred decisions queued");
     expect(promptResult.systemPrompt).toContain("headsdown_deferred action=list");
     expect(promptResult.systemPrompt).not.toContain("decision-2");
     expect(promptResult.systemPrompt).not.toContain("decision-expired");

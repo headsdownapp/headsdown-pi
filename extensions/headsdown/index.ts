@@ -3660,6 +3660,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       return { state, summary: zeroWakeUpDigestSummary() };
     }
 
+    wakeUpDigestCache = null;
+
     try {
       const entries = await queryWakeUpDigestEntries(ctx, {
         state,
@@ -3667,7 +3669,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         limit: config.wakeUpDigest.maxEntriesShown,
       });
       const summary = summarizeWakeUpDigest(entries);
-      wakeUpDigestCache = { summary, fetchedAt: now.getTime() };
 
       if (summary.count === 0) {
         return { state, summary };

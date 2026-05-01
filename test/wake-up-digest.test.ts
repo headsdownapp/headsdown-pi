@@ -80,6 +80,7 @@ describe("wake-up digest mode transitions", () => {
   it("detects online arrival and non-triggering mode changes", () => {
     expect(detectModeTransition("offline", "online")).toBe("online_arrival");
     expect(detectModeTransition("limited", "online")).toBe("online_arrival");
+    expect(detectModeTransition("offline", "busy")).toBe("online_arrival");
     expect(detectModeTransition("offline", "limited")).toBe("still_offline");
     expect(detectModeTransition("online", "offline")).toBe("going_offline");
     expect(detectModeTransition("online", "busy")).toBe("still_online");
@@ -88,6 +89,7 @@ describe("wake-up digest mode transitions", () => {
 
     expect(shouldTriggerWakeUp("online_arrival", "online")).toBe(true);
     expect(shouldTriggerWakeUp("first_observation", "online")).toBe(true);
+    expect(shouldTriggerWakeUp("first_observation", "busy")).toBe(true);
     expect(shouldTriggerWakeUp("first_observation", "offline")).toBe(false);
     expect(shouldTriggerWakeUp("still_online", "busy")).toBe(false);
   });
@@ -247,6 +249,36 @@ describe("wake-up digest entry selection", () => {
     );
     expect(JSON.stringify(entries)).not.toContain("ignore previous instructions");
     expect(JSON.stringify(entries)).not.toContain("/private/path");
+  });
+
+  it("matches resolved decisions by run and decision id", () => {
+    const now = new Date("2026-05-01T10:00:00.000Z");
+    const entries = selectUnresolvedDeferredDecisionEntries({
+      recordedEvents: [
+        makeEvent({
+          eventType: "deferred_decision.recorded",
+          decisionId: "decision-shared",
+          runId: "run-1",
+        }),
+        makeEvent({
+          eventType: "deferred_decision.recorded",
+          decisionId: "decision-shared",
+          runId: "run-2",
+        }),
+      ],
+      resolvedEvents: [
+        makeEvent({
+          eventType: "deferred_decision.resolved",
+          decisionId: "decision-shared",
+          runId: "run-2",
+        }),
+      ],
+      now,
+    });
+
+    expect(entries.map((entry) => `${entry.run_id}:${entry.decision_id}`)).toEqual([
+      "run-1:decision-shared",
+    ]);
   });
 
   it("queries recorded and resolved events with recent-window filters", async () => {
