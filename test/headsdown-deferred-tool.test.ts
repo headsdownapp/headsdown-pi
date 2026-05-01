@@ -375,6 +375,20 @@ describe("headsdown_deferred tool", () => {
       ),
     ).rejects.toThrow("refined_decision_category must be a supported decision category enum");
 
+    await expect(
+      tool.execute(
+        "tool-0b",
+        {
+          action: "refine",
+          decision_id: "decision-1",
+          refined_urgency_bucket: "unknown",
+        },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    ).rejects.toThrow("refined_urgency_bucket must be one of low, normal, or high");
+
     const payload = textResult(
       await tool.execute(
         "tool-1",

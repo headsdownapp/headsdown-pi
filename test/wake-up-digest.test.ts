@@ -7,6 +7,7 @@ import {
   emptyAutopilotState,
   loadAutopilotState,
   markDecisionIdsSurfaced,
+  removeDecisionIdsFromSurfaced,
   saveAutopilotState,
 } from "../extensions/headsdown/autopilot-state.js";
 import {
@@ -364,5 +365,31 @@ describe("autopilot state", () => {
     expect(loaded.lastObservedMode).toBe("offline");
     expect(loaded.lastTransitionAt).toBe("2026-04-30T10:00:00.000Z");
     expect(loaded.surfacedDecisionIds).toEqual({ "run-1": ["decision-1"] });
+  });
+
+  it("tracks surfaced timestamps per run when decision ids collide", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headsdown-autopilot-state-"));
+    tempDirs.push(dir);
+    const path = join(dir, "autopilot-state.json");
+    const state = markDecisionIdsSurfaced(
+      emptyAutopilotState(),
+      [
+        { runId: "run-1", decisionId: "decision-shared" },
+        { runId: "run-2", decisionId: "decision-shared" },
+        { runId: "run-3", decisionId: "decision-other" },
+      ],
+      new Date("2026-05-01T10:00:00.000Z"),
+    );
+
+    await saveAutopilotState(
+      removeDecisionIdsFromSurfaced(state, [{ runId: "run-1", decisionId: "decision-shared" }]),
+      path,
+    );
+    const loaded = await loadAutopilotState(path);
+
+    expect(loaded.surfacedDecisionIds).toEqual({
+      "run-2": ["decision-shared"],
+      "run-3": ["decision-other"],
+    });
   });
 });

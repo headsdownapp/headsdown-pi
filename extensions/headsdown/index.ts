@@ -3756,7 +3756,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   function validateOptionalRefinedUrgencyBucket(value: string | undefined): string | undefined {
     if (value === undefined) return undefined;
     const normalized = normalizeUrgencyBucketToken(value);
-    if (normalized) return normalized;
+    if (normalized && normalized !== "unknown") return normalized;
     throw new Error("refined_urgency_bucket must be one of low, normal, or high.");
   }
 

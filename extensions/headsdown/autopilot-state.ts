@@ -53,12 +53,27 @@ function normalizeSurfacedAtByDecisionId(value: unknown): Record<string, string>
 
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).filter(
-      ([decisionId, surfacedAt]) =>
-        decisionId.length > 0 &&
+      ([decisionKey, surfacedAt]) =>
+        decisionKey.length > 0 &&
         typeof surfacedAt === "string" &&
         Number.isFinite(Date.parse(surfacedAt)),
     ),
   ) as Record<string, string>;
+}
+
+function surfacedDecisionKey(runId: string, decisionId: string): string {
+  return JSON.stringify([runId, decisionId]);
+}
+
+function surfacedDecisionTimestamp(
+  surfacedAtByDecisionId: Record<string, string>,
+  runId: string,
+  decisionId: string,
+): string | undefined {
+  return (
+    surfacedAtByDecisionId[surfacedDecisionKey(runId, decisionId)] ??
+    surfacedAtByDecisionId[decisionId]
+  );
 }
 
 export function normalizeAutopilotState(value: unknown): AutopilotState {
@@ -91,7 +106,9 @@ export function pruneAutopilotState(state: AutopilotState, now: Date = new Date(
     Object.entries(state.surfacedDecisionIds)
       .map(([runId, decisionIds]) => {
         const keptDecisionIds = hasTimestampMap
-          ? decisionIds.filter((decisionId) => surfacedAtByDecisionId[decisionId])
+          ? decisionIds.filter((decisionId) =>
+              surfacedDecisionTimestamp(surfacedAtByDecisionId, runId, decisionId),
+            )
           : decisionIds;
         return [runId, keptDecisionIds] as const;
       })
@@ -124,7 +141,7 @@ export function markDecisionIdsSurfaced(
     if (!decisionIds.includes(entry.decisionId)) {
       surfacedDecisionIds[entry.runId] = [...decisionIds, entry.decisionId];
     }
-    surfacedAtByDecisionId[entry.decisionId] = surfacedAt;
+    surfacedAtByDecisionId[surfacedDecisionKey(entry.runId, entry.decisionId)] = surfacedAt;
   }
 
   return pruneAutopilotState({ ...state, surfacedDecisionIds, surfacedAtByDecisionId }, now);
@@ -150,9 +167,13 @@ export function removeDecisionIdsFromSurfaced(
       .filter(([, decisionIds]) => decisionIds.length > 0),
   );
 
+  const remainingDecisionIds = new Set(Object.values(surfacedDecisionIds).flat());
   const surfacedAtByDecisionId = { ...state.surfacedAtByDecisionId };
   for (const entry of entries) {
-    delete surfacedAtByDecisionId[entry.decisionId];
+    delete surfacedAtByDecisionId[surfacedDecisionKey(entry.runId, entry.decisionId)];
+    if (!remainingDecisionIds.has(entry.decisionId)) {
+      delete surfacedAtByDecisionId[entry.decisionId];
+    }
   }
 
   return { ...state, surfacedDecisionIds, surfacedAtByDecisionId };
