@@ -236,6 +236,7 @@ interface AutopilotStuckState {
   signature: string | null;
   consecutiveDetections: number;
   pendingTurnIndex: number | null;
+  deferredDecisionId: string | null;
   lastNudgedAt: number;
   attemptedSteps: Array<{
     step: ClassifierEscalationStep;
@@ -1718,10 +1719,10 @@ function basePiAgentRunEvent(context: PiAgentRunEventContext): Record<string, un
 
 function buildStartedEventInput(
   proposal: ProposalRecord,
-  telemetry?: Pick<PiRunTelemetry, "runId" | "sequence">,
+  telemetry?: Pick<PiRunTelemetry, "runId">,
 ): Record<string, unknown> {
   const runId = telemetry?.runId ?? runIdForProposal(proposal.id);
-  const sequence = telemetry?.sequence ?? 1;
+  const sequence = 1;
   return {
     ...basePiAgentRunEvent({
       runId,
@@ -2763,6 +2764,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     signature: null,
     consecutiveDetections: 0,
     pendingTurnIndex: null,
+    deferredDecisionId: null,
     lastNudgedAt: 0,
     attemptedSteps: [],
   };
@@ -3027,32 +3029,49 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function reportPiAgentRunEvent(
+  async function reportPiAgentRunEventResult(
     _ctx: ExtensionContext,
     input: Record<string, unknown>,
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; errorMessage: string | null }> {
     try {
       const client = await getClient();
-      if (!client) return false;
+      if (!client) return { ok: false, errorMessage: "not authenticated" };
       const eventClient = client as unknown as {
         reportAgentRunEvent?: (input: Record<string, unknown>) => Promise<unknown>;
       };
       if (typeof eventClient.reportAgentRunEvent === "function") {
-        await eventClient.reportAgentRunEvent(input);
-        return true;
+        const result = (await eventClient.reportAgentRunEvent(input)) as
+          | { ok?: boolean; error?: { message?: string | null } | null }
+          | undefined;
+        return {
+          ok: result?.ok !== false,
+          errorMessage: result?.error?.message ?? null,
+        };
       }
 
       const graphql = getLowLevelGraphQLClient(client);
-      if (!graphql) return false;
+      if (!graphql) return { ok: false, errorMessage: "event API unavailable" };
       const response = await graphql.request(REPORT_AGENT_RUN_EVENT_MUTATION, {
         input: serializeAgentRunEventForGraphQL(input),
       });
-      const result = response.reportAgentRunEvent as { ok?: boolean } | undefined;
-      return result?.ok !== false;
-    } catch {
+      const result = response.reportAgentRunEvent as
+        | { ok?: boolean; error?: { message?: string | null } | null }
+        | undefined;
+      return {
+        ok: result?.ok !== false,
+        errorMessage: result?.error?.message ?? null,
+      };
+    } catch (error) {
       // Event telemetry must never interrupt the agent run.
-      return false;
+      return { ok: false, errorMessage: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  async function reportPiAgentRunEvent(
+    ctx: ExtensionContext,
+    input: Record<string, unknown>,
+  ): Promise<boolean> {
+    return (await reportPiAgentRunEventResult(ctx, input)).ok;
   }
 
   async function reportStartedIfNeeded(ctx: ExtensionContext, proposal: ProposalRecord) {
@@ -4827,6 +4846,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     autopilotStuckState.signature = null;
     autopilotStuckState.consecutiveDetections = 0;
     autopilotStuckState.pendingTurnIndex = null;
+    autopilotStuckState.deferredDecisionId = null;
     autopilotStuckState.attemptedSteps = [];
   }
 
@@ -4885,6 +4905,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     ].join("\n\n");
   }
 
+  function isUnsupportedAutopilotContextError(message: string | null): boolean {
+    const normalized = message?.toLowerCase() ?? "";
+    return (
+      normalized.includes("autopilot_context") ||
+      normalized.includes("unsupported field") ||
+      normalized.includes("unknown field") ||
+      normalized.includes("is not defined by type")
+    );
+  }
+
   async function recordAutopilotDeferredDecision(input: {
     ctx: ExtensionContext;
     telemetry: PiRunTelemetry;
@@ -4912,10 +4942,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       now: new Date(),
     });
 
-    const classifierDecisionId = `decision_${randomBytes(16).toString("hex")}`;
+    autopilotStuckState.deferredDecisionId ??= `decision_${randomBytes(16).toString("hex")}`;
     const eventInput = buildDeferredDecisionEventInput({
       telemetry: nextTelemetry,
       proposal: input.proposal,
+      decisionId: autopilotStuckState.deferredDecisionId,
       decisionKind: pickDecisionKind(),
       decisionCategory: pickDecisionCategory(input.questionCategory),
       urgencyBucket: pickUrgencyBucket(input.config),
@@ -4927,15 +4958,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             policy: input.policy,
             capabilities: input.capabilities,
             attempts: autopilotStuckState.attemptedSteps,
-            classifierDecisionId,
+            classifierDecisionId: autopilotStuckState.deferredDecisionId,
           })
         : undefined,
     });
 
-    let reported = await reportPiAgentRunEvent(input.ctx, eventInput);
-    if (!reported && input.config.hostedAutopilotContextEnabled) {
+    let result = await reportPiAgentRunEventResult(input.ctx, eventInput);
+    if (
+      !result.ok &&
+      input.config.hostedAutopilotContextEnabled &&
+      isUnsupportedAutopilotContextError(result.errorMessage)
+    ) {
       const payload = eventInput.payload as Record<string, unknown> | undefined;
-      reported = await reportPiAgentRunEvent(input.ctx, {
+      result = await reportPiAgentRunEventResult(input.ctx, {
         ...eventInput,
         payload: payload
           ? stripUndefinedValues({ ...payload, autopilot_context: undefined })
@@ -4943,20 +4978,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       });
     }
 
-    if (reported) {
+    if (result.ok) {
       input.telemetry.deferredDecisionsCount = nextTelemetry.deferredDecisionsCount;
       input.telemetry.sequence = nextTelemetry.sequence;
     }
 
-    return reported;
+    return result.ok;
   }
 
   async function handleAutopilotStuckDetection(input: {
     ctx: ExtensionContext;
+    turnIndex: number;
     detection: AutopilotDeferralDetection;
     progressVersionAtSchedule: number;
     generationAtSchedule: number;
   }): Promise<void> {
+    if (autopilotStuckState.pendingTurnIndex !== input.turnIndex) return;
     if (autopilotStuckGeneration !== input.generationAtSchedule) return;
     if (autopilotProgressVersion !== input.progressVersionAtSchedule) return;
     if (inFlightToolExecutions.size > 0) return;
@@ -4999,6 +5036,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (autopilotStuckState.signature !== signature) {
       autopilotStuckState.signature = signature;
       autopilotStuckState.consecutiveDetections = 0;
+      autopilotStuckState.deferredDecisionId = null;
       autopilotStuckState.attemptedSteps = [];
     }
 
@@ -5080,6 +5118,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     setTimeout(() => {
       void handleAutopilotStuckDetection({
         ctx: input.ctx,
+        turnIndex: input.turnIndex,
         detection: input.detection,
         progressVersionAtSchedule,
         generationAtSchedule,

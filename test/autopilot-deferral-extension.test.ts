@@ -168,8 +168,10 @@ describe("autopilot deferral turn_end hook", () => {
 
     await fireTurnEnd(handlers, ctx, "Should I update the tests?", 2);
 
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
     const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
-    expect(deferrals).toHaveLength(1);
     const payload = deferrals[0].payload as Record<string, any>;
     expect(payload.decision_kind).toBe("would_have_asked");
     expect(payload.decision_category).toBe("scope");
@@ -226,7 +228,7 @@ describe("autopilot deferral turn_end hook", () => {
     const client = makeClient("offline", events);
     client.reportAgentRunEvent.mockImplementation(async (input: Record<string, unknown>) => {
       const payload = input.payload as Record<string, unknown>;
-      if (payload.autopilot_context) throw new Error("unsupported field");
+      if (payload.autopilot_context) throw new Error("unsupported field autopilot_context");
       events.push(input);
     });
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
@@ -236,10 +238,44 @@ describe("autopilot deferral turn_end hook", () => {
 
     await fireTurnEnd(handlers, ctx, "Please confirm the default.");
 
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
     const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
-    expect(deferrals).toHaveLength(1);
     expect((deferrals[0].payload as Record<string, unknown>).autopilot_context).toBeUndefined();
     expect((deferrals[0].payload as Record<string, unknown>).local_session_summary).toBeDefined();
+  });
+
+  it("does not strip classifier context for generic telemetry failures", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const attemptedDecisionIds: unknown[] = [];
+    const client = makeClient("offline", events);
+    client.reportAgentRunEvent.mockImplementationOnce(async (input: Record<string, unknown>) => {
+      attemptedDecisionIds.push((input.payload as Record<string, unknown>).decision_id);
+      throw new Error("network timeout");
+    });
+    client.reportAgentRunEvent.mockImplementationOnce(async (input: Record<string, unknown>) => {
+      attemptedDecisionIds.push((input.payload as Record<string, unknown>).decision_id);
+      events.push(input);
+    });
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 1);
+    await expect.poll(() => client.reportAgentRunEvent.mock.calls.length).toBe(1);
+    expect(events).toHaveLength(0);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 2);
+
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
+    const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
+    expect((deferrals[0].payload as Record<string, unknown>).autopilot_context).toBeDefined();
+    expect(attemptedDecisionIds[1]).toBe(attemptedDecisionIds[0]);
   });
 
   it("uses a conservative local policy when hosted policy lookup fails", async () => {
@@ -425,6 +461,44 @@ describe("autopilot deferral turn_end hook", () => {
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
     );
+  });
+
+  it("waits for the latest stuck turn before firing a scheduled nudge", async () => {
+    vi.useFakeTimers();
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 50, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const turnEnd = handlers.get("turn_end")?.at(0);
+    if (!turnEnd) throw new Error("turn_end handler was not registered");
+
+    await turnEnd(
+      {
+        turnIndex: 1,
+        message: { role: "assistant", content: "Should I keep going?" },
+        toolResults: [],
+      },
+      ctx,
+    );
+    await vi.advanceTimersByTimeAsync(25);
+    await turnEnd(
+      {
+        turnIndex: 2,
+        message: { role: "assistant", content: "Should I keep going?" },
+        toolResults: [],
+      },
+      ctx,
+    );
+    await vi.advanceTimersByTimeAsync(30);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("resets autopilot turn idempotency and in-flight state on a new session", async () => {

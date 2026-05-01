@@ -41,10 +41,9 @@ describe("Pi agent run event payloads", () => {
     expect(serialized).not.toContain("prompt content");
   });
 
-  it("builds started events with the active telemetry run id when one exists", () => {
+  it("builds started events with the active telemetry run id and pinned start sequence", () => {
     const input = __internal.buildStartedEventInput(proposal, {
       runId: "run_proposal-1_abcd1234",
-      sequence: 1,
     });
 
     expect(input).toMatchObject({
