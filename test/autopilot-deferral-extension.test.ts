@@ -245,6 +245,7 @@ describe("autopilot deferral turn_end hook", () => {
       .toBe(1);
     const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
     expect((deferrals[0].payload as Record<string, unknown>).autopilot_context).toBeUndefined();
+    expect((deferrals[0].idempotencyKey as string).endsWith(":compat")).toBe(true);
     expect((deferrals[0].payload as Record<string, unknown>).local_session_summary).toBeDefined();
   });
 
@@ -298,6 +299,10 @@ describe("autopilot deferral turn_end hook", () => {
     await fireTurnEnd(handlers, ctx, "Please confirm the default.", 1);
     await expect.poll(() => client.reportAgentRunEvent.mock.calls.length).toBe(1);
     expect(events).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "[HeadsDown] Autopilot anti-stuck check failed safely. The run will continue without a nudge.",
+      "warning",
+    );
 
     await fireTurnEnd(handlers, ctx, "Please confirm the default.", 2);
 

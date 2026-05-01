@@ -3082,7 +3082,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return (await reportPiAgentRunEventResult(input)).ok;
   }
 
-  async function reportStartedIfNeeded(ctx: ExtensionContext, proposal: ProposalRecord) {
+  async function reportStartedIfNeeded(proposal: ProposalRecord) {
     const telemetry = getTelemetryForProposal(proposal);
     if (telemetry.startedReported) return;
 
@@ -4701,7 +4701,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     const activeProposal = getLatestApprovedProposal();
     if (activeProposal) {
-      await reportStartedIfNeeded(ctx, activeProposal);
+      await reportStartedIfNeeded(activeProposal);
     }
 
     const instructionBlocks: string[] = [];
@@ -4989,6 +4989,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       if (fallbackPayload) delete fallbackPayload.autopilot_context;
       result = await reportPiAgentRunEventResult({
         ...eventInput,
+        idempotencyKey:
+          typeof eventInput.idempotencyKey === "string"
+            ? `${eventInput.idempotencyKey}:compat`
+            : eventInput.idempotencyKey,
         payload: fallbackPayload,
       });
     }
@@ -5109,7 +5113,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         policy,
         capabilities,
       });
-      if (recorded) resetAutopilotStuckState();
+      if (recorded) {
+        resetAutopilotStuckState();
+      } else {
+        notifyAutopilotFailure(input.ctx);
+      }
     }
   }
 
@@ -5763,7 +5771,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         };
         proposalScopes.set(verdict.proposalId, scope);
         persistScope(scope);
-        await reportStartedIfNeeded(_ctx, proposalRecord);
+        await reportStartedIfNeeded(proposalRecord);
       } else {
         const snapshot = await refreshAvailability(_ctx, { force: true });
         const nextWindowStartsAt = snapshot?.schedule?.nextTransitionAt ?? null;
