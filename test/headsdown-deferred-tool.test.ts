@@ -288,6 +288,38 @@ describe("headsdown_deferred tool", () => {
     expect(payload).toEqual({ ok: false, notFound: true, decision_id: "missing" });
   });
 
+  it("does not treat duplicate events for the same run as ambiguous", async () => {
+    const recorded = [
+      makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-1" }),
+      makeEvent({
+        eventType: "deferred_decision.recorded",
+        decisionId: "decision-1",
+        payload: { flagged_for_review: false },
+      }),
+    ];
+    const client = {
+      withActor: vi.fn(() => client),
+      listAgentRunEvents: vi.fn(async ({ eventType }: { eventType?: string }) =>
+        eventType === "deferred_decision.recorded" ? recorded : [],
+      ),
+    };
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { tool } = registerToolHarness();
+
+    const payload = textResult(
+      await tool.execute(
+        "tool-1",
+        { action: "view", decision_id: "decision-1" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    );
+
+    expect(payload.ok).toBe(true);
+    expect(payload.decision.run_id).toBe("run-1");
+  });
+
   it("requires run_id when a decision id appears in multiple runs", async () => {
     const recorded = [
       makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-shared" }),

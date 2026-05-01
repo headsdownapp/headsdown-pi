@@ -3837,9 +3837,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       runId: safeRunId,
     });
     const matches = entries.filter((entry) => entry.decision_id === safeDecisionId);
+    const matchingRunIds = [...new Set(matches.map((entry) => entry.run_id))];
 
-    if (!safeRunId && matches.length > 1) {
-      return { entry: null, ambiguousRunIds: matches.map((entry) => entry.run_id) };
+    if (!safeRunId && matchingRunIds.length > 1) {
+      return { entry: null, ambiguousRunIds: matchingRunIds };
     }
 
     return { entry: matches[0] ?? null, ambiguousRunIds: [] };
