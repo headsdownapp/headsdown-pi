@@ -16,6 +16,7 @@ Use these tools directly:
 - `headsdown_presets`: list or apply saved availability presets
 - `headsdown_propose`: submit a task proposal for approved/deferred verdict
 - `headsdown_digest`: review notifications/messages that arrived during focus windows
+- `headsdown_deferred`: list, view, and resolve deferred decisions from recent autopilot runs using derived facts only
 - `headsdown_grants`: list/create/revoke delegation grants
 - `headsdown_override`: get/set/clear temporary availability override
 - `headsdown_continuation`: save/load/check/clear resumable continuation artifacts
@@ -64,7 +65,7 @@ When the user declares a session time box with `/headsdown box <duration>`, trea
 
 If realized edits exceed the approved estimate, pause and re-propose with updated `estimated_files`, `estimated_minutes`, and `scope_summary`. Do not silently overrun approved scope.
 
-## Digest Triage
+## Digest And Deferred Decision Triage
 
 When a session starts with pending digest summaries, or when the user asks what they missed:
 
@@ -72,6 +73,13 @@ When a session starts with pending digest summaries, or when the user asks what 
 2. Summarize by source and actor.
 3. Prioritize items related to current work.
 4. Offer to convert actionable items into proposals.
+
+When wake-up guidance says deferred decisions are queued:
+
+1. Call `headsdown_deferred` with `action=list` before continuing resumed work.
+2. Review only the derived fields returned by the tool.
+3. Use `action=view` for a specific decision when needed.
+4. Resolve decisions with `approve`, `override`, `refine`, or `dismiss` once the next action is clear.
 
 ## Continuation And Session Boundaries
 

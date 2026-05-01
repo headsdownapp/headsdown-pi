@@ -136,7 +136,7 @@ HeadsDown is designed to answer routing questions without seeing the work itself
 
 **Received by hosted features:** current HeadsDown guidance, schedule context, approval or deferral decisions, missed-update summaries, and continuation context.
 
-**Stored locally:** API credentials when authenticated, optional continuation artifact (`~/.config/headsdown/continuation.json`), and any repo-local Referee contract you create.
+**Stored locally:** API credentials when authenticated, optional continuation artifact (`~/.config/headsdown/continuation.json`), wake-up digest state (`~/.config/headsdown/autopilot-state.json`), and any repo-local Referee contract you create.
 
 **Not sent by default:** prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, analytics, or third-party requests.
 
@@ -207,6 +207,8 @@ The extension records HeadsDown continuity snapshots on:
 
 It also auto-saves continuation artifacts for unfinished approved work when switching or ending sessions.
 
+When Pi defers decisions during offline or limited modes, the wake-up digest can surface unresolved decisions the next time you are available. It shows derived facts only and prompts Pi to use `headsdown_deferred` before continuing resumed work.
+
 Auto-thinking is optional and off by default. When enabled, the extension can choose a Pi thinking level before each turn using the current prompt, active HeadsDown guidance, and approved proposal state already available locally. It does not make extra telemetry calls.
 
 When `showStatus` is enabled, the footer shows the current automatic decision, for example `thinking:auto high` or `thinking:manual medium`.
@@ -222,6 +224,7 @@ Registered tools:
 - `headsdown_propose` submits a task proposal for approval or deferral
 - `headsdown_referee` creates a local-only run verification receipt from a repo-local contract
 - `headsdown_digest` reviews grouped summaries of updates received while you were not taking interruptions
+- `headsdown_deferred` lists, views, and resolves deferred decisions from recent autopilot runs using derived facts only
 - `headsdown_presets` lists or applies saved presets
 - `headsdown_grants` manages delegation grants
 - `headsdown_override` manages temporary overrides
@@ -246,6 +249,10 @@ Registered tools:
   "autopilotDeferral": {
     "enabled": true,
     "defaultUrgencyBucket": "normal"
+  },
+  "wakeUpDigest": {
+    "enabled": true,
+    "maxEntriesShown": 20
   }
 }
 ```
@@ -262,6 +269,8 @@ Registered tools:
 | `autopilotDeferral.enabled`              | `true`                     | Records metadata-only deferred-decision events when finalized assistant messages match a human-input pattern during offline and limited modes                                                                                                                  |
 | `autopilotDeferral.defaultUrgencyBucket` | `"normal"`                 | Sets the urgency bucket for recorded deferrals. Valid values are `low`, `normal`, and `high`                                                                                                                                                                   |
 | `autopilotDeferral.patterns`             | built-in defaults          | Optional regex patterns that replace the built-in detection set. Invalid regexes are ignored, and an explicitly empty or fully invalid list disables detection. Defaults include explicit `[DEFER]` and `[NEEDS_USER]` markers plus common human-input prompts |
+| `wakeUpDigest.enabled`                   | `true`                     | Surfaces unresolved deferred decisions when availability returns to online or busy mode                                                                                                                                                                        |
+| `wakeUpDigest.maxEntriesShown`           | `20`                       | Caps deferred-decision entries shown by wake-up digest guidance and the `headsdown_deferred` tool. Valid values are 1 through 50                                                                                                                               |
 
 ## Skill behavior
 
@@ -272,7 +281,7 @@ Registered tools:
 - slice work by the time available
 - keep runs moving when the user is away or cannot answer
 - ask for a new plan when work grows
-- triage missed-update summaries
+- triage missed-update summaries and deferred decisions
 - persist and resume continuation artifacts
 - report outcomes for future guidance
 
