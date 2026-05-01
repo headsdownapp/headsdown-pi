@@ -3830,11 +3830,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   async function findDeferredDecisionEntry(
     ctx: ExtensionContext,
-    decisionId: string,
-  ): Promise<DeferredDecisionEntry | null> {
-    const safeDecisionId = validateDeferredToolId(decisionId, "decision_id");
-    const entries = await queryWakeUpDigestEntries(ctx, { excludeSurfaced: false, limit: 200 });
-    return entries.find((entry) => entry.decision_id === safeDecisionId) ?? null;
+    params: HeadsDownDeferredToolParams,
+  ): Promise<{ entry: DeferredDecisionEntry | null; ambiguousRunIds: string[] }> {
+    const safeDecisionId = validateDeferredToolId(params.decision_id, "decision_id");
+    const safeRunId = validateOptionalDeferredToolRunId(params.run_id);
+    const entries = await queryWakeUpDigestEntries(ctx, {
+      excludeSurfaced: false,
+      limit: 200,
+      runId: safeRunId,
+    });
+    const matches = entries.filter((entry) => entry.decision_id === safeDecisionId);
+
+    if (!safeRunId && matches.length > 1) {
+      return { entry: null, ambiguousRunIds: matches.map((entry) => entry.run_id) };
+    }
+
+    return { entry: matches[0] ?? null, ambiguousRunIds: [] };
   }
 
   function resolutionKindForDeferredAction(
@@ -5378,7 +5389,23 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         throw new Error("decision_id is required for view and resolution actions.");
       }
 
-      const entry = await findDeferredDecisionEntry(_ctx, params.decision_id);
+      const lookup = await findDeferredDecisionEntry(_ctx, params);
+      if (lookup.ambiguousRunIds.length > 0) {
+        const payload = {
+          ok: false,
+          ambiguous: true,
+          decision_id: params.decision_id,
+          run_ids: lookup.ambiguousRunIds,
+          message: "decision_id matches multiple runs. Pass run_id to choose one.",
+        };
+        assertPrivacySafeDeferredDecisionOutput(payload);
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          details: payload,
+        };
+      }
+
+      const entry = lookup.entry;
       if (!entry) {
         const payload = { ok: false, notFound: true, decision_id: params.decision_id };
         return {

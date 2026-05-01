@@ -288,6 +288,76 @@ describe("headsdown_deferred tool", () => {
     expect(payload).toEqual({ ok: false, notFound: true, decision_id: "missing" });
   });
 
+  it("requires run_id when a decision id appears in multiple runs", async () => {
+    const recorded = [
+      makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-shared" }),
+      makeEvent({
+        eventType: "deferred_decision.recorded",
+        decisionId: "decision-shared",
+        runId: "run-2",
+      }),
+    ];
+    const resolved: AgentRunEvent[] = [];
+    const reportDeferredDecisionResolved = vi.fn(async (context: any, payload: any) => {
+      resolved.push(
+        makeEvent({
+          eventType: "deferred_decision.resolved",
+          decisionId: payload.decision_id,
+          runId: context.runId,
+          payload,
+        }),
+      );
+      return { ok: true, event: null, error: null };
+    });
+    const client = {
+      withActor: vi.fn(() => client),
+      listAgentRunEvents: vi.fn(
+        async ({ eventType, runId }: { eventType?: string; runId?: string }) => {
+          const source = eventType === "deferred_decision.recorded" ? recorded : resolved;
+          return runId ? source.filter((event) => event.runId === runId) : source;
+        },
+      ),
+      reportDeferredDecisionResolved,
+    };
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { tool } = registerToolHarness();
+
+    const ambiguousPayload = textResult(
+      await tool.execute(
+        "tool-1",
+        { action: "view", decision_id: "decision-shared" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    );
+
+    expect(ambiguousPayload).toEqual({
+      ok: false,
+      ambiguous: true,
+      decision_id: "decision-shared",
+      run_ids: ["run-1", "run-2"],
+      message: "decision_id matches multiple runs. Pass run_id to choose one.",
+    });
+
+    const resolvedPayload = textResult(
+      await tool.execute(
+        "tool-2",
+        { action: "approve", decision_id: "decision-shared", run_id: "run-2" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    );
+
+    expect(resolvedPayload.ok).toBe(true);
+    expect(resolvedPayload.remaining.count).toBe(0);
+    expect(reportDeferredDecisionResolved).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "run-2" }),
+      expect.objectContaining({ decision_id: "decision-shared", resolution_kind: "approved" }),
+    );
+  });
+
   it("requires and writes override action keys", async () => {
     const recorded = [
       makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-1" }),
