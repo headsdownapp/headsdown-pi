@@ -2759,6 +2759,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let lastAutopilotFailureNoticeAt = 0;
   let autopilotProgressVersion = 0;
   let autopilotStuckGeneration = 0;
+  let autopilotSyntheticTurnIndex = 0;
   let lastToolContext: LastToolContextState | null = null;
   const inFlightToolExecutions = new Set<string>();
   const processedAutopilotTurnIndexes = new Set<number>();
@@ -3031,13 +3032,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
-  function normalizeAgentRunEventReportResult(
-    result: unknown,
-    options: { allowVoidSuccess?: boolean } = {},
-  ): { ok: boolean; errorMessage: string | null } {
-    if (result === undefined && options.allowVoidSuccess === true) {
-      return { ok: true, errorMessage: null };
-    }
+  function normalizeAgentRunEventReportResult(result: unknown): {
+    ok: boolean;
+    errorMessage: string | null;
+  } {
     if (!result || typeof result !== "object") {
       return { ok: false, errorMessage: "missing event report response" };
     }
@@ -3053,7 +3051,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   }
 
   async function reportPiAgentRunEventResult(
-    _ctx: ExtensionContext,
     input: Record<string, unknown>,
   ): Promise<{ ok: boolean; errorMessage: string | null }> {
     try {
@@ -3064,7 +3061,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       };
       if (typeof eventClient.reportAgentRunEvent === "function") {
         const result = await eventClient.reportAgentRunEvent(input);
-        return normalizeAgentRunEventReportResult(result, { allowVoidSuccess: true });
+        return normalizeAgentRunEventReportResult(result);
       }
 
       const graphql = getLowLevelGraphQLClient(client);
@@ -3081,29 +3078,25 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function reportPiAgentRunEvent(
-    ctx: ExtensionContext,
-    input: Record<string, unknown>,
-  ): Promise<boolean> {
-    return (await reportPiAgentRunEventResult(ctx, input)).ok;
+  async function reportPiAgentRunEvent(input: Record<string, unknown>): Promise<boolean> {
+    return (await reportPiAgentRunEventResult(input)).ok;
   }
 
   async function reportStartedIfNeeded(ctx: ExtensionContext, proposal: ProposalRecord) {
     const telemetry = getTelemetryForProposal(proposal);
     if (telemetry.startedReported) return;
 
-    const reported = await reportPiAgentRunEvent(ctx, buildStartedEventInput(proposal, telemetry));
+    const reported = await reportPiAgentRunEvent(buildStartedEventInput(proposal, telemetry));
     if (reported) {
       telemetry.startedReported = true;
     }
   }
 
-  async function reportProgress(ctx: ExtensionContext, proposal: ProposalRecord) {
+  async function reportProgress(proposal: ProposalRecord) {
     const telemetry = getTelemetryForProposal(proposal);
     telemetry.sequence += 1;
     const scope = getScopeSnapshot(proposal.id);
     await reportPiAgentRunEvent(
-      ctx,
       buildProgressEventInput(
         telemetry,
         scope.warningSent || telemetry.scopeDriftReported,
@@ -4224,7 +4217,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       if (ctx && proposal) {
         const telemetry = getTelemetryForProposal(proposal);
         telemetry.sequence += 1;
-        await reportPiAgentRunEvent(ctx, buildContinuationSavedEventInput(telemetry, artifact));
+        await reportPiAgentRunEvent(buildContinuationSavedEventInput(telemetry, artifact));
       }
       return true;
     } catch {
@@ -4582,7 +4575,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       telemetry.scopeDriftReported = true;
       telemetry.sequence += 1;
       await reportPiAgentRunEvent(
-        ctx,
         buildScopeDriftEventInput(telemetry, activeProposal.estimatedFiles),
       );
     }
@@ -4867,6 +4859,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   function resetAutopilotRuntimeState(): void {
     autopilotProgressVersion = 0;
+    autopilotSyntheticTurnIndex = 0;
     lastToolContext = null;
     inFlightToolExecutions.clear();
     processedAutopilotTurnIndexes.clear();
@@ -4939,7 +4932,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   }
 
   async function recordAutopilotDeferredDecision(input: {
-    ctx: ExtensionContext;
     telemetry: PiRunTelemetry;
     proposal: ProposalRecord;
     config: AutopilotDeferralConfig;
@@ -4986,7 +4978,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         : undefined,
     });
 
-    let result = await reportPiAgentRunEventResult(input.ctx, eventInput);
+    let result = await reportPiAgentRunEventResult(eventInput);
     if (
       !result.ok &&
       input.config.hostedAutopilotContextEnabled &&
@@ -4995,7 +4987,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const payload = eventInput.payload as Record<string, unknown> | undefined;
       const fallbackPayload = payload ? { ...payload } : payload;
       if (fallbackPayload) delete fallbackPayload.autopilot_context;
-      result = await reportPiAgentRunEventResult(input.ctx, {
+      result = await reportPiAgentRunEventResult({
         ...eventInput,
         payload: fallbackPayload,
       });
@@ -5109,7 +5101,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     if (isDeferredStep) {
       const recorded = await recordAutopilotDeferredDecision({
-        ctx: input.ctx,
         telemetry: getTelemetryForProposal(proposal),
         proposal,
         config: config.autopilotDeferral,
@@ -5180,9 +5171,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
     if (!getLatestApprovedProposal()) return undefined;
 
+    const eventTurnIndex = (event as { turnIndex?: unknown }).turnIndex;
     scheduleAutopilotStuckDetection({
       ctx,
-      turnIndex: (event as { turnIndex?: number }).turnIndex ?? Date.now(),
+      turnIndex:
+        typeof eventTurnIndex === "number" ? eventTurnIndex : ++autopilotSyntheticTurnIndex,
       detection,
       config: config.autopilotDeferral,
     });
@@ -5302,7 +5295,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       if (activeProposal && progressState) {
         const telemetry = getTelemetryForProposal(activeProposal);
         telemetry.progressState = progressState;
-        await reportProgress(ctx, activeProposal);
+        await reportProgress(activeProposal);
       }
     }
 
@@ -5328,7 +5321,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     telemetry.filesModified.add(path);
 
     await maybeWarnScopeDrift(ctx, activeProposal, scope);
-    await reportProgress(ctx, activeProposal);
+    await reportProgress(activeProposal);
 
     return undefined;
   });
@@ -5776,7 +5769,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         const nextWindowStartsAt = snapshot?.schedule?.nextTransitionAt ?? null;
         if (nextWindowStartsAt) {
           await reportPiAgentRunEvent(
-            _ctx,
             buildQueuedForMorningEventInput(proposalRecord, nextWindowStartsAt),
           );
         }
@@ -6330,7 +6322,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             clearContinuation: clearContinuationArtifact,
             reportResumed: async () => {
               const eventInput = buildResumedEventInput(artifact);
-              if (eventInput) await reportPiAgentRunEvent(_ctx, eventInput);
+              if (eventInput) await reportPiAgentRunEvent(eventInput);
             },
           });
           consumed = resumeResult.consumed;
@@ -6389,7 +6381,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       if (activeProposal) {
         const telemetry = getTelemetryForProposal(activeProposal);
         telemetry.sequence += 1;
-        await reportPiAgentRunEvent(_ctx, buildContinuationSavedEventInput(telemetry, artifact));
+        await reportPiAgentRunEvent(buildContinuationSavedEventInput(telemetry, artifact));
       }
 
       return {
@@ -6484,7 +6476,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           telemetry.sequence += 1;
           if (!telemetry.completedReported) {
             await reportPiAgentRunEvent(
-              _ctx,
               buildTerminalEventInput(
                 telemetry,
                 params.outcome,
@@ -6496,7 +6487,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           }
           telemetry.sequence += 1;
           await reportPiAgentRunEvent(
-            _ctx,
             buildSteeringOutcomeEventInput(
               telemetry,
               params.outcome,

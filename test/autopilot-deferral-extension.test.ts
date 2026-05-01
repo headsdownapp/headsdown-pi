@@ -94,6 +94,7 @@ function makeClient(
     listDigestSummaries: vi.fn(async () => []),
     reportAgentRunEvent: vi.fn(async (input: Record<string, unknown>) => {
       events.push(input);
+      return { ok: true, event: null, error: null };
     }),
   };
   return client;
@@ -230,6 +231,7 @@ describe("autopilot deferral turn_end hook", () => {
       const payload = input.payload as Record<string, unknown>;
       if (payload.autopilot_context) throw new Error("unsupported field autopilot_context");
       events.push(input);
+      return { ok: true, event: null, error: null };
     });
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
     const { handlers } = registerHeadsDownHarness();
@@ -258,6 +260,7 @@ describe("autopilot deferral turn_end hook", () => {
     client.reportAgentRunEvent.mockImplementationOnce(async (input: Record<string, unknown>) => {
       attemptedDecisionIds.push((input.payload as Record<string, unknown>).decision_id);
       events.push(input);
+      return { ok: true, event: null, error: null };
     });
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
     const { handlers } = registerHeadsDownHarness();
@@ -276,6 +279,33 @@ describe("autopilot deferral turn_end hook", () => {
     const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
     expect((deferrals[0].payload as Record<string, unknown>).autopilot_context).toBeDefined();
     expect(attemptedDecisionIds[1]).toBe(attemptedDecisionIds[0]);
+  });
+
+  it("does not mark malformed telemetry responses as recorded", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("offline", events);
+    client.reportAgentRunEvent.mockImplementationOnce(async () => undefined as any);
+    client.reportAgentRunEvent.mockImplementationOnce(async (input: Record<string, unknown>) => {
+      events.push(input);
+      return { ok: true, event: null, error: null };
+    });
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 1);
+    await expect.poll(() => client.reportAgentRunEvent.mock.calls.length).toBe(1);
+    expect(events).toHaveLength(0);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 2);
+
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
+    const payload = events[0].payload as Record<string, any>;
+    expect(payload.local_session_summary.deferredDecisionCount).toBe(1);
   });
 
   it("uses a conservative local policy when hosted policy lookup fails", async () => {
