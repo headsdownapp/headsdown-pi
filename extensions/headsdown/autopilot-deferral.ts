@@ -4,14 +4,14 @@ import { LOCAL_SESSION_SUMMARY_VERSION, assertLocalSessionSummary } from "@heads
 export type AutopilotDeferralUrgencyBucket = "low" | "normal" | "high";
 
 export interface AutopilotDeferralPattern {
-  key: string;
-  regex: RegExp;
+  readonly key: string;
+  readonly regex: RegExp;
 }
 
 export interface AutopilotDeferralConfig {
-  enabled: boolean;
-  defaultUrgencyBucket: AutopilotDeferralUrgencyBucket;
-  patterns: AutopilotDeferralPattern[];
+  readonly enabled: boolean;
+  readonly defaultUrgencyBucket: AutopilotDeferralUrgencyBucket;
+  readonly patterns: ReadonlyArray<AutopilotDeferralPattern>;
 }
 
 export interface LocalSessionSummaryInput {
@@ -76,7 +76,9 @@ function normalizeUrgencyBucket(value: unknown): AutopilotDeferralUrgencyBucket 
 
 export function normalizeAutopilotDeferralConfig(value: unknown): AutopilotDeferralConfig {
   const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const rawPatterns = Array.isArray(raw.patterns) ? raw.patterns : [];
+  const rawPatternValue = raw.patterns;
+  const hasCustomPatterns = Array.isArray(rawPatternValue);
+  const rawPatterns: unknown[] = hasCustomPatterns ? rawPatternValue : [];
   const customPatterns = rawPatterns
     .map((entry, index) => {
       if (typeof entry === "string") return compilePattern(`custom_${index + 1}`, entry);
@@ -95,9 +97,9 @@ export function normalizeAutopilotDeferralConfig(value: unknown): AutopilotDefer
   ).filter((pattern): pattern is AutopilotDeferralPattern => pattern !== null);
 
   return {
-    enabled: raw.enabled === false ? false : true,
+    enabled: raw.enabled !== false,
     defaultUrgencyBucket: normalizeUrgencyBucket(raw.defaultUrgencyBucket),
-    patterns: customPatterns.length > 0 ? customPatterns : defaultPatterns,
+    patterns: hasCustomPatterns ? customPatterns : defaultPatterns,
   };
 }
 
@@ -107,7 +109,7 @@ function stripCodeFences(text: string): string {
 
 export function detectDeferral(
   text: string,
-  patterns: AutopilotDeferralPattern[],
+  patterns: ReadonlyArray<AutopilotDeferralPattern>,
 ): { matched: boolean; matchedPatternKey: string | null } {
   const searchableText = stripCodeFences(text).trim();
   if (!searchableText) return { matched: false, matchedPatternKey: null };

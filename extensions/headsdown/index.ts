@@ -78,6 +78,7 @@ import {
   pickDecisionKind,
   pickUrgencyBucket,
   type AutopilotDeferralConfig,
+  type AutopilotDeferralUrgencyBucket,
 } from "./autopilot-deferral.js";
 
 // === State ===
@@ -1742,9 +1743,9 @@ function buildDeferredDecisionEventInput(input: {
   telemetry: PiRunTelemetry;
   proposal: ProposalRecord | null;
   decisionId?: string;
-  decisionKind: string;
-  decisionCategory: string;
-  urgencyBucket: string;
+  decisionKind: ReturnType<typeof pickDecisionKind>;
+  decisionCategory: ReturnType<typeof pickDecisionCategory>;
+  urgencyBucket: AutopilotDeferralUrgencyBucket;
   flaggedForReview: boolean;
   localSessionSummary: LocalSessionSummary;
 }): Record<string, unknown> {
@@ -2904,6 +2905,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     };
   }
 
+  function isMissingFileError(error: unknown): boolean {
+    return !!error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT";
+  }
+
   async function loadConfig(): Promise<HeadsDownPiConfig> {
     if (!cachedConfig) {
       const store = new ConfigStore();
@@ -2911,6 +2916,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       let rawAutoThinking: unknown;
       let rawAutopilotDeferral: unknown;
       let rawLocalRefereeOutcomeSharing: unknown;
+      let configReadFailed = false;
 
       try {
         const rawConfig = JSON.parse(await readFile(store.filePath, "utf-8")) as Record<
@@ -2920,7 +2926,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         rawAutoThinking = rawConfig.autoThinking;
         rawAutopilotDeferral = rawConfig.autopilotDeferral;
         rawLocalRefereeOutcomeSharing = rawConfig.localRefereeOutcomeSharing;
-      } catch {
+      } catch (error) {
+        configReadFailed = !isMissingFileError(error);
         rawAutoThinking = undefined;
         rawAutopilotDeferral = undefined;
         rawLocalRefereeOutcomeSharing = undefined;
@@ -2929,7 +2936,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       cachedConfig = {
         ...baseConfig,
         autoThinking: normalizeAutoThinkingConfig(rawAutoThinking),
-        autopilotDeferral: normalizeAutopilotDeferralConfig(rawAutopilotDeferral),
+        autopilotDeferral: normalizeAutopilotDeferralConfig(
+          configReadFailed ? { enabled: false } : rawAutopilotDeferral,
+        ),
         localRefereeOutcomeSharing: normalizeLocalRefereeOutcomeSharingState(
           rawLocalRefereeOutcomeSharing,
         ),
@@ -3109,9 +3118,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   async function refreshAvailability(
     ctx: ExtensionContext,
-    options: { force?: boolean } = {},
+    options: { force?: boolean; requireFresh?: boolean } = {},
   ): Promise<AvailabilitySnapshot | null> {
     const force = options.force === true;
+    const requireFresh = options.requireFresh === true;
     const now = Date.now();
 
     if (
@@ -3151,7 +3161,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
       return availabilitySnapshot;
     } catch {
-      return availabilitySnapshot;
+      return requireFresh ? null : availabilitySnapshot;
     }
   }
 
@@ -4182,7 +4192,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     const config = await loadConfig();
 
-    const snapshot = await refreshAvailability(ctx);
+    const snapshot = await refreshAvailability(ctx, { force: true, requireFresh: true });
     const detection = shouldRecordAutopilotDeferral({
       message,
       mode: snapshot?.contract?.mode,

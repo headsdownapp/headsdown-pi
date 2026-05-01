@@ -75,7 +75,29 @@ describe("autopilot deferral detection", () => {
       matched: true,
       matchedPatternKey: "custom_marker",
     });
+    expect(detectDeferral("Should I pick a default?", config.patterns)).toEqual({
+      matched: false,
+      matchedPatternKey: null,
+    });
     expect(pickUrgencyBucket(config)).toBe("high");
+  });
+
+  it("treats an explicitly empty or invalid custom pattern set as no detection", () => {
+    const emptyConfig = normalizeAutopilotDeferralConfig({ patterns: [] });
+    const invalidConfig = normalizeAutopilotDeferralConfig({
+      patterns: [{ key: "broken", pattern: "[" }],
+    });
+
+    expect(emptyConfig.patterns).toEqual([]);
+    expect(invalidConfig.patterns).toEqual([]);
+    expect(detectDeferral("Should I pick a default?", emptyConfig.patterns)).toEqual({
+      matched: false,
+      matchedPatternKey: null,
+    });
+    expect(detectDeferral("Please confirm the default.", invalidConfig.patterns)).toEqual({
+      matched: false,
+      matchedPatternKey: null,
+    });
   });
 
   it("builds validated local session summaries from derived counters only", () => {

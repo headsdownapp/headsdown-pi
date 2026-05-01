@@ -1,4 +1,7 @@
-import { HeadsDownClient } from "@headsdown/sdk";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ConfigStore, HeadsDownClient } from "@headsdown/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
 
@@ -57,6 +60,14 @@ function makeContext() {
   };
 }
 
+async function useConfigFile(config: Record<string, unknown> | string) {
+  const dir = await mkdtemp(join(tmpdir(), "headsdown-pi-config-"));
+  const path = join(dir, "config.json");
+  await writeFile(path, typeof config === "string" ? config : JSON.stringify(config), "utf-8");
+  vi.spyOn(ConfigStore.prototype, "filePath", "get").mockReturnValue(path);
+  tempDirs.push(dir);
+}
+
 function makeClient(mode: "online" | "limited" | "offline", events: Record<string, unknown>[]) {
   const client = {
     withActor: vi.fn(() => client),
@@ -82,9 +93,12 @@ async function startSession(
   await sessionStart({ reason: "new" }, ctx);
 }
 
-afterEach(() => {
+const tempDirs: string[] = [];
+
+afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 describe("autopilot deferral message_end hook", () => {
@@ -125,7 +139,12 @@ describe("autopilot deferral message_end hook", () => {
 
     await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
     await messageEnd(
-      { message: { role: "assistant", content: "Should I update the tests?" } },
+      {
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Should I update the tests?" }],
+        },
+      },
       ctx,
     );
     await messageEnd(
@@ -158,6 +177,92 @@ describe("autopilot deferral message_end hook", () => {
     expect(serialized).not.toContain("Please confirm");
     expect(serialized).not.toContain("README.md");
     expect(serialized).not.toContain(process.cwd());
+  });
+
+  it("does not record non-text structured assistant messages", async () => {
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("offline", events) as any,
+    );
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const messageEnd = handlers.get("message_end")?.at(0);
+    if (!messageEnd) throw new Error("message_end handler was not registered");
+
+    await messageEnd(
+      { message: { role: "assistant", content: [{ type: "image", source: "redacted" }] } },
+      ctx,
+    );
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+  });
+
+  it("does not record events when autopilot deferral is disabled through config", async () => {
+    await useConfigFile({ autopilotDeferral: { enabled: false } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("offline", events) as any,
+    );
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const messageEnd = handlers.get("message_end")?.at(0);
+    if (!messageEnd) throw new Error("message_end handler was not registered");
+
+    await messageEnd(
+      { message: { role: "assistant", content: "Do you want me to continue?" } },
+      ctx,
+    );
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+  });
+
+  it("does not fail open when config is malformed", async () => {
+    await useConfigFile("{");
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("offline", events) as any,
+    );
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const messageEnd = handlers.get("message_end")?.at(0);
+    if (!messageEnd) throw new Error("message_end handler was not registered");
+
+    await messageEnd(
+      { message: { role: "assistant", content: "Do you want me to continue?" } },
+      ctx,
+    );
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+  });
+
+  it("does not record events when fresh availability cannot be verified", async () => {
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("offline", events);
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    client.getAvailability.mockRejectedValueOnce(new Error("network down"));
+    const messageEnd = handlers.get("message_end")?.at(0);
+    if (!messageEnd) throw new Error("message_end handler was not registered");
+
+    await messageEnd(
+      { message: { role: "assistant", content: "Do you want me to continue?" } },
+      ctx,
+    );
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
   });
 
   it("does not record events outside autopilot mode", async () => {

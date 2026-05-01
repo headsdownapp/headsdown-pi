@@ -387,9 +387,6 @@ describe("Pi agent run event payloads", () => {
         },
       },
     });
-    expect(String((event.payload as Record<string, unknown>).decision_id)).toMatch(
-      /^decision_[a-f0-9]{32}$/,
-    );
     expect(graphqlInput).toMatchObject({
       schemaVersion: 1,
       privacyMode: "METADATA_ONLY",
