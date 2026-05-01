@@ -667,7 +667,9 @@ function normalizeEscalationStep(value: unknown): ClassifierEscalationStep | nul
 function adaptAutopilotPolicy(value: AutopilotPolicyPayload | null | undefined): ClassifierPolicy {
   const sandboxPreference = normalizeEnumKey(value?.sandboxPreference);
   const adaptedSandboxPreference =
-    sandboxPreference === "required" || sandboxPreference === "preferred"
+    sandboxPreference === "required" ||
+    sandboxPreference === "preferred" ||
+    sandboxPreference === "avoid"
       ? sandboxPreference
       : sandboxPreference === "disabled"
         ? "avoid"
@@ -1714,14 +1716,18 @@ function basePiAgentRunEvent(context: PiAgentRunEventContext): Record<string, un
   });
 }
 
-function buildStartedEventInput(proposal: ProposalRecord): Record<string, unknown> {
-  const runId = runIdForProposal(proposal.id);
+function buildStartedEventInput(
+  proposal: ProposalRecord,
+  telemetry?: Pick<PiRunTelemetry, "runId" | "sequence">,
+): Record<string, unknown> {
+  const runId = telemetry?.runId ?? runIdForProposal(proposal.id);
+  const sequence = telemetry?.sequence ?? 1;
   return {
     ...basePiAgentRunEvent({
       runId,
       proposalId: proposal.id,
-      sequence: 1,
-      idempotencyKey: `${runId}:agent_run.started:1`,
+      sequence,
+      idempotencyKey: `${runId}:agent_run.started:${sequence}`,
     }),
     eventType: "agent_run.started",
     payload: {
@@ -2749,6 +2755,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let lastObservedModeInProcess: Mode | null = null;
   let wakeUpDigestCache: { summary: WakeUpDigestSummary; fetchedAt: number } | null = null;
   let autopilotProgressVersion = 0;
+  let autopilotStuckGeneration = 0;
   let lastToolContext: LastToolContextState | null = null;
   const inFlightToolExecutions = new Set<string>();
   const processedAutopilotTurnIndexes = new Set<number>();
@@ -3051,9 +3058,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   async function reportStartedIfNeeded(ctx: ExtensionContext, proposal: ProposalRecord) {
     const telemetry = getTelemetryForProposal(proposal);
     if (telemetry.startedReported) return;
-    telemetry.startedReported = true;
-    telemetry.sequence += 1;
-    await reportPiAgentRunEvent(ctx, buildStartedEventInput(proposal));
+
+    const reported = await reportPiAgentRunEvent(ctx, buildStartedEventInput(proposal, telemetry));
+    if (reported) {
+      telemetry.startedReported = true;
+    }
   }
 
   async function reportProgress(ctx: ExtensionContext, proposal: ProposalRecord) {
@@ -4558,6 +4567,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     lastObservedModeInProcess = null;
     wakeUpDigestCache = null;
     autoQueuedRunIds = new Set<string>();
+    resetAutopilotRuntimeState();
     attentionWindowDedupe.clear();
     lastAttentionWindowPollAt = 0;
     lastAttentionWindowPollFailureNoticeAt = 0;
@@ -4587,6 +4597,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     restoreProposalState(ctx);
     restoreTimeBoxState(ctx);
+    resetAutopilotRuntimeState();
     await updateStatusUI(ctx);
     updateTimeBoxUI(ctx, activeWrapUpDeadlineAt(availabilitySnapshot?.schedule?.wrapUpGuidance));
   });
@@ -4812,10 +4823,20 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   });
 
   function resetAutopilotStuckState(): void {
+    autopilotStuckGeneration += 1;
     autopilotStuckState.signature = null;
     autopilotStuckState.consecutiveDetections = 0;
     autopilotStuckState.pendingTurnIndex = null;
     autopilotStuckState.attemptedSteps = [];
+  }
+
+  function resetAutopilotRuntimeState(): void {
+    autopilotProgressVersion = 0;
+    lastToolContext = null;
+    inFlightToolExecutions.clear();
+    processedAutopilotTurnIndexes.clear();
+    autopilotStuckState.lastNudgedAt = 0;
+    resetAutopilotStuckState();
   }
 
   function markAutopilotProgress(): void {
@@ -4873,16 +4894,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     classifiedAction: ClassifiedAction;
     policy: ClassifierPolicy;
     capabilities: IntegrationCapabilities;
-  }): Promise<void> {
-    input.telemetry.deferredDecisionsCount += 1;
-    input.telemetry.sequence += 1;
+  }): Promise<boolean> {
+    const nextTelemetry = {
+      ...input.telemetry,
+      sequence: input.telemetry.sequence + 1,
+      deferredDecisionsCount: input.telemetry.deferredDecisionsCount + 1,
+    };
 
     const localSessionSummary = buildLocalSessionSummary({
-      runId: input.telemetry.runId,
+      runId: nextTelemetry.runId,
       approvedProposalId: input.proposal.id,
-      toolCallCount: input.telemetry.toolCallsCount,
-      fileChangeCount: input.telemetry.filesModified.size,
-      deferredDecisionCount: input.telemetry.deferredDecisionsCount,
+      toolCallCount: nextTelemetry.toolCallsCount,
+      fileChangeCount: nextTelemetry.filesModified.size,
+      deferredDecisionCount: nextTelemetry.deferredDecisionsCount,
       continuationArtifactAvailable: await continuationExists(),
       validationLocallyPassed: false,
       now: new Date(),
@@ -4890,7 +4914,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     const classifierDecisionId = `decision_${randomBytes(16).toString("hex")}`;
     const eventInput = buildDeferredDecisionEventInput({
-      telemetry: input.telemetry,
+      telemetry: nextTelemetry,
       proposal: input.proposal,
       decisionKind: pickDecisionKind(),
       decisionCategory: pickDecisionCategory(input.questionCategory),
@@ -4908,23 +4932,32 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         : undefined,
     });
 
-    const reported = await reportPiAgentRunEvent(input.ctx, eventInput);
+    let reported = await reportPiAgentRunEvent(input.ctx, eventInput);
     if (!reported && input.config.hostedAutopilotContextEnabled) {
       const payload = eventInput.payload as Record<string, unknown> | undefined;
-      await reportPiAgentRunEvent(input.ctx, {
+      reported = await reportPiAgentRunEvent(input.ctx, {
         ...eventInput,
         payload: payload
           ? stripUndefinedValues({ ...payload, autopilot_context: undefined })
           : payload,
       });
     }
+
+    if (reported) {
+      input.telemetry.deferredDecisionsCount = nextTelemetry.deferredDecisionsCount;
+      input.telemetry.sequence = nextTelemetry.sequence;
+    }
+
+    return reported;
   }
 
   async function handleAutopilotStuckDetection(input: {
     ctx: ExtensionContext;
     detection: AutopilotDeferralDetection;
     progressVersionAtSchedule: number;
+    generationAtSchedule: number;
   }): Promise<void> {
+    if (autopilotStuckGeneration !== input.generationAtSchedule) return;
     if (autopilotProgressVersion !== input.progressVersionAtSchedule) return;
     if (inFlightToolExecutions.size > 0) return;
 
@@ -4942,9 +4975,17 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     const client = await getClient();
-    const policy = client
-      ? await getAutopilotPolicy(client, mode)
-      : adaptAutopilotPolicy({ classifierVersion: AUTOPILOT_CLASSIFIER_VERSION, latitude: mode });
+    let policy = adaptAutopilotPolicy({
+      classifierVersion: AUTOPILOT_CLASSIFIER_VERSION,
+      latitude: mode,
+    });
+    if (client) {
+      try {
+        policy = await getAutopilotPolicy(client, mode);
+      } catch {
+        // Policy lookup failures must not make the anti-stuck path disappear. Fall back to the conservative local policy.
+      }
+    }
     const questionCategory = questionCategoryForPattern(input.detection.matchedPatternKey);
     const actionShape = buildInteractionAskUserActionShape({
       questionCategory,
@@ -4961,16 +5002,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       autopilotStuckState.attemptedSteps = [];
     }
 
-    autopilotStuckState.consecutiveDetections = Math.min(
-      autopilotStuckState.consecutiveDetections + 1,
-      config.autopilotDeferral.maxConsecutiveNudges,
-    );
+    autopilotStuckState.consecutiveDetections += 1;
 
     const stepIndex = Math.min(
       autopilotStuckState.consecutiveDetections - 1,
       escalation.steps.length - 1,
     );
-    const step = escalation.steps[stepIndex] ?? "defer_for_human_review";
+    const selectedStep = escalation.steps[stepIndex] ?? "defer_for_human_review";
+    const reachedNudgeLimit =
+      autopilotStuckState.consecutiveDetections > config.autopilotDeferral.maxConsecutiveNudges;
+    const step =
+      reachedNudgeLimit && !selectedStep.startsWith("defer_")
+        ? "defer_for_human_review"
+        : selectedStep;
     const outcome: AutopilotEscalationOutcome = step.startsWith("defer_")
       ? "deferred"
       : step === "try_in_sandbox"
@@ -5002,7 +5046,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     if (step.startsWith("defer_")) {
-      await recordAutopilotDeferredDecision({
+      const recorded = await recordAutopilotDeferredDecision({
         ctx: input.ctx,
         telemetry: getTelemetryForProposal(proposal),
         proposal,
@@ -5012,7 +5056,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         policy,
         capabilities,
       });
-      resetAutopilotStuckState();
+      if (recorded) resetAutopilotStuckState();
     }
   }
 
@@ -5031,12 +5075,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     processedAutopilotTurnIndexes.add(input.turnIndex);
     autopilotStuckState.pendingTurnIndex = input.turnIndex;
     const progressVersionAtSchedule = autopilotProgressVersion;
+    const generationAtSchedule = autopilotStuckGeneration;
 
     setTimeout(() => {
       void handleAutopilotStuckDetection({
         ctx: input.ctx,
         detection: input.detection,
         progressVersionAtSchedule,
+        generationAtSchedule,
       })
         .catch(() => {
           // Anti-stuck nudges must fail closed and never interrupt the active run.

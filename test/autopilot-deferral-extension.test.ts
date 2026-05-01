@@ -242,6 +242,52 @@ describe("autopilot deferral turn_end hook", () => {
     expect((deferrals[0].payload as Record<string, unknown>).local_session_summary).toBeDefined();
   });
 
+  it("uses a conservative local policy when hosted policy lookup fails", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("offline", events);
+    client.graphql.request.mockRejectedValue(new Error("policy unavailable"));
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.");
+
+    const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
+    expect(deferrals).toHaveLength(1);
+    expect((deferrals[0].payload as Record<string, any>).autopilot_context).toMatchObject({
+      latitude_at_decision: "cautious",
+    });
+  });
+
+  it("forces deferral after the configured nudge limit instead of looping on the first step", async () => {
+    await useConfigFile({
+      autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0, maxConsecutiveNudges: 1 },
+    });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events, {
+        escalationStrategy: ["TRY_ALTERNATIVE", "TRY_IN_SANDBOX", "DEFER_FOR_HUMAN_REVIEW"],
+      }) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Would you like me to update tests too?", 1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+
+    await fireTurnEnd(handlers, ctx, "Would you like me to update tests too?", 2);
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      1,
+    );
+  });
+
   it("does not record non-text structured assistant messages", async () => {
     await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
     const events: Record<string, unknown>[] = [];
@@ -342,6 +388,67 @@ describe("autopilot deferral turn_end hook", () => {
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
     );
+  });
+
+  it("cancels a scheduled nudge when the next assistant turn is no longer stuck", async () => {
+    vi.useFakeTimers();
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 50, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const turnEnd = handlers.get("turn_end")?.at(0);
+    if (!turnEnd) throw new Error("turn_end handler was not registered");
+
+    await turnEnd(
+      {
+        turnIndex: 1,
+        message: { role: "assistant", content: "Should I keep going?" },
+        toolResults: [],
+      },
+      ctx,
+    );
+    await turnEnd(
+      {
+        turnIndex: 2,
+        message: { role: "assistant", content: "I found the answer and will continue." },
+        toolResults: [],
+      },
+      ctx,
+    );
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+  });
+
+  it("resets autopilot turn idempotency and in-flight state on a new session", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const toolStart = handlers.get("tool_execution_start")?.at(0);
+    if (!toolStart) throw new Error("tool_execution_start handler was not registered");
+
+    await fireTurnEnd(handlers, ctx, "Should I keep going?", 1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    await toolStart({ toolCallId: "leaked-tool", toolName: "read" }, ctx);
+    await startSession(handlers, ctx);
+    pi.sendMessage.mockClear();
+
+    await fireTurnEnd(handlers, ctx, "Should I keep going?", 1);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("does not nudge when a turn produced tool results", async () => {
