@@ -60,6 +60,7 @@ describe("Pi agent run event payloads", () => {
       startedReported: true,
       scopeDriftReported: false,
       completedReported: false,
+      deferredDecisionsCount: 0,
     };
 
     const progress = __internal.buildProgressEventInput(telemetry, false, 2, 20);
@@ -136,6 +137,7 @@ describe("Pi agent run event payloads", () => {
       startedReported: true,
       scopeDriftReported: false,
       completedReported: false,
+      deferredDecisionsCount: 0,
     };
 
     const progress = __internal.buildProgressEventInput(telemetry, false, 2, 20);
@@ -176,6 +178,7 @@ describe("Pi agent run event payloads", () => {
       startedReported: true,
       scopeDriftReported: false,
       completedReported: false,
+      deferredDecisionsCount: 0,
     };
 
     const withinEstimate = __internal.buildProgressEventInput(telemetry, false, 3, 20);
@@ -257,6 +260,7 @@ describe("Pi agent run event payloads", () => {
       startedReported: true,
       scopeDriftReported: true,
       completedReported: false,
+      deferredDecisionsCount: 0,
     };
     const artifact = {
       branch: "feature/secret-branch",
@@ -319,6 +323,80 @@ describe("Pi agent run event payloads", () => {
     expect(serialized).not.toContain("secret-branch");
     expect(serialized).not.toContain("prompt details");
     expect(serialized).not.toContain("github.com");
+  });
+
+  it("builds deferred-decision events with metadata-only local session summaries", () => {
+    const telemetry = {
+      runId: __internal.runIdForProposal("proposal-1"),
+      proposalId: "proposal-1",
+      startedAt: Date.now() - 30_000,
+      sequence: 5,
+      toolCallsCount: 5,
+      toolReadCount: 1,
+      toolWriteCount: 2,
+      toolExternalCount: 1,
+      failureCount: 0,
+      retryCount: 0,
+      redirectCount: 0,
+      filesRead: new Set<string>(),
+      filesModified: new Set(["/private/repo/src/auth.ts"]),
+      progressState: "working" as const,
+      startedReported: true,
+      scopeDriftReported: false,
+      completedReported: false,
+      deferredDecisionsCount: 1,
+    };
+    const localSessionSummary = __internal.buildLocalSessionSummary({
+      runId: telemetry.runId,
+      approvedProposalId: proposal.id,
+      toolCallCount: telemetry.toolCallsCount,
+      fileChangeCount: telemetry.filesModified.size,
+      deferredDecisionCount: telemetry.deferredDecisionsCount,
+      continuationArtifactAvailable: false,
+      validationLocallyPassed: false,
+      now: new Date("2026-04-28T10:00:00.000Z"),
+    });
+
+    const event = __internal.buildDeferredDecisionEventInput({
+      telemetry,
+      proposal,
+      decisionId: "decision_0123456789abcdef0123456789abcdef",
+      decisionKind: "would_have_asked",
+      decisionCategory: "unknown",
+      urgencyBucket: "normal",
+      flaggedForReview: true,
+      localSessionSummary,
+    });
+    const graphqlInput = __internal.serializeAgentRunEventForGraphQL(event);
+    const serialized = stringify({ event, graphqlInput });
+
+    expect(event).toMatchObject({
+      eventType: "deferred_decision.recorded",
+      idempotencyKey: `${telemetry.runId}:deferred_decision.recorded:decision_0123456789abcdef0123456789abcdef`,
+      payload: {
+        decision_id: "decision_0123456789abcdef0123456789abcdef",
+        decision_kind: "would_have_asked",
+        decision_category: "unknown",
+        urgency_bucket: "normal",
+        flagged_for_review: true,
+        proposal_id: "proposal-1",
+        local_session_summary: {
+          version: 1,
+          sessionId: "run_proposal-1",
+          deferredDecisionCount: 1,
+        },
+      },
+    });
+    expect(graphqlInput).toMatchObject({
+      schemaVersion: 1,
+      privacyMode: "METADATA_ONLY",
+      eventType: "deferred_decision.recorded",
+    });
+    expect(serialized).not.toContain("Should we expose raw prompt?");
+    expect(serialized).not.toContain("/private/repo");
+    expect(serialized).not.toContain("auth.ts");
+    expect(serialized).not.toContain("github.com");
+    expect(serialized).not.toContain("feature/secret-branch");
   });
 
   it("maps Pi task outcomes to taxonomy outcome values", () => {

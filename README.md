@@ -186,11 +186,11 @@ HeadsDown can warn or block file-changing tool calls through Pi's `tool_call` ho
 
 The trust level controls how strict HeadsDown should be before Pi changes files:
 
-| | online | busy | busy+locked | limited | offline |
-|---|---|---|---|---|---|
-| **advisory** (default) | allow | warn | warn | warn | warn |
-| **active** | allow | allow | block | allow | block (no proposal) |
-| **guarded** | allow | block (no proposal) | block | block (no proposal) | block (no proposal) |
+|                        | online | busy                | busy+locked | limited             | offline             |
+| ---------------------- | ------ | ------------------- | ----------- | ------------------- | ------------------- |
+| **advisory** (default) | allow  | warn                | warn        | warn                | warn                |
+| **active**             | allow  | allow               | block       | allow               | block (no proposal) |
+| **guarded**            | allow  | block (no proposal) | block       | block (no proposal) | block (no proposal) |
 
 Mode names in this table are HeadsDown technical modes. In plain English: `online` means available, `busy` means available but focused, `locked` means do not interrupt, `limited` means only some work should proceed, and `offline` means you are not available to answer.
 
@@ -242,19 +242,26 @@ Registered tools:
     "respectManualChanges": true,
     "showStatus": true,
     "allowDowngrade": false
+  },
+  "autopilotDeferral": {
+    "enabled": true,
+    "defaultUrgencyBucket": "normal"
   }
 }
 ```
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `trustLevel` | `"advisory"` | Controls how strict HeadsDown should be before Pi changes files. Valid values are `advisory`, `active`, and `guarded` |
-| `sensitivePaths` | built-in defaults + config | Glob patterns that always warn |
-| `autoThinking.enabled` | `false` | Enables HeadsDown-aware automatic Pi thinking-level selection before each turn |
-| `autoThinking.maxLevel` | `"high"` | Caps the automatic selection to control cost and latency. Valid values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh` |
-| `autoThinking.respectManualChanges` | `true` | Preserves a later manual thinking-level change instead of immediately overriding it |
-| `autoThinking.showStatus` | `true` | Shows the automatic or preserved manual thinking decision in the Pi status footer |
-| `autoThinking.allowDowngrade` | `false` | Allows the policy to lower the current thinking level when the task looks simpler |
+| Setting                                  | Default                    | Description                                                                                                                                                                                                                                                    |
+| ---------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trustLevel`                             | `"advisory"`               | Controls how strict HeadsDown should be before Pi changes files. Valid values are `advisory`, `active`, and `guarded`                                                                                                                                          |
+| `sensitivePaths`                         | built-in defaults + config | Glob patterns that always warn                                                                                                                                                                                                                                 |
+| `autoThinking.enabled`                   | `false`                    | Enables HeadsDown-aware automatic Pi thinking-level selection before each turn                                                                                                                                                                                 |
+| `autoThinking.maxLevel`                  | `"high"`                   | Caps the automatic selection to control cost and latency. Valid values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`                                                                                                                              |
+| `autoThinking.respectManualChanges`      | `true`                     | Preserves a later manual thinking-level change instead of immediately overriding it                                                                                                                                                                            |
+| `autoThinking.showStatus`                | `true`                     | Shows the automatic or preserved manual thinking decision in the Pi status footer                                                                                                                                                                              |
+| `autoThinking.allowDowngrade`            | `false`                    | Allows the policy to lower the current thinking level when the task looks simpler                                                                                                                                                                              |
+| `autopilotDeferral.enabled`              | `true`                     | Records metadata-only deferred-decision events when finalized assistant messages match a human-input pattern during offline and limited modes                                                                                                                  |
+| `autopilotDeferral.defaultUrgencyBucket` | `"normal"`                 | Sets the urgency bucket for recorded deferrals. Valid values are `low`, `normal`, and `high`                                                                                                                                                                   |
+| `autopilotDeferral.patterns`             | built-in defaults          | Optional regex patterns that replace the built-in detection set. Invalid regexes are ignored, and an explicitly empty or fully invalid list disables detection. Defaults include explicit `[DEFER]` and `[NEEDS_USER]` markers plus common human-input prompts |
 
 ## Skill behavior
 
