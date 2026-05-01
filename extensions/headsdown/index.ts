@@ -19,17 +19,21 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { StringEnum, Type } from "@mariozechner/pi-ai";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import * as HeadsDownSDK from "@headsdown/sdk";
-import { HeadsDownClient, ConfigStore } from "@headsdown/sdk";
+import { ConfigStore, HeadsDownClient } from "@headsdown/sdk";
 import type {
   ActorContext,
   AgentControlOverview,
   Contract,
+  DeferredDecisionNotesBucket,
+  DeferredDecisionResolutionKind,
+  DeferredDecisionResolvedPayload,
   DelegationGrantFilterInput,
   DelegationGrantInput,
   DelegationGrantPermission,
   DelegationGrantScope,
   HeadsDownConfig,
   LocalSessionSummary,
+  Mode,
   ProposalInput,
   ScheduleResolution,
   Verdict,
@@ -80,6 +84,32 @@ import {
   type AutopilotDeferralConfig,
   type AutopilotDeferralUrgencyBucket,
 } from "./autopilot-deferral.js";
+import {
+  loadAutopilotState,
+  removeDecisionIdsFromSurfaced,
+  saveAutopilotState,
+  type AutopilotState,
+} from "./autopilot-state.js";
+import {
+  assertPrivacySafeDeferredDecisionOutput,
+  detectModeTransition,
+  formatWakeUpDigestInstruction,
+  groupDeferredDecisionEntries,
+  isSafeOpaqueToken,
+  listUnresolvedDeferredDecisionEntries,
+  markWakeUpDigestSurfaced,
+  normalizeDecisionCategoryToken,
+  normalizeUrgencyBucketToken,
+  normalizeWakeUpDigestConfig,
+  shouldTriggerWakeUp,
+  summarizeWakeUpDigest,
+  type DeferredDecisionEntry,
+  type DeferredDecisionEventClient,
+  type DeferredDecisionGroup,
+  type ModeTransition,
+  type WakeUpDigestConfig,
+  type WakeUpDigestSummary,
+} from "./wake-up-digest.js";
 
 // === State ===
 
@@ -107,6 +137,20 @@ interface ProposeToolParams {
   source_ref?: string;
   idempotency_key?: string;
   delivery_mode?: "auto" | "wrap_up" | "full_depth";
+}
+
+type HeadsDownDeferredToolAction = "list" | "view" | "approve" | "override" | "refine" | "dismiss";
+
+interface HeadsDownDeferredToolParams {
+  action?: HeadsDownDeferredToolAction;
+  decision_id?: string;
+  flagged_only?: boolean;
+  run_id?: string;
+  limit?: number;
+  resolved_action_key?: HeadsDownActionKey;
+  refined_urgency_bucket?: string;
+  refined_decision_category?: string;
+  notes_bucket?: DeferredDecisionNotesBucket;
 }
 
 interface LocalRefereeToolParams {
@@ -310,6 +354,7 @@ interface LocalRefereeOutcomeSharingState {
 interface HeadsDownPiConfig extends HeadsDownConfig {
   autoThinking: AutoThinkingConfig;
   autopilotDeferral: AutopilotDeferralConfig;
+  wakeUpDigest: WakeUpDigestConfig;
   localRefereeOutcomeSharing: LocalRefereeOutcomeSharingState;
 }
 
@@ -2565,6 +2610,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   const runTelemetry = new Map<string, PiRunTelemetry>();
   let autoQueuedRunIds = new Set<string>();
   let activeTimeBox: TimeBoxState | null = null;
+  let lastObservedModeInProcess: Mode | null = null;
+  let wakeUpDigestCache: { summary: WakeUpDigestSummary; fetchedAt: number } | null = null;
   const attentionWindowDedupe = new Map<string, string>();
   let lastAttentionWindowPollAt = 0;
   let lastAttentionWindowPollFailureNoticeAt = 0;
@@ -2915,6 +2962,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const baseConfig = await store.load();
       let rawAutoThinking: unknown;
       let rawAutopilotDeferral: unknown;
+      let rawWakeUpDigest: unknown;
       let rawLocalRefereeOutcomeSharing: unknown;
       let configReadFailed = false;
 
@@ -2925,11 +2973,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         >;
         rawAutoThinking = rawConfig.autoThinking;
         rawAutopilotDeferral = rawConfig.autopilotDeferral;
+        rawWakeUpDigest = rawConfig.wakeUpDigest;
         rawLocalRefereeOutcomeSharing = rawConfig.localRefereeOutcomeSharing;
       } catch (error) {
         configReadFailed = !isMissingFileError(error);
         rawAutoThinking = undefined;
         rawAutopilotDeferral = undefined;
+        rawWakeUpDigest = undefined;
         rawLocalRefereeOutcomeSharing = undefined;
       }
 
@@ -2938,6 +2988,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         autoThinking: normalizeAutoThinkingConfig(rawAutoThinking),
         autopilotDeferral: normalizeAutopilotDeferralConfig(
           configReadFailed ? { enabled: false } : rawAutopilotDeferral,
+        ),
+        wakeUpDigest: normalizeWakeUpDigestConfig(
+          configReadFailed ? { enabled: false } : rawWakeUpDigest,
         ),
         localRefereeOutcomeSharing: normalizeLocalRefereeOutcomeSharingState(
           rawLocalRefereeOutcomeSharing,
@@ -3118,10 +3171,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   async function refreshAvailability(
     ctx: ExtensionContext,
-    options: { force?: boolean; requireFresh?: boolean } = {},
+    options: { force?: boolean; requireFresh?: boolean; skipWakeUp?: boolean } = {},
   ): Promise<AvailabilitySnapshot | null> {
     const force = options.force === true;
     const requireFresh = options.requireFresh === true;
+    const skipWakeUp = options.skipWakeUp === true;
     const now = Date.now();
 
     if (
@@ -3150,6 +3204,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         schedule: availability.schedule,
       });
 
+      const previousMode =
+        lastObservedModeInProcess ?? normalizeObservedMode(availabilitySnapshot?.contract?.mode);
+      const currentMode = normalizeObservedMode(availability.contract?.mode);
+
       availabilitySnapshot = {
         contract: availability.contract,
         calendar: availability.calendar,
@@ -3158,6 +3216,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         wrapUpInstruction,
         fetchedAt: now,
       };
+
+      if (!skipWakeUp) {
+        await observeWakeUpMode(ctx, previousMode, currentMode);
+      } else {
+        lastObservedModeInProcess = currentMode;
+      }
 
       return availabilitySnapshot;
     } catch {
@@ -3514,6 +3578,401 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     } catch {
       return 0;
     }
+  }
+
+  function normalizeObservedMode(value: unknown): Mode | null {
+    return value === "online" || value === "busy" || value === "limited" || value === "offline"
+      ? value
+      : null;
+  }
+
+  function zeroWakeUpDigestSummary(): WakeUpDigestSummary {
+    return { count: 0, runIds: [], flaggedCount: 0, hasFlagged: false };
+  }
+
+  function asDeferredDecisionEventClient(
+    client: HeadsDownClient,
+  ): DeferredDecisionEventClient | null {
+    const method = (client as unknown as DeferredDecisionEventClient).listAgentRunEvents;
+    return typeof method === "function" ? (client as unknown as DeferredDecisionEventClient) : null;
+  }
+
+  async function queryWakeUpDigestEntries(
+    ctx: ExtensionContext,
+    options: {
+      state?: AutopilotState;
+      excludeSurfaced?: boolean;
+      limit?: number;
+      runId?: string;
+      flaggedOnly?: boolean;
+    } = {},
+  ): Promise<DeferredDecisionEntry[]> {
+    const client = await getClient();
+    if (!client) return [];
+
+    const eventClient = asDeferredDecisionEventClient(withActorContext(client, ctx));
+    if (!eventClient) return [];
+
+    return listUnresolvedDeferredDecisionEntries(eventClient, {
+      state: options.state,
+      excludeSurfaced: options.excludeSurfaced,
+      limit: options.limit,
+      runId: options.runId,
+      flaggedOnly: options.flaggedOnly,
+    });
+  }
+
+  async function getCurrentWakeUpDigestSummary(
+    ctx: ExtensionContext,
+    options: { force?: boolean } = {},
+  ): Promise<WakeUpDigestSummary> {
+    const now = Date.now();
+    if (!options.force && wakeUpDigestCache && now - wakeUpDigestCache.fetchedAt < 60_000) {
+      return wakeUpDigestCache.summary;
+    }
+
+    const config = await loadConfig();
+    if (!config.wakeUpDigest.enabled) {
+      wakeUpDigestCache = { summary: zeroWakeUpDigestSummary(), fetchedAt: now };
+      return wakeUpDigestCache.summary;
+    }
+
+    try {
+      const entries = await queryWakeUpDigestEntries(ctx, {
+        excludeSurfaced: false,
+        limit: config.wakeUpDigest.maxEntriesShown,
+      });
+      const summary = summarizeWakeUpDigest(entries);
+      wakeUpDigestCache = { summary, fetchedAt: now };
+      return summary;
+    } catch {
+      return wakeUpDigestCache?.summary ?? zeroWakeUpDigestSummary();
+    }
+  }
+
+  async function maybeSurfaceWakeUpDigest(
+    ctx: ExtensionContext,
+    state: AutopilotState,
+    now: Date,
+  ): Promise<{ state: AutopilotState; summary: WakeUpDigestSummary }> {
+    const config = await loadConfig();
+    if (!config.wakeUpDigest.enabled) {
+      return { state, summary: zeroWakeUpDigestSummary() };
+    }
+
+    wakeUpDigestCache = null;
+
+    try {
+      const entries = await queryWakeUpDigestEntries(ctx, {
+        state,
+        excludeSurfaced: true,
+        limit: config.wakeUpDigest.maxEntriesShown,
+      });
+      const summary = summarizeWakeUpDigest(entries);
+
+      if (summary.count === 0) {
+        return { state, summary };
+      }
+
+      if (ctx.hasUI) {
+        const noun = summary.count === 1 ? "decision" : "decisions";
+        ctx.ui.notify(
+          `[HeadsDown] ${summary.count} deferred ${noun} queued from recent autopilot runs. Use headsdown_deferred to review.`,
+          "info",
+        );
+      }
+
+      return { state: markWakeUpDigestSurfaced(state, entries, now), summary };
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `[HeadsDown] Wake-up digest is temporarily unavailable: ${sanitizeErrorMessage(error)}.`,
+          "warning",
+        );
+      }
+      return { state, summary: zeroWakeUpDigestSummary() };
+    }
+  }
+
+  async function observeWakeUpMode(
+    ctx: ExtensionContext,
+    previousMode: Mode | null,
+    currentMode: Mode | null,
+  ): Promise<ModeTransition> {
+    const client = await getClient();
+    if (!client || !asDeferredDecisionEventClient(withActorContext(client, ctx))) {
+      lastObservedModeInProcess = currentMode;
+      return detectModeTransition(previousMode, currentMode);
+    }
+
+    const state = await loadAutopilotState();
+    const effectivePreviousMode = previousMode ?? state.lastObservedMode;
+    const transition = detectModeTransition(effectivePreviousMode, currentMode);
+    const now = new Date();
+    let nextState: AutopilotState = {
+      ...state,
+      lastObservedMode: currentMode,
+    };
+
+    if (shouldTriggerWakeUp(transition, currentMode)) {
+      const result = await maybeSurfaceWakeUpDigest(ctx, nextState, now);
+      nextState = result.state;
+    }
+
+    await saveAutopilotState(nextState);
+    lastObservedModeInProcess = currentMode;
+    return transition;
+  }
+
+  function buildWakeUpDigestContextMessage(summary: WakeUpDigestSummary) {
+    return {
+      role: "custom" as const,
+      customType: "headsdown-wake-up-digest",
+      content:
+        formatWakeUpDigestInstruction(summary) ?? "[HeadsDown] No deferred decisions are queued.",
+      display: false,
+      timestamp: Date.now(),
+    };
+  }
+
+  function clampDeferredToolLimit(value: number | undefined, config: WakeUpDigestConfig): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) return config.maxEntriesShown;
+    return Math.max(1, Math.min(config.maxEntriesShown, Math.floor(value)));
+  }
+
+  function validateDeferredToolId(value: string | undefined, field: string): string {
+    if (isSafeOpaqueToken(value)) return value;
+    throw new Error(`${field} must be an opaque ID token, not free text.`);
+  }
+
+  function validateOptionalDeferredToolRunId(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    return validateDeferredToolId(value, "run_id");
+  }
+
+  function validateOptionalRefinedUrgencyBucket(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    const normalized = normalizeUrgencyBucketToken(value);
+    if (normalized && normalized !== "unknown") return normalized;
+    throw new Error("refined_urgency_bucket must be one of low, normal, or high.");
+  }
+
+  function validateOptionalRefinedDecisionCategory(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    const normalized = normalizeDecisionCategoryToken(value);
+    if (normalized) return normalized;
+    throw new Error("refined_decision_category must be a supported decision category enum.");
+  }
+
+  function validateOptionalNotesBucket(
+    value: DeferredDecisionNotesBucket | undefined,
+  ): DeferredDecisionNotesBucket | undefined {
+    if (value === undefined) return undefined;
+    if (
+      value === "needs_more_info" ||
+      value === "wrong_framing" ||
+      value === "split_into_two" ||
+      value === "duplicate" ||
+      value === "other"
+    ) {
+      return value;
+    }
+    throw new Error("notes_bucket must be a supported notes bucket enum.");
+  }
+
+  function renderDeferredDecisionToolEntry(entry: DeferredDecisionEntry) {
+    return {
+      decision_id: entry.decision_id,
+      run_id: entry.run_id,
+      decision_kind: entry.decision_kind,
+      decision_category: entry.decision_category,
+      urgency_bucket: entry.urgency_bucket,
+      flagged_for_review: entry.flagged_for_review,
+      recorded_at: entry.recorded_at,
+      expires_at: entry.expires_at,
+      summary: entry.summary,
+    };
+  }
+
+  function renderDeferredDecisionToolPayload(entries: DeferredDecisionEntry[]): {
+    count: number;
+    groups: Array<{
+      run_id: string;
+      entries: ReturnType<typeof renderDeferredDecisionToolEntry>[];
+    }>;
+  } {
+    const payload = {
+      count: entries.length,
+      groups: groupDeferredDecisionEntries(entries).map((group: DeferredDecisionGroup) => ({
+        run_id: group.run_id,
+        entries: group.entries.map(renderDeferredDecisionToolEntry),
+      })),
+    };
+    assertPrivacySafeDeferredDecisionOutput(payload);
+    return payload;
+  }
+
+  async function listDeferredDecisionToolEntries(
+    ctx: ExtensionContext,
+    params: HeadsDownDeferredToolParams,
+  ): Promise<DeferredDecisionEntry[]> {
+    const config = await loadConfig();
+    return queryWakeUpDigestEntries(ctx, {
+      excludeSurfaced: false,
+      limit: clampDeferredToolLimit(params.limit, config.wakeUpDigest),
+      runId: validateOptionalDeferredToolRunId(params.run_id),
+      flaggedOnly: params.flagged_only,
+    });
+  }
+
+  async function findDeferredDecisionEntry(
+    ctx: ExtensionContext,
+    params: HeadsDownDeferredToolParams,
+  ): Promise<{ entry: DeferredDecisionEntry | null; ambiguousRunIds: string[] }> {
+    const safeDecisionId = validateDeferredToolId(params.decision_id, "decision_id");
+    const safeRunId = validateOptionalDeferredToolRunId(params.run_id);
+    const entries = await queryWakeUpDigestEntries(ctx, {
+      excludeSurfaced: false,
+      limit: 200,
+      runId: safeRunId,
+    });
+    const matches = entries.filter((entry) => entry.decision_id === safeDecisionId);
+    const matchingRunIds = [...new Set(matches.map((entry) => entry.run_id))];
+
+    if (!safeRunId && matchingRunIds.length > 1) {
+      return { entry: null, ambiguousRunIds: matchingRunIds };
+    }
+
+    return { entry: matches[0] ?? null, ambiguousRunIds: [] };
+  }
+
+  function resolutionKindForDeferredAction(
+    action: HeadsDownDeferredToolAction,
+  ): DeferredDecisionResolutionKind {
+    if (action === "approve") return "approved";
+    if (action === "override") return "overridden";
+    if (action === "refine") return "refined";
+    return "dismissed";
+  }
+
+  function buildDeferredDecisionResolvedPayload(
+    action: HeadsDownDeferredToolAction,
+    params: HeadsDownDeferredToolParams,
+    entry: DeferredDecisionEntry,
+  ): DeferredDecisionResolvedPayload {
+    const resolvedActionKey =
+      action === "override" && params.resolved_action_key
+        ? normalizeActionKey(params.resolved_action_key)
+        : null;
+    const refinedUrgencyBucket =
+      action === "refine"
+        ? validateOptionalRefinedUrgencyBucket(params.refined_urgency_bucket)
+        : undefined;
+    const refinedDecisionCategory =
+      action === "refine"
+        ? validateOptionalRefinedDecisionCategory(params.refined_decision_category)
+        : undefined;
+    const notesBucket = validateOptionalNotesBucket(params.notes_bucket);
+    if (action === "override" && !resolvedActionKey) {
+      throw new Error("resolved_action_key is required when action='override'.");
+    }
+
+    const payload: DeferredDecisionResolvedPayload = {
+      decision_id: entry.decision_id,
+      resolution_kind: resolutionKindForDeferredAction(action),
+      ...(action === "override" && resolvedActionKey
+        ? { resolved_action_key: resolvedActionKey }
+        : {}),
+      ...(refinedUrgencyBucket ? { refined_urgency_bucket: refinedUrgencyBucket } : {}),
+      ...(refinedDecisionCategory ? { refined_decision_category: refinedDecisionCategory } : {}),
+      ...(notesBucket ? { notes_bucket: notesBucket } : {}),
+      ...(entry.local_session_summary
+        ? { local_session_summary: entry.local_session_summary }
+        : {}),
+    };
+    assertPrivacySafeDeferredDecisionOutput(payload);
+    return payload;
+  }
+
+  function isDuplicateResolutionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /already|duplicate|unique|idempotency/i.test(message);
+  }
+
+  function isAlreadyResolvedPayload(value: unknown): boolean {
+    if (!value || typeof value !== "object") return false;
+    const payload = value as { ok?: unknown; error?: { code?: unknown; message?: unknown } | null };
+    if (payload.ok === true) return false;
+    const code = typeof payload.error?.code === "string" ? payload.error.code : "";
+    const message = typeof payload.error?.message === "string" ? payload.error.message : "";
+    return /already|duplicate|unique|idempotency/i.test(`${code} ${message}`);
+  }
+
+  function assertResolutionReportSucceeded(value: unknown): void {
+    if (!value || typeof value !== "object") return;
+    const payload = value as { ok?: unknown; error?: { message?: unknown } | null };
+    if (payload.ok !== false) return;
+    const message =
+      typeof payload.error?.message === "string"
+        ? payload.error.message
+        : "Resolution write failed.";
+    throw new Error(message);
+  }
+
+  async function reportDeferredDecisionResolution(
+    ctx: ExtensionContext,
+    action: HeadsDownDeferredToolAction,
+    params: HeadsDownDeferredToolParams,
+    entry: DeferredDecisionEntry,
+  ): Promise<{ ok: true; alreadyResolved: boolean }> {
+    const client = await getClientOrThrow();
+    const actorClient = withActorContext(client, ctx);
+    const method = (
+      actorClient as unknown as {
+        reportDeferredDecisionResolved?: (
+          context: Record<string, unknown>,
+          payload: DeferredDecisionResolvedPayload,
+        ) => Promise<unknown>;
+      }
+    ).reportDeferredDecisionResolved;
+
+    if (typeof method !== "function") {
+      throw new Error("HeadsDown SDK does not expose reportDeferredDecisionResolved.");
+    }
+
+    const actorContext = buildActorContext(ctx);
+    const context = {
+      workspaceRef: actorContext.workspaceRef,
+      runId: entry.run_id,
+      source: "pi",
+      client: { kind: "pi_extension", name: "headsdown-pi", version: HEADSDOWN_PI_CLIENT_VERSION },
+      actor: { kind: "agent", ref: "pi-agent" },
+      correlationId: entry.run_id,
+      idempotencyKey: `${entry.run_id}:deferred_decision.resolved:${entry.decision_id}`,
+    };
+    const payload = buildDeferredDecisionResolvedPayload(action, params, entry);
+
+    try {
+      const result = await method.call(actorClient, context, payload);
+      if (isAlreadyResolvedPayload(result)) return { ok: true, alreadyResolved: true };
+      assertResolutionReportSucceeded(result);
+      return { ok: true, alreadyResolved: false };
+    } catch (error) {
+      if (isDuplicateResolutionError(error)) return { ok: true, alreadyResolved: true };
+      throw error;
+    }
+  }
+
+  async function removeResolvedDecisionFromWakeUpState(
+    entry: DeferredDecisionEntry,
+  ): Promise<void> {
+    const state = await loadAutopilotState();
+    await saveAutopilotState(
+      removeDecisionIdsFromSurfaced(state, [
+        { runId: entry.run_id, decisionId: entry.decision_id },
+      ]),
+    );
+    wakeUpDigestCache = null;
   }
 
   async function currentBranchName(): Promise<string | null> {
@@ -3943,6 +4402,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     cachedConfig = null;
     cachedClient = null;
     availabilitySnapshot = null;
+    lastObservedModeInProcess = null;
+    wakeUpDigestCache = null;
     autoQueuedRunIds = new Set<string>();
     attentionWindowDedupe.clear();
     lastAttentionWindowPollAt = 0;
@@ -4150,6 +4611,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       }
     }
 
+    const wakeUpSummary = await getCurrentWakeUpDigestSummary(ctx);
+    const wakeUpInstruction = formatWakeUpDigestInstruction(wakeUpSummary);
+    if (wakeUpInstruction) {
+      instructionBlocks.push(wakeUpInstruction);
+    }
+
     if (instructionBlocks.length === 0) return undefined;
 
     return {
@@ -4173,7 +4640,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       mode: refreshedSnapshot?.contract?.mode ?? null,
       hasActiveProposal: hasApprovedProposal(),
     });
-    if (!wrapUpHintInstruction && !autopilotGuidance) return undefined;
+    const wakeUpSummary = await getCurrentWakeUpDigestSummary(ctx);
+    const wakeUpInstruction = formatWakeUpDigestInstruction(wakeUpSummary);
+    if (!wrapUpHintInstruction && !autopilotGuidance && !wakeUpInstruction) return undefined;
 
     const messages = [...event.messages];
     if (wrapUpHintInstruction) {
@@ -4181,6 +4650,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
     if (autopilotGuidance) {
       messages.push(buildAutopilotGuidanceContextMessage(autopilotGuidance));
+    }
+    if (wakeUpInstruction) {
+      messages.push(buildWakeUpDigestContextMessage(wakeUpSummary));
     }
 
     return { messages };
@@ -4840,6 +5312,141 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           },
         ],
         details: { verdict },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "headsdown_deferred",
+    label: "HeadsDown Deferred Decisions",
+    description:
+      "Review and resolve deferred decisions from recent autopilot runs using derived facts only.",
+    promptSnippet:
+      "Review deferred decisions with headsdown_deferred before continuing resumed work",
+    parameters: Type.Object({
+      action: Type.Optional(
+        StringEnum(["list", "view", "approve", "override", "refine", "dismiss"] as const, {
+          description:
+            "Use list to show unresolved decisions, view for one decision, or resolve one decision.",
+        }),
+      ),
+      decision_id: Type.Optional(
+        Type.String({
+          description: "Deferred decision ID. Required for view and resolution actions.",
+        }),
+      ),
+      flagged_only: Type.Optional(
+        Type.Boolean({ description: "List only decisions flagged for review." }),
+      ),
+      run_id: Type.Optional(Type.String({ description: "List only decisions for this run ID." })),
+      limit: Type.Optional(
+        Type.Number({ description: "Maximum entries to return, capped by config." }),
+      ),
+      resolved_action_key: Type.Optional(
+        StringEnum(
+          HEADSDOWN_ACTION_KEYS as unknown as [HeadsDownActionKey, ...HeadsDownActionKey[]],
+          {
+            description: "Canonical action key to record for override resolutions.",
+          },
+        ),
+      ),
+      refined_urgency_bucket: Type.Optional(
+        StringEnum(["low", "normal", "high"] as const, {
+          description: "Replacement urgency bucket for refine resolutions.",
+        }),
+      ),
+      refined_decision_category: Type.Optional(
+        Type.String({ description: "Replacement decision category enum for refine resolutions." }),
+      ),
+      notes_bucket: Type.Optional(
+        StringEnum(
+          ["needs_more_info", "wrong_framing", "split_into_two", "duplicate", "other"] as const,
+          {
+            description: "Optional bucketed note for the resolution.",
+          },
+        ),
+      ),
+    }),
+    async execute(_toolCallId, params: HeadsDownDeferredToolParams, _signal, _onUpdate, _ctx) {
+      const action = params.action ?? "list";
+
+      if (action === "list") {
+        const entries = await listDeferredDecisionToolEntries(_ctx, params);
+        const payload = {
+          ok: true,
+          ...renderDeferredDecisionToolPayload(entries),
+        };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          details: payload,
+        };
+      }
+
+      if (!params.decision_id) {
+        throw new Error("decision_id is required for view and resolution actions.");
+      }
+
+      const lookup = await findDeferredDecisionEntry(_ctx, params);
+      if (lookup.ambiguousRunIds.length > 0) {
+        const payload = {
+          ok: false,
+          ambiguous: true,
+          decision_id: params.decision_id,
+          run_ids: lookup.ambiguousRunIds,
+          message: "decision_id matches multiple runs. Pass run_id to choose one.",
+        };
+        assertPrivacySafeDeferredDecisionOutput(payload);
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          details: payload,
+        };
+      }
+
+      const entry = lookup.entry;
+      if (!entry) {
+        const payload = { ok: false, notFound: true, decision_id: params.decision_id };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          details: payload,
+        };
+      }
+
+      if (action === "view") {
+        const payload = { ok: true, decision: renderDeferredDecisionToolEntry(entry) };
+        assertPrivacySafeDeferredDecisionOutput(payload);
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          details: payload,
+        };
+      }
+
+      if (action === "override" && !params.resolved_action_key) {
+        throw new Error("resolved_action_key is required when action='override'.");
+      }
+
+      const resolution = await reportDeferredDecisionResolution(_ctx, action, params, entry);
+      await removeResolvedDecisionFromWakeUpState(entry);
+      const remainingEntries = await listDeferredDecisionToolEntries(_ctx, params);
+      const payload = {
+        ok: true,
+        action,
+        decision_id: entry.decision_id,
+        resolution_kind: resolutionKindForDeferredAction(action),
+        alreadyResolved: resolution.alreadyResolved,
+        notice:
+          action === "refine"
+            ? "Refinement recorded. Pi does not re-attempt refined decisions automatically yet."
+            : resolution.alreadyResolved
+              ? "Already resolved, likely by another session."
+              : "Resolution recorded.",
+        remaining: renderDeferredDecisionToolPayload(remainingEntries),
+      };
+      assertPrivacySafeDeferredDecisionOutput(payload);
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        details: payload,
       };
     },
   });
