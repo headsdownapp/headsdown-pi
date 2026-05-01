@@ -319,9 +319,9 @@ describe("autopilot deferral turn_end hook", () => {
 
     await fireTurnEnd(handlers, ctx, "Would you like me to update tests too?", 2);
 
-    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
-      1,
-    );
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
   });
 
   it("does not record non-text structured assistant messages", async () => {

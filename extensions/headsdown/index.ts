@@ -228,7 +228,7 @@ interface AutopilotPolicyPayload {
 
 interface LastToolContextState {
   toolKind: Exclude<RecentToolContext["last_tool_kind"], "none">;
-  outcome: "succeeded" | "failed" | "unavailable";
+  outcome: "succeeded" | "failed";
   progressVersion: number;
 }
 
@@ -417,6 +417,7 @@ const TIME_BOX_WIDGET_KEY = "headsdown:time-box";
 const TIME_BOX_WIDGET_THRESHOLD_MINUTES = 3;
 const DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES = 15;
 const SCOPE_WARNING_MULTIPLIER = 1.5;
+const AUTOPILOT_FAILURE_NOTICE_COOLDOWN_MS = 60 * 1000;
 const CONTINUATION_PATH = join(homedir(), ".config", "headsdown", "continuation.json");
 
 const AVAILABILITY_COMPAT_QUERY = `
@@ -2755,6 +2756,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let activeTimeBox: TimeBoxState | null = null;
   let lastObservedModeInProcess: Mode | null = null;
   let wakeUpDigestCache: { summary: WakeUpDigestSummary; fetchedAt: number } | null = null;
+  let lastAutopilotFailureNoticeAt = 0;
   let autopilotProgressVersion = 0;
   let autopilotStuckGeneration = 0;
   let lastToolContext: LastToolContextState | null = null;
@@ -3029,6 +3031,27 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
   }
 
+  function normalizeAgentRunEventReportResult(
+    result: unknown,
+    options: { allowVoidSuccess?: boolean } = {},
+  ): { ok: boolean; errorMessage: string | null } {
+    if (result === undefined && options.allowVoidSuccess === true) {
+      return { ok: true, errorMessage: null };
+    }
+    if (!result || typeof result !== "object") {
+      return { ok: false, errorMessage: "missing event report response" };
+    }
+
+    const payload = result as { ok?: unknown; error?: { message?: string | null } | null };
+    if (payload.error) {
+      return { ok: false, errorMessage: payload.error.message ?? "event report failed" };
+    }
+
+    return payload.ok === true
+      ? { ok: true, errorMessage: null }
+      : { ok: false, errorMessage: "event report was not accepted" };
+  }
+
   async function reportPiAgentRunEventResult(
     _ctx: ExtensionContext,
     input: Record<string, unknown>,
@@ -3040,13 +3063,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         reportAgentRunEvent?: (input: Record<string, unknown>) => Promise<unknown>;
       };
       if (typeof eventClient.reportAgentRunEvent === "function") {
-        const result = (await eventClient.reportAgentRunEvent(input)) as
-          | { ok?: boolean; error?: { message?: string | null } | null }
-          | undefined;
-        return {
-          ok: result?.ok !== false,
-          errorMessage: result?.error?.message ?? null,
-        };
+        const result = await eventClient.reportAgentRunEvent(input);
+        return normalizeAgentRunEventReportResult(result, { allowVoidSuccess: true });
       }
 
       const graphql = getLowLevelGraphQLClient(client);
@@ -3054,13 +3072,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const response = await graphql.request(REPORT_AGENT_RUN_EVENT_MUTATION, {
         input: serializeAgentRunEventForGraphQL(input),
       });
-      const result = response.reportAgentRunEvent as
-        | { ok?: boolean; error?: { message?: string | null } | null }
-        | undefined;
-      return {
-        ok: result?.ok !== false,
-        errorMessage: result?.error?.message ?? null,
-      };
+      return normalizeAgentRunEventReportResult(
+        (response as Record<string, unknown>).reportAgentRunEvent,
+      );
     } catch (error) {
       // Event telemetry must never interrupt the agent run.
       return { ok: false, errorMessage: error instanceof Error ? error.message : String(error) };
@@ -4588,6 +4602,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     autoQueuedRunIds = new Set<string>();
     resetAutopilotRuntimeState();
     attentionWindowDedupe.clear();
+    lastAutopilotFailureNoticeAt = 0;
     lastAttentionWindowPollAt = 0;
     lastAttentionWindowPollFailureNoticeAt = 0;
     clearAttentionWindowWarning(ctx);
@@ -4875,7 +4890,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   }
 
   function recentToolContext(): RecentToolContext {
-    if (!lastToolContext || lastToolContext.outcome === "unavailable") {
+    if (!lastToolContext) {
       return { last_tool_kind: "none", last_tool_outcome: "unavailable", turns_since: 0 };
     }
 
@@ -4907,11 +4922,19 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
   function isUnsupportedAutopilotContextError(message: string | null): boolean {
     const normalized = message?.toLowerCase() ?? "";
-    return (
-      normalized.includes("autopilot_context") ||
-      normalized.includes("unsupported field") ||
-      normalized.includes("unknown field") ||
-      normalized.includes("is not defined by type")
+    return normalized.includes("autopilot_context") || normalized.includes("autopilotcontext");
+  }
+
+  function notifyAutopilotFailure(ctx: ExtensionContext): void {
+    if (!ctx.hasUI) return;
+
+    const now = Date.now();
+    if (now - lastAutopilotFailureNoticeAt < AUTOPILOT_FAILURE_NOTICE_COOLDOWN_MS) return;
+
+    lastAutopilotFailureNoticeAt = now;
+    ctx.ui.notify(
+      "[HeadsDown] Autopilot anti-stuck check failed safely. The run will continue without a nudge.",
+      "warning",
     );
   }
 
@@ -4970,11 +4993,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       isUnsupportedAutopilotContextError(result.errorMessage)
     ) {
       const payload = eventInput.payload as Record<string, unknown> | undefined;
+      const fallbackPayload = payload ? { ...payload } : payload;
+      if (fallbackPayload) delete fallbackPayload.autopilot_context;
       result = await reportPiAgentRunEventResult(input.ctx, {
         ...eventInput,
-        payload: payload
-          ? stripUndefinedValues({ ...payload, autopilot_context: undefined })
-          : payload,
+        payload: fallbackPayload,
       });
     }
 
@@ -5053,7 +5076,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       reachedNudgeLimit && !selectedStep.startsWith("defer_")
         ? "defer_for_human_review"
         : selectedStep;
-    const outcome: AutopilotEscalationOutcome = step.startsWith("defer_")
+    const isDeferredStep = step.startsWith("defer_");
+    const outcome: AutopilotEscalationOutcome = isDeferredStep
       ? "deferred"
       : step === "try_in_sandbox"
         ? "unavailable"
@@ -5083,7 +5107,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       );
     }
 
-    if (step.startsWith("defer_")) {
+    if (isDeferredStep) {
       const recorded = await recordAutopilotDeferredDecision({
         ctx: input.ctx,
         telemetry: getTelemetryForProposal(proposal),
@@ -5124,7 +5148,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         generationAtSchedule,
       })
         .catch(() => {
-          // Anti-stuck nudges must fail closed and never interrupt the active run.
+          notifyAutopilotFailure(input.ctx);
         })
         .finally(() => {
           if (autopilotStuckState.pendingTurnIndex === input.turnIndex) {
