@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DETECTION_PATTERNS,
+  buildAutopilotContext,
+  buildInteractionAskUserActionShape,
   buildLocalSessionSummary,
   detectDeferral,
+  escalationAttemptReasonCode,
   normalizeAutopilotDeferralConfig,
   pickDecisionCategory,
   pickDecisionKind,
   pickUrgencyBucket,
+  questionCategoryForPattern,
 } from "../extensions/headsdown/autopilot-deferral.js";
 
 function defaultConfig() {
@@ -58,6 +62,10 @@ describe("autopilot deferral detection", () => {
     const config = normalizeAutopilotDeferralConfig({ enabled: false });
 
     expect(config.enabled).toBe(false);
+    expect(config.idleThresholdMs).toBe(30_000);
+    expect(config.nudgeCooldownMs).toBe(5_000);
+    expect(config.maxConsecutiveNudges).toBe(4);
+    expect(config.hostedAutopilotContextEnabled).toBe(true);
     expect(config.patterns.length).toBeGreaterThan(0);
   });
 
@@ -131,8 +139,92 @@ describe("autopilot deferral detection", () => {
     ).toThrow();
   });
 
-  it("uses v1 default categorization helpers", () => {
+  it("uses SDK ask-user action shape and derived categorization helpers", () => {
+    const questionCategory = questionCategoryForPattern("please_confirm");
+    const actionShape = buildInteractionAskUserActionShape({
+      questionCategory,
+      recentToolContext: {
+        last_tool_kind: "edit",
+        last_tool_outcome: "failed",
+        turns_since: 1,
+      },
+    });
+
+    expect(actionShape).toEqual({
+      tool_kind: "interaction.ask_user",
+      question_category: "approval_request",
+      recent_tool_context: {
+        last_tool_kind: "edit",
+        last_tool_outcome: "failed",
+        turns_since: 1,
+      },
+    });
     expect(pickDecisionKind()).toBe("would_have_asked");
     expect(pickDecisionCategory()).toBe("unknown");
+    expect(pickDecisionCategory(questionCategory)).toBe("other");
+    expect(pickDecisionCategory(questionCategoryForPattern("should_i"))).toBe("scope");
+    expect(escalationAttemptReasonCode("try_alternative", "failed")).toBe("try_alternative_failed");
+  });
+
+  it("builds privacy-safe autopilot context from SDK-owned classifier facts", () => {
+    const context = buildAutopilotContext({
+      classifiedAction: {
+        outcome: "notable",
+        reasonCode: "ask_user_baseline",
+        source: "deterministic",
+        toolKind: "interaction.ask_user",
+      },
+      policy: {
+        classifierVersion: "1.1.0",
+        latitude: "cautious",
+        escalationStrategy: ["try_alternative", "defer_for_human_review"],
+        sandboxPreference: "preferred",
+      },
+      capabilities: {
+        classifierVersion: "1.1.0",
+        capturedAt: "2026-04-28T10:00:00.000Z",
+        sandbox: {
+          available: false,
+          fsIsolation: "none",
+          networkIsolation: "none",
+          identityIsolation: "none",
+        },
+        toolKinds: ["bash", "edit", "webfetch", "mcp", "computer_use"],
+      },
+      attempts: [
+        {
+          step: "defer_for_human_review",
+          outcome: "deferred",
+          reasonCode: "defer_for_human_review_deferred",
+        },
+      ],
+      classifierDecisionId: "decision_abcdef1234567890",
+    });
+
+    expect(context).toEqual({
+      classifier_version: "1.1.0",
+      tool_kind: "interaction.ask_user",
+      classification_outcome: "notable",
+      classifier_reason_code: "ask_user_baseline",
+      classifier_source: "deterministic",
+      latitude_at_decision: "cautious",
+      sandbox_preference: "preferred",
+      classifier_decision_id: "decision_abcdef1234567890",
+      capability_summary: {
+        sandbox_available: false,
+        sandbox_stale: false,
+        fs_isolation: "none",
+        network_isolation: "none",
+        identity_isolation: "none",
+      },
+      escalation_attempts: [
+        {
+          step: "defer_for_human_review",
+          outcome: "deferred",
+          reason_code: "defer_for_human_review_deferred",
+        },
+      ],
+    });
+    expect(JSON.stringify(context)).not.toContain("/private/repo");
   });
 });

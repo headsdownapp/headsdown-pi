@@ -34,7 +34,7 @@ function makeApprovedProposalEntry() {
           id: "proposal-1",
           decision: "approved",
           description: "public-safe slice",
-          evaluatedAt: "2026-04-28T10:00:00.000Z",
+          evaluatedAt: new Date().toISOString(),
           estimatedFiles: 4,
           estimatedMinutes: 30,
         },
@@ -68,7 +68,11 @@ async function useConfigFile(config: Record<string, unknown> | string) {
   tempDirs.push(dir);
 }
 
-function makeClient(mode: "online" | "limited" | "offline", events: Record<string, unknown>[]) {
+function makeClient(
+  mode: "online" | "limited" | "offline",
+  events: Record<string, unknown>[],
+  policy: Record<string, unknown> = {},
+) {
   const client = {
     withActor: vi.fn(() => client),
     getAvailability: vi.fn(async () => ({
@@ -76,6 +80,17 @@ function makeClient(mode: "online" | "limited" | "offline", events: Record<strin
       calendar: null,
       schedule: { wrapUpGuidance: { active: false } },
     })),
+    graphql: {
+      request: vi.fn(async () => ({
+        autopilotPolicy: {
+          latitude: mode === "offline" ? "CAUTIOUS" : "VERIFY",
+          escalationStrategy: ["TRY_ALTERNATIVE", "DEFER_FOR_HUMAN_REVIEW"],
+          sandboxPreference: "PREFERRED",
+          classifierVersion: "1.1.0",
+          ...policy,
+        },
+      })),
+    },
     listDigestSummaries: vi.fn(async () => []),
     reportAgentRunEvent: vi.fn(async (input: Record<string, unknown>) => {
       events.push(input);
@@ -93,6 +108,18 @@ async function startSession(
   await sessionStart({ reason: "new" }, ctx);
 }
 
+async function fireTurnEnd(
+  handlers: Map<string, Array<(event: any, ctx: any) => Promise<any>>>,
+  ctx: any,
+  content: unknown,
+  turnIndex = 1,
+) {
+  const turnEnd = handlers.get("turn_end")?.at(0);
+  if (!turnEnd) throw new Error("turn_end handler was not registered");
+  await turnEnd({ turnIndex, message: { role: "assistant", content }, toolResults: [] }, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
 const tempDirs: string[] = [];
 
 afterEach(async () => {
@@ -101,7 +128,7 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-describe("autopilot deferral message_end hook", () => {
+describe("autopilot deferral turn_end hook", () => {
   it("uses configured custom patterns when deciding whether to record", () => {
     const config = __internal.normalizeAutopilotDeferralConfig({
       patterns: [{ key: "custom_marker", pattern: "NEEDS_DECISION" }],
@@ -123,63 +150,60 @@ describe("autopilot deferral message_end hook", () => {
     ).toEqual({ matched: false, matchedPatternKey: null });
   });
 
-  it("records multiple metadata-only deferrals during autopilot runs", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-28T10:05:00.000Z"));
+  it("nudges with SDK classifier guidance before recording after escalation exhausts", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
     const events: Record<string, unknown>[] = [];
-    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
-      makeClient("offline", events) as any,
-    );
-    const { handlers } = registerHeadsDownHarness();
+    const client = makeClient("limited", events);
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers, pi } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    const toolCall = handlers.get("tool_call")?.at(0);
-    if (!messageEnd || !toolCall) throw new Error("required handlers were not registered");
 
-    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
-    await messageEnd(
-      {
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Should I update the tests?" }],
-        },
-      },
-      ctx,
+    await fireTurnEnd(handlers, ctx, [{ type: "text", text: "Should I update the tests?" }], 1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(pi.sendMessage.mock.calls[0])).toContain("Autopilot classifier addendum");
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
     );
-    await messageEnd(
-      { message: { role: "assistant", content: "Please confirm the default." } },
-      ctx,
-    );
-    await messageEnd(
-      { message: { role: "assistant", content: "[NEEDS_USER] choose option A or B" } },
-      ctx,
-    );
+
+    await fireTurnEnd(handlers, ctx, "Should I update the tests?", 2);
 
     const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
-    expect(deferrals).toHaveLength(3);
-    const decisionIds = deferrals.map(
-      (event) => (event.payload as Record<string, unknown>).decision_id,
+    expect(deferrals).toHaveLength(1);
+    const payload = deferrals[0].payload as Record<string, any>;
+    expect(payload.decision_kind).toBe("would_have_asked");
+    expect(payload.decision_category).toBe("scope");
+    expect(payload.autopilot_context).toMatchObject({
+      classifier_version: "1.1.0",
+      tool_kind: "interaction.ask_user",
+      classification_outcome: "notable",
+      classifier_reason_code: "ask_user_baseline",
+      classifier_source: "deterministic",
+      latitude_at_decision: "verify",
+    });
+    expect(payload.autopilot_context.escalation_attempts).toEqual([
+      {
+        step: "try_alternative",
+        outcome: "failed",
+        reason_code: "try_alternative_failed",
+      },
+      {
+        step: "defer_for_human_review",
+        outcome: "deferred",
+        reason_code: "defer_for_human_review_deferred",
+      },
+    ]);
+    expect((payload.local_session_summary as Record<string, unknown>).deferredDecisionCount).toBe(
+      1,
     );
-    expect(new Set(decisionIds)).toHaveProperty("size", 3);
-    expect(decisionIds).toEqual(
-      decisionIds.map((id) => expect.stringMatching(/^decision_[a-f0-9]{32}$/)),
-    );
-    expect(
-      deferrals.map(
-        (event) =>
-          ((event.payload as Record<string, any>).local_session_summary as Record<string, unknown>)
-            .deferredDecisionCount,
-      ),
-    ).toEqual([1, 2, 3]);
     const serialized = JSON.stringify(deferrals);
     expect(serialized).not.toContain("Should I update the tests?");
-    expect(serialized).not.toContain("Please confirm");
     expect(serialized).not.toContain("README.md");
     expect(serialized).not.toContain(process.cwd());
   });
 
-  it("does not record non-text structured assistant messages", async () => {
+  it("records immediately when policy requires deferral and remains idempotent for the same turn", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
     const events: Record<string, unknown>[] = [];
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
       makeClient("offline", events) as any,
@@ -187,13 +211,48 @@ describe("autopilot deferral message_end hook", () => {
     const { handlers } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: [{ type: "image", source: "redacted" }] } },
-      ctx,
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 7);
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 7);
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      1,
     );
+  });
+
+  it("falls back to currently accepted deferred-decision fields when hosted context is rejected", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("offline", events);
+    client.reportAgentRunEvent.mockImplementation(async (input: Record<string, unknown>) => {
+      const payload = input.payload as Record<string, unknown>;
+      if (payload.autopilot_context) throw new Error("unsupported field");
+      events.push(input);
+    });
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.");
+
+    const deferrals = events.filter((event) => event.eventType === "deferred_decision.recorded");
+    expect(deferrals).toHaveLength(1);
+    expect((deferrals[0].payload as Record<string, unknown>).autopilot_context).toBeUndefined();
+    expect((deferrals[0].payload as Record<string, unknown>).local_session_summary).toBeDefined();
+  });
+
+  it("does not record non-text structured assistant messages", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("offline", events) as any,
+    );
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, [{ type: "image", source: "redacted" }]);
 
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
@@ -201,7 +260,7 @@ describe("autopilot deferral message_end hook", () => {
   });
 
   it("does not record events when autopilot deferral is disabled through config", async () => {
-    await useConfigFile({ autopilotDeferral: { enabled: false } });
+    await useConfigFile({ autopilotDeferral: { enabled: false, idleThresholdMs: 0 } });
     const events: Record<string, unknown>[] = [];
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
       makeClient("offline", events) as any,
@@ -209,13 +268,8 @@ describe("autopilot deferral message_end hook", () => {
     const { handlers } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: "Do you want me to continue?" } },
-      ctx,
-    );
+    await fireTurnEnd(handlers, ctx, "Do you want me to continue?");
 
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
@@ -231,13 +285,8 @@ describe("autopilot deferral message_end hook", () => {
     const { handlers } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: "Do you want me to continue?" } },
-      ctx,
-    );
+    await fireTurnEnd(handlers, ctx, "Do you want me to continue?");
 
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
@@ -245,6 +294,7 @@ describe("autopilot deferral message_end hook", () => {
   });
 
   it("does not record events when fresh availability cannot be verified", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
     const events: Record<string, unknown>[] = [];
     const client = makeClient("offline", events);
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
@@ -252,13 +302,8 @@ describe("autopilot deferral message_end hook", () => {
     const ctx = makeContext();
     await startSession(handlers, ctx);
     client.getAvailability.mockRejectedValueOnce(new Error("network down"));
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: "Do you want me to continue?" } },
-      ctx,
-    );
+    await fireTurnEnd(handlers, ctx, "Do you want me to continue?");
 
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
@@ -266,6 +311,7 @@ describe("autopilot deferral message_end hook", () => {
   });
 
   it("does not record events outside autopilot mode", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
     const events: Record<string, unknown>[] = [];
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
       makeClient("online", events) as any,
@@ -273,13 +319,8 @@ describe("autopilot deferral message_end hook", () => {
     const { handlers } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: "Do you want me to continue?" } },
-      ctx,
-    );
+    await fireTurnEnd(handlers, ctx, "Do you want me to continue?");
 
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
@@ -287,6 +328,7 @@ describe("autopilot deferral message_end hook", () => {
   });
 
   it("does not record non-deferral messages during autopilot mode", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
     const events: Record<string, unknown>[] = [];
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
       makeClient("limited", events) as any,
@@ -294,14 +336,37 @@ describe("autopilot deferral message_end hook", () => {
     const { handlers } = registerHeadsDownHarness();
     const ctx = makeContext();
     await startSession(handlers, ctx);
-    const messageEnd = handlers.get("message_end")?.at(0);
-    if (!messageEnd) throw new Error("message_end handler was not registered");
 
-    await messageEnd(
-      { message: { role: "assistant", content: "I updated the tests and will continue." } },
+    await fireTurnEnd(handlers, ctx, "I updated the tests and will continue.");
+
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+  });
+
+  it("does not nudge when a turn produced tool results", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const turnEnd = handlers.get("turn_end")?.at(0);
+    if (!turnEnd) throw new Error("turn_end handler was not registered");
+
+    await turnEnd(
+      {
+        turnIndex: 99,
+        message: { role: "assistant", content: "Should I keep going?" },
+        toolResults: [{ toolName: "read", result: "ok" }],
+      },
       ctx,
     );
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
+    expect(pi.sendMessage).not.toHaveBeenCalled();
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
     );
