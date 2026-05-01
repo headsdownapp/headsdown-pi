@@ -5183,7 +5183,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     scheduleAutopilotStuckDetection({
       ctx,
       turnIndex:
-        typeof eventTurnIndex === "number" ? eventTurnIndex : ++autopilotSyntheticTurnIndex,
+        typeof eventTurnIndex === "number" ? eventTurnIndex : --autopilotSyntheticTurnIndex,
       detection,
       config: config.autopilotDeferral,
     });

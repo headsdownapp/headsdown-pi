@@ -536,6 +536,31 @@ describe("autopilot deferral turn_end hook", () => {
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps synthetic turn indexes from colliding with Pi turn indexes", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const turnEnd = handlers.get("turn_end")?.at(0);
+    if (!turnEnd) throw new Error("turn_end handler was not registered");
+
+    await turnEnd(
+      { message: { role: "assistant", content: "Should I keep going?" }, toolResults: [] },
+      ctx,
+    );
+    await expect.poll(() => pi.sendMessage.mock.calls.length).toBe(1);
+
+    await fireTurnEnd(handlers, ctx, "Should I keep going?", 1);
+
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
+  });
+
   it("resets autopilot turn idempotency and in-flight state on a new session", async () => {
     await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
     const events: Record<string, unknown>[] = [];
