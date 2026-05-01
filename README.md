@@ -242,6 +242,13 @@ Registered tools:
     "respectManualChanges": true,
     "showStatus": true,
     "allowDowngrade": false
+  },
+  "autopilotDeferral": {
+    "enabled": true,
+    "defaultUrgencyBucket": "normal",
+    "patterns": [
+      { "key": "needs_decision", "pattern": "NEEDS_DECISION" }
+    ]
   }
 }
 ```
@@ -255,6 +262,9 @@ Registered tools:
 | `autoThinking.respectManualChanges` | `true` | Preserves a later manual thinking-level change instead of immediately overriding it |
 | `autoThinking.showStatus` | `true` | Shows the automatic or preserved manual thinking decision in the Pi status footer |
 | `autoThinking.allowDowngrade` | `false` | Allows the policy to lower the current thinking level when the task looks simpler |
+| `autopilotDeferral.enabled` | `true` | Records metadata-only deferred-decision events when finalized assistant messages match a human-input pattern during autopilot-eligible modes |
+| `autopilotDeferral.defaultUrgencyBucket` | `"normal"` | Sets the urgency bucket for recorded deferrals. Valid values are `low`, `normal`, and `high` |
+| `autopilotDeferral.patterns` | built-in defaults | Optional regex patterns that replace the built-in detection set. Invalid regexes are ignored. Defaults cover explicit `[DEFER]` and `[NEEDS_USER]` markers, `should I`, `would you like`, `do you want`, `let me know`, `please confirm`, `which would you prefer`, and trailing second-person questions |
 
 ## Skill behavior
 

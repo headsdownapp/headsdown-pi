@@ -11,7 +11,7 @@
  * - Registers /headsdown command for quick status checks
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -29,6 +29,7 @@ import type {
   DelegationGrantPermission,
   DelegationGrantScope,
   HeadsDownConfig,
+  LocalSessionSummary,
   ProposalInput,
   ScheduleResolution,
   Verdict,
@@ -69,6 +70,15 @@ import {
   resolveEffectiveDeadline,
   type TimeBoxState,
 } from "./time-box.js";
+import {
+  buildLocalSessionSummary,
+  detectDeferral,
+  normalizeAutopilotDeferralConfig,
+  pickDecisionCategory,
+  pickDecisionKind,
+  pickUrgencyBucket,
+  type AutopilotDeferralConfig,
+} from "./autopilot-deferral.js";
 
 // === State ===
 
@@ -141,6 +151,7 @@ interface PiRunTelemetry {
   startedReported: boolean;
   scopeDriftReported: boolean;
   completedReported: boolean;
+  deferredDecisionsCount: number;
 }
 
 interface PiAgentRunEventContext {
@@ -297,6 +308,7 @@ interface LocalRefereeOutcomeSharingState {
 
 interface HeadsDownPiConfig extends HeadsDownConfig {
   autoThinking: AutoThinkingConfig;
+  autopilotDeferral: AutopilotDeferralConfig;
   localRefereeOutcomeSharing: LocalRefereeOutcomeSharingState;
 }
 
@@ -1726,6 +1738,38 @@ function buildQueuedForMorningEventInput(
   };
 }
 
+function buildDeferredDecisionEventInput(input: {
+  telemetry: PiRunTelemetry;
+  proposal: ProposalRecord | null;
+  decisionId?: string;
+  decisionKind: string;
+  decisionCategory: string;
+  urgencyBucket: string;
+  flaggedForReview: boolean;
+  localSessionSummary: LocalSessionSummary;
+}): Record<string, unknown> {
+  const decisionId = input.decisionId ?? `decision_${randomBytes(16).toString("hex")}`;
+
+  return {
+    ...basePiAgentRunEvent({
+      runId: input.telemetry.runId,
+      proposalId: input.proposal?.id ?? input.telemetry.proposalId,
+      sequence: input.telemetry.sequence,
+      idempotencyKey: `${input.telemetry.runId}:deferred_decision.recorded:${decisionId}`,
+    }),
+    eventType: "deferred_decision.recorded",
+    payload: stripUndefinedValues({
+      decision_id: decisionId,
+      decision_kind: input.decisionKind,
+      decision_category: input.decisionCategory,
+      urgency_bucket: input.urgencyBucket,
+      flagged_for_review: input.flaggedForReview,
+      proposal_id: input.proposal?.id,
+      local_session_summary: input.localSessionSummary,
+    }),
+  };
+}
+
 function buildTerminalEventInput(
   telemetry: PiRunTelemetry,
   outcome: "completed" | "failed" | "partially_completed" | "cancelled" | "timed_out",
@@ -2363,6 +2407,39 @@ function getHeadsDownCommandCompletions(argumentPrefix: string): AutocompleteIte
   }));
 }
 
+function extractAssistantText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const record = message as Record<string, unknown>;
+  const content = record.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      const partRecord = part as Record<string, unknown>;
+      return typeof partRecord.text === "string" ? partRecord.text : "";
+    })
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+function shouldRecordAutopilotDeferral(input: {
+  message: unknown;
+  mode: string | null | undefined;
+  config: AutopilotDeferralConfig;
+}): { matched: boolean; matchedPatternKey: string | null } {
+  const message = input.message as { role?: string } | null | undefined;
+  if (message?.role !== "assistant") return { matched: false, matchedPatternKey: null };
+  if (!input.config.enabled) return { matched: false, matchedPatternKey: null };
+  if (input.mode !== "offline" && input.mode !== "limited") {
+    return { matched: false, matchedPatternKey: null };
+  }
+
+  return detectDeferral(extractAssistantText(input.message), input.config.patterns);
+}
+
 function buildHeadsDownCommandHelp(): string {
   return [
     "HeadsDown commands:",
@@ -2446,6 +2523,10 @@ export const __internal = {
   buildTerminalEventInput,
   buildSteeringOutcomeEventInput,
   serializeAgentRunEventForGraphQL,
+  buildDeferredDecisionEventInput,
+  buildLocalSessionSummary,
+  detectDeferral,
+  normalizeAutopilotDeferralConfig,
   mapTaskOutcomeToAgentRunOutcome,
   runIdForProposal,
   resolveAttentionWindowRun,
@@ -2465,6 +2546,8 @@ export const __internal = {
   buildHeadsDownCommandHelp,
   getHeadsDownCommandCompletions,
   normalizeHeadsDownCommandArgs,
+  extractAssistantText,
+  shouldRecordAutopilotDeferral,
   toOpaqueWorkspaceRef,
   runLocalReferee,
   CONTINUATION_PATH,
@@ -2717,6 +2800,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       startedReported: false,
       scopeDriftReported: false,
       completedReported: false,
+      deferredDecisionsCount: 0,
     };
     runTelemetry.set(proposal.id, telemetry);
     return telemetry;
@@ -2825,6 +2909,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const store = new ConfigStore();
       const baseConfig = await store.load();
       let rawAutoThinking: unknown;
+      let rawAutopilotDeferral: unknown;
       let rawLocalRefereeOutcomeSharing: unknown;
 
       try {
@@ -2833,15 +2918,18 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           unknown
         >;
         rawAutoThinking = rawConfig.autoThinking;
+        rawAutopilotDeferral = rawConfig.autopilotDeferral;
         rawLocalRefereeOutcomeSharing = rawConfig.localRefereeOutcomeSharing;
       } catch {
         rawAutoThinking = undefined;
+        rawAutopilotDeferral = undefined;
         rawLocalRefereeOutcomeSharing = undefined;
       }
 
       cachedConfig = {
         ...baseConfig,
         autoThinking: normalizeAutoThinkingConfig(rawAutoThinking),
+        autopilotDeferral: normalizeAutopilotDeferralConfig(rawAutopilotDeferral),
         localRefereeOutcomeSharing: normalizeLocalRefereeOutcomeSharingState(
           rawLocalRefereeOutcomeSharing,
         ),
@@ -4086,6 +4174,54 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     return { messages };
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    const message = (event as { message?: { role?: string } }).message;
+    if (message?.role !== "assistant") return undefined;
+
+    const config = await loadConfig();
+
+    const snapshot = await refreshAvailability(ctx);
+    const detection = shouldRecordAutopilotDeferral({
+      message,
+      mode: snapshot?.contract?.mode,
+      config: config.autopilotDeferral,
+    });
+    if (!detection.matched) return undefined;
+
+    const proposal = getLatestApprovedProposal();
+    if (!proposal) return undefined;
+
+    const telemetry = getTelemetryForProposal(proposal);
+    telemetry.deferredDecisionsCount += 1;
+    telemetry.sequence += 1;
+
+    const localSessionSummary = buildLocalSessionSummary({
+      runId: telemetry.runId,
+      approvedProposalId: proposal.id,
+      toolCallCount: telemetry.toolCallsCount,
+      fileChangeCount: telemetry.filesModified.size,
+      deferredDecisionCount: telemetry.deferredDecisionsCount,
+      continuationArtifactAvailable: await continuationExists(),
+      validationLocallyPassed: false,
+      now: new Date(),
+    });
+
+    await reportPiAgentRunEvent(
+      ctx,
+      buildDeferredDecisionEventInput({
+        telemetry,
+        proposal,
+        decisionKind: pickDecisionKind(),
+        decisionCategory: pickDecisionCategory(),
+        urgencyBucket: pickUrgencyBucket(config.autopilotDeferral),
+        flaggedForReview: true,
+        localSessionSummary,
+      }),
+    );
+
+    return undefined;
   });
 
   // === Tool call interception ===
