@@ -353,7 +353,6 @@ describe("autopilot state", () => {
       {
         ...emptyAutopilotState(),
         lastObservedMode: "offline",
-        lastTransitionAt: "2026-04-30T10:00:00.000Z",
       },
       [{ runId: "run-1", decisionId: "decision-1" }],
       now,
@@ -363,7 +362,6 @@ describe("autopilot state", () => {
     const loaded = await loadAutopilotState(path);
 
     expect(loaded.lastObservedMode).toBe("offline");
-    expect(loaded.lastTransitionAt).toBe("2026-04-30T10:00:00.000Z");
     expect(loaded.surfacedDecisionIds).toEqual({ "run-1": ["decision-1"] });
   });
 

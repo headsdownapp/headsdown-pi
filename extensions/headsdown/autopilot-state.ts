@@ -16,7 +16,6 @@ export function resolveAutopilotStatePath(): string {
 export interface AutopilotState {
   lastObservedMode: ContractMode | null;
   surfacedDecisionIds: Record<string, string[]>;
-  lastTransitionAt: string | null;
   surfacedAtByDecisionId: Record<string, string>;
 }
 
@@ -24,7 +23,6 @@ export function emptyAutopilotState(): AutopilotState {
   return {
     lastObservedMode: null,
     surfacedDecisionIds: {},
-    lastTransitionAt: null,
     surfacedAtByDecisionId: {},
   };
 }
@@ -84,10 +82,6 @@ export function normalizeAutopilotState(value: unknown): AutopilotState {
   return {
     lastObservedMode: isContractMode(raw.lastObservedMode) ? raw.lastObservedMode : null,
     surfacedDecisionIds: normalizeSurfacedDecisionIds(raw.surfacedDecisionIds),
-    lastTransitionAt:
-      typeof raw.lastTransitionAt === "string" && Number.isFinite(Date.parse(raw.lastTransitionAt))
-        ? raw.lastTransitionAt
-        : null,
     surfacedAtByDecisionId: normalizeSurfacedAtByDecisionId(raw.surfacedAtByDecisionId),
   };
 }

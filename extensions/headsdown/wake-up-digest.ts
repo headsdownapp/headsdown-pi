@@ -171,6 +171,11 @@ function daysAgoIso(now: Date, daysBack: number): string {
   return new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000).toISOString();
 }
 
+function normalizeQueryLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_QUERY_LIMIT;
+  return Math.max(0, Math.floor(value));
+}
+
 function getString(value: Record<string, unknown>, key: string): string | null {
   const raw = value[key];
   return typeof raw === "string" && raw.length > 0 ? raw : null;
@@ -394,8 +399,8 @@ export async function listUnresolvedDeferredDecisionEntries(
   const now = options.now ?? new Date();
   const daysBack = options.daysBack ?? DEFAULT_DAYS_BACK;
   const insertedAfter = daysAgoIso(now, daysBack);
-  const queryLimit =
-    options.limit && options.limit > DEFAULT_QUERY_LIMIT ? options.limit : DEFAULT_QUERY_LIMIT;
+  const requestedLimit = normalizeQueryLimit(options.limit);
+  const queryLimit = Math.max(DEFAULT_QUERY_LIMIT, requestedLimit);
   const [recordedEvents, resolvedEvents] = await Promise.all([
     client.listAgentRunEvents({
       eventType: "deferred_decision.recorded",

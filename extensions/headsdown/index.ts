@@ -3712,9 +3712,6 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     let nextState: AutopilotState = {
       ...state,
       lastObservedMode: currentMode,
-      lastTransitionAt: shouldTriggerWakeUp(transition, currentMode)
-        ? now.toISOString()
-        : state.lastTransitionAt,
     };
 
     if (shouldTriggerWakeUp(transition, currentMode)) {
