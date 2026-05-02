@@ -51,7 +51,7 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@headsdown/sdk": "^0.5.1",
+    "@headsdown/sdk": "^0.6.0",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*",
