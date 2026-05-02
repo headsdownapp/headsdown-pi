@@ -1,30 +1,58 @@
-# headsdown-pi
+# HeadsDown for Pi
 
-Pi agents are powerful because they can keep working while you do something else. The problem is that they still treat you like you are always available.
+Pi agents are at their best when you can hand them real work and go do something else. The failure mode is that they still behave like you are always there to answer the next question, approve the next tangent, or notice when a small fix has turned into a bigger one.
 
-HeadsDown gives [Pi agent](https://github.com/badlogic/pi-coding-agent) a simple rule: check what the human needs before interrupting them. If you are at the keyboard, Pi gets timing and scope guidance so it can finish cleanly before your attention moves elsewhere. If you are away, Pi gets autopilot guidance so it can keep moving, defer questions, and leave you a clean review note instead of stalling.
+HeadsDown turns your availability into runtime instructions for Pi.
+
+If you are at the keyboard, Pi gets timing and scope guidance so it can finish cleanly. If you are focused, Pi knows not to interrupt unless it matters. If you are away, Pi shifts into autopilot: keep moving when it is safe, defer human-only decisions, nudge itself out of stalls, and leave you a clean review queue when you return.
 
 By default, HeadsDown does **not** receive prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, or message contents.
 
 ## The pitch
 
-AI agents should not ask you every time they hit a small decision. They also should not quietly turn a small fix into a wandering refactor.
+AI agents should feel like responsible teammates, not clever processes that need babysitting.
 
-HeadsDown sits between Pi and the moment where Pi would normally ask, expand, or stop. It gives Pi enough context to choose the right next move:
+Today, most coding agents fail in two ordinary ways:
 
-- Keep going.
-- Reduce the task.
-- Ask for approval.
-- Save the question for later.
-- Wrap up with a handoff.
+- They interrupt you for tiny choices they could have routed around.
+- They keep expanding the job until the original task is no longer recognizable.
 
-The goal is not to stop the agent. The goal is to keep the agent going right.
+HeadsDown sits at those decision points. It tells Pi what kind of run this is, how much room it has, and what to do when it hits uncertainty.
+
+That gives Pi a better set of defaults:
+
+- Keep going when the next step is safe.
+- Stay inside the approved slice.
+- Ask only when the interruption is worth it.
+- Save non-urgent questions for later.
+- Wrap up before your time window closes.
+- Leave a continuation note when the work should pause.
+
+The goal is not to slow Pi down. The goal is to let Pi run longer without becoming reckless, noisy, or stuck.
+
+## The story
+
+You ask Pi to fix a bug before your next meeting. The first few steps are easy: reproduce it, patch it, run the focused test.
+
+Then the real workflow starts. A related file looks suspicious. A test failure might be flaky. A dependency update would probably help. Pi could ask you, keep digging, or package the current fix.
+
+Without HeadsDown, Pi guesses. Sometimes it pings you for a small decision while you are not available. Sometimes it wanders into a larger refactor. Sometimes it stops and waits, even though there was safe work left to do.
+
+With HeadsDown, Pi gets the missing context:
+
+- If you are available, ask for approval before expanding scope.
+- If your time is almost up, finish the current slice and save the rest.
+- If you are offline, defer the question and keep going with safe, reversible work.
+- If Pi starts to stall on a human question, nudge it back into autopilot.
+- If the work crosses the approved plan, stop and re-propose instead of drifting.
+
+That is the product: Pi keeps momentum, and you keep control.
 
 ## What Pi gets
 
-### 1. A better start for bigger work
+### 1. A cleaner start for meaningful work
 
-Before Pi starts meaningful work, it can ask HeadsDown whether the run is worth starting now and how tightly it should stay scoped.
+Before Pi starts meaningful work, it can ask HeadsDown whether the run should start now and how tightly it should stay scoped.
 
 For bigger tasks, Pi can propose a short plan first: what it intends to do, roughly how long it should take, and how many files it expects to touch. Once approved, that plan becomes the guardrail for the run.
 
@@ -55,13 +83,25 @@ That means:
 
 This is the important part: HeadsDown does not make Pi stall faster. It helps Pi defer and continue.
 
-### 4. Guardrails before file changes
+### 4. Anti-stuck nudges when Pi tries to wait
 
-HeadsDown can warn or block risky file changes based on your trust setting.
+Autopilot is not just detection after the fact. When Pi starts ending a turn with a human-only question during offline or limited modes, HeadsDown can nudge it to defer the decision and keep working on the safe parts.
+
+Deferred decisions are recorded as metadata-only events. Raw question text, transcript content, file paths, terminal output, and code snippets stay local by default.
+
+### 5. A wake-up queue when you return
+
+When your availability returns, HeadsDown can surface the decisions Pi deferred while you were away.
+
+The wake-up digest is designed for review, not surveillance. It shows derived facts like counts, urgency buckets, flags, and timestamps, then points Pi to `headsdown_deferred` so you can resolve the queue intentionally.
+
+### 6. Guardrails before risky changes
+
+HeadsDown can warn or block file-changing tool calls based on your trust setting and current availability.
 
 For example, it can warn before Pi changes sensitive paths like `.env*`, `.ssh/*`, `package.json`, `Dockerfile*`, or `.github/**`. It can also block changes when your current rules say Pi should not proceed without approval.
 
-### 5. A local receipt when the run is done
+### 7. A local receipt when the run is done
 
 Local Referee verifies whether a run met your repo-local completion rules. It works without a HeadsDown account and does not make required network calls.
 
@@ -304,10 +344,6 @@ Before packing or publishing, run:
 ```bash
 npm run build
 ```
-
-## Dependency update automation
-
-This repo uses Renovate to keep `@headsdown/sdk` and other routine dependencies current. New SDK releases open bot PRs automatically, and eligible updates can automerge after required CI checks pass. In normal maintenance flow, do not manually edit `@headsdown/sdk` versions unless you are intentionally overriding Renovate behavior.
 
 ## License
 
