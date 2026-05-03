@@ -27,9 +27,17 @@ import {
   classifyActionShapeFallback,
   computeEscalationPath,
 } from "@headsdown/sdk";
+import {
+  HEADSDOWN_ACTION_KEYS,
+  bucketFileCount,
+  bucketScopeGrowth,
+  isHeadsDownActionKey,
+} from "@headsdown/sdk/agent";
 import type {
   ActorContext,
   AgentControlOverview,
+  AvailabilityOverride,
+  AvailabilityOverrideInput,
   ClassifiedAction,
   ClassifierEscalationStep,
   ClassifierLatitude,
@@ -267,24 +275,11 @@ interface AvailabilityContext {
   schedule: ScheduleResolution | null;
 }
 
-interface AvailabilityOverride {
-  id: string;
-  mode: string;
-  reason: string | null;
-  source: string;
-  expiresAt: string;
-  cancelledAt: string | null;
-  expiredAt: string | null;
-  createdById: string;
-  cancelledById: string | null;
-  insertedAt: string;
-  updatedAt: string;
-}
-
 interface HeadsDownCallPayload {
   key: string | null;
   title: string | null;
   body: string | null;
+  privacyMode: string | null;
   recommendedActionKey: HeadsDownActionKey | null;
   allowedActionKeys: HeadsDownActionKey[];
   reasonCodes: string[];
@@ -483,60 +478,6 @@ const AVAILABILITY_COMPAT_QUERY = `
   }
 `;
 
-const ACTIVE_AVAILABILITY_OVERRIDE_QUERY = `
-  query ActiveAvailabilityOverride {
-    activeAvailabilityOverride {
-      id
-      mode
-      reason
-      source
-      expiresAt
-      cancelledAt
-      expiredAt
-      createdById
-      cancelledById
-      insertedAt
-      updatedAt
-    }
-  }
-`;
-
-const CREATE_AVAILABILITY_OVERRIDE_MUTATION = `
-  mutation CreateAvailabilityOverride($input: AvailabilityOverrideInput!) {
-    createAvailabilityOverride(input: $input) {
-      id
-      mode
-      reason
-      source
-      expiresAt
-      cancelledAt
-      expiredAt
-      createdById
-      cancelledById
-      insertedAt
-      updatedAt
-    }
-  }
-`;
-
-const CANCEL_AVAILABILITY_OVERRIDE_MUTATION = `
-  mutation CancelAvailabilityOverride($id: ID!, $reason: String, $source: String) {
-    cancelAvailabilityOverride(id: $id, reason: $reason, source: $source) {
-      id
-      mode
-      reason
-      source
-      expiresAt
-      cancelledAt
-      expiredAt
-      createdById
-      cancelledById
-      insertedAt
-      updatedAt
-    }
-  }
-`;
-
 const AGENT_CONTROL_OVERVIEW_QUERY = `
   query AgentControlOverviewForPi {
     agentControlOverview {
@@ -544,6 +485,7 @@ const AGENT_CONTROL_OVERVIEW_QUERY = `
         key
         title
         body
+        privacyMode
         recommendedActionKey
         allowedActionKeys
         reasonCodes
@@ -780,111 +722,32 @@ function isSessionTokenOnlyGrantError(message: string): boolean {
   );
 }
 
-type AvailabilityOverrideInput = {
-  mode: "online" | "busy" | "limited" | "offline";
+function availabilityOverrideInput(input: {
+  mode: AvailabilityOverride["mode"];
   durationMinutes?: number;
   expiresAt?: string;
   reason?: string;
   source?: string;
-};
-
-async function createAvailabilityOverrideCompat(
-  client: HeadsDownClient,
-  input: AvailabilityOverrideInput,
-): Promise<AvailabilityOverride> {
-  const nativeMethod = (
-    client as unknown as {
-      createAvailabilityOverride?: (
-        value: AvailabilityOverrideInput,
-      ) => Promise<AvailabilityOverride>;
-    }
-  ).createAvailabilityOverride;
-
-  if (typeof nativeMethod === "function") {
-    return nativeMethod(input);
+}): AvailabilityOverrideInput {
+  if (input.expiresAt) {
+    return {
+      mode: input.mode,
+      expiresAt: input.expiresAt,
+      reason: input.reason,
+      source: input.source,
+    };
   }
 
-  const graphql = getLowLevelGraphQLClient(client);
-  if (!graphql) {
-    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
+  if (typeof input.durationMinutes === "number") {
+    return {
+      mode: input.mode,
+      durationMinutes: input.durationMinutes,
+      reason: input.reason,
+      source: input.source,
+    };
   }
 
-  const graphQLMode = toGraphQLEnumValue(input.mode);
-  if (!graphQLMode) {
-    throw new Error("Invalid availability override mode.");
-  }
-
-  const data = await graphql.request(CREATE_AVAILABILITY_OVERRIDE_MUTATION, {
-    input: stripUndefinedValues({
-      ...input,
-      mode: graphQLMode,
-    }),
-  });
-
-  const override =
-    (data.createAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
-  if (!override) {
-    throw new Error("HeadsDown API returned no availability override data.");
-  }
-
-  return override;
-}
-
-async function getActiveAvailabilityOverrideCompat(
-  client: HeadsDownClient,
-): Promise<AvailabilityOverride | null> {
-  const nativeMethod = (
-    client as unknown as {
-      getActiveAvailabilityOverride?: () => Promise<AvailabilityOverride | null>;
-    }
-  ).getActiveAvailabilityOverride;
-
-  if (typeof nativeMethod === "function") {
-    return nativeMethod();
-  }
-
-  const graphql = getLowLevelGraphQLClient(client);
-  if (!graphql) {
-    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
-  }
-
-  const data = await graphql.request(ACTIVE_AVAILABILITY_OVERRIDE_QUERY);
-  return (data.activeAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
-}
-
-async function cancelAvailabilityOverrideCompat(
-  client: HeadsDownClient,
-  id: string,
-  reason?: string,
-): Promise<AvailabilityOverride> {
-  const nativeMethod = (
-    client as unknown as {
-      cancelAvailabilityOverride?: (id: string, reason?: string) => Promise<AvailabilityOverride>;
-    }
-  ).cancelAvailabilityOverride;
-
-  if (typeof nativeMethod === "function") {
-    return nativeMethod(id, reason);
-  }
-
-  const graphql = getLowLevelGraphQLClient(client);
-  if (!graphql) {
-    throw new Error("Availability override APIs are unavailable in this @headsdown/sdk version.");
-  }
-
-  const data = await graphql.request(CANCEL_AVAILABILITY_OVERRIDE_MUTATION, {
-    id,
-    reason,
-    source: "pi",
-  });
-
-  const override =
-    (data.cancelAvailabilityOverride as AvailabilityOverride | null | undefined) ?? null;
-  if (!override) {
-    throw new Error("HeadsDown API returned no cancelled availability override data.");
-  }
-
-  return override;
+  throw new Error("duration_minutes or expires_at is required when action='set'.");
 }
 
 function toStringOrNull(value: unknown): string | null {
@@ -904,26 +767,6 @@ function normalizeEnumKey(value: unknown): string | null {
     .toLowerCase();
 
   return snakeCase.length > 0 ? snakeCase : null;
-}
-
-const HEADSDOWN_ACTION_KEYS = [
-  "continue",
-  "continue_with_limit",
-  "narrow_scope",
-  "ask_user",
-  "queue_for_later",
-  "queue_for_morning",
-  "pause_and_summarize",
-  "stop_run",
-  "resume_run",
-  "allow_once",
-  "allow_for_duration",
-  "create_temporary_exception",
-  "keep_queued",
-] as const satisfies readonly HeadsDownActionKey[];
-
-function isHeadsDownActionKey(value: string): value is HeadsDownActionKey {
-  return (HEADSDOWN_ACTION_KEYS as readonly string[]).includes(value);
 }
 
 function normalizeCallKey(value: unknown): string | null {
@@ -952,6 +795,14 @@ function normalizeActionKeyList(value: unknown): HeadsDownActionKey[] {
     .filter((item): item is HeadsDownActionKey => item !== null);
 }
 
+function normalizeReasonCodeList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => (typeof item === "string" ? normalizeEnumKey(item) : null))
+    .filter((item): item is string => item !== null);
+}
+
 function normalizeHeadsDownCallPayload(value: unknown): HeadsDownCallPayload | null {
   if (!value || typeof value !== "object") return null;
 
@@ -960,9 +811,10 @@ function normalizeHeadsDownCallPayload(value: unknown): HeadsDownCallPayload | n
     key: normalizeCallKey(payload.key),
     title: toStringOrNull(payload.title),
     body: toStringOrNull(payload.body),
+    privacyMode: normalizeCallKey(payload.privacyMode),
     recommendedActionKey: normalizeActionKey(payload.recommendedActionKey),
     allowedActionKeys: normalizeActionKeyList(payload.allowedActionKeys),
-    reasonCodes: normalizeActionKeyList(payload.reasonCodes),
+    reasonCodes: normalizeReasonCodeList(payload.reasonCodes),
   };
 }
 
@@ -1621,24 +1473,6 @@ function safeIdToken(value: string): string {
 
 function runIdForProposal(proposalId: string): string {
   return `run_${safeIdToken(proposalId)}`;
-}
-
-function bucketFileCount(count: number | undefined): string {
-  if (count === undefined || count < 0) return "unknown";
-  if (count === 0) return "0";
-  if (count <= 2) return "1_to_2";
-  if (count <= 5) return "3_to_5";
-  if (count <= 10) return "6_to_10";
-  return "over_10";
-}
-
-function bucketScopeGrowth(count: number | undefined): string {
-  if (count === undefined || count < 0) return "unknown";
-  if (count === 0) return "none";
-  if (count <= 2) return "1_to_2_files";
-  if (count <= 5) return "3_to_5_files";
-  if (count <= 10) return "6_to_10_files";
-  return "over_10_files";
 }
 
 function normalizeSafeReasonCode(value: string | undefined, fallback: string): string {
@@ -2656,9 +2490,6 @@ function buildHeadsDownCommandHelp(): string {
 
 export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
-  ACTIVE_AVAILABILITY_OVERRIDE_QUERY,
-  CREATE_AVAILABILITY_OVERRIDE_MUTATION,
-  CANCEL_AVAILABILITY_OVERRIDE_MUTATION,
   AGENT_CONTROL_OVERVIEW_QUERY,
   APPLY_HEADSDOWN_ACTION_MUTATION,
   AUTOPILOT_POLICY_QUERY,
@@ -2671,9 +2502,7 @@ export const __internal = {
   applyHeadsDownActionCompat,
   buildActorContext,
   withActorContext,
-  createAvailabilityOverrideCompat,
-  getActiveAvailabilityOverrideCompat,
-  cancelAvailabilityOverrideCompat,
+  availabilityOverrideInput,
   normalizeToolPath,
   normalizeCallKey,
   normalizeActionKey,
@@ -4743,6 +4572,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             key: overview.headsdownCall.key,
             title: overview.headsdownCall.title,
             body: overview.headsdownCall.body,
+            privacyMode: overview.headsdownCall.privacyMode,
+            recommendedActionKey: overview.headsdownCall.recommendedActionKey,
+            allowedActionKeys: overview.headsdownCall.allowedActionKeys,
+            reasonCodes: overview.headsdownCall.reasonCodes,
           });
           if (renderedCallCopy) {
             const activeProposalRunIds = activeProposal
@@ -6197,7 +6030,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const action = params.action ?? "get";
 
       if (action === "get") {
-        const override = await getActiveAvailabilityOverrideCompat(actorClient);
+        const override = await actorClient.getActiveAvailabilityOverride();
         return {
           content: [{ type: "text", text: JSON.stringify({ override }, null, 2) }],
           details: { override },
@@ -6209,13 +6042,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           throw new Error("mode is required when action='set'.");
         }
 
-        const override = await createAvailabilityOverrideCompat(actorClient, {
-          mode: params.mode,
-          durationMinutes: params.duration_minutes,
-          expiresAt: params.expires_at,
-          reason: params.reason,
-          source: "pi",
-        });
+        const override = await actorClient.createAvailabilityOverride(
+          availabilityOverrideInput({
+            mode: params.mode,
+            durationMinutes: params.duration_minutes,
+            expiresAt: params.expires_at,
+            reason: params.reason,
+            source: "pi",
+          }),
+        );
 
         await refreshAvailability(_ctx, { force: true });
         await updateStatusUI(_ctx);
@@ -6226,7 +6061,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         };
       }
 
-      const targetId = params.id ?? (await getActiveAvailabilityOverrideCompat(actorClient))?.id;
+      const targetId = params.id ?? (await actorClient.getActiveAvailabilityOverride())?.id;
       if (!targetId) {
         return {
           content: [{ type: "text", text: "No active availability override found to cancel." }],
@@ -6234,7 +6069,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         };
       }
 
-      const override = await cancelAvailabilityOverrideCompat(actorClient, targetId, params.reason);
+      const override = await actorClient.cancelAvailabilityOverride(targetId, params.reason, "pi");
       await refreshAvailability(_ctx, { force: true });
       await updateStatusUI(_ctx);
 

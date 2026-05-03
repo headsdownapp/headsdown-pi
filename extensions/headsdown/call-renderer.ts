@@ -1,43 +1,22 @@
-export const CANONICAL_HEADSDOWN_CALL_KEYS = [
-  "good_to_run",
-  "keep_it_tight",
-  "not_worth_starting_now",
-  "off_the_clock",
-  "rabbit_hole_detected",
-  "finish_line_friction",
-  "ready_to_resume",
-  "all_contained",
-  "needs_your_yes",
-  "attention_window_closing",
-] as const;
+import {
+  HEADSDOWN_CALL_KEYS,
+  isHeadsDownActionKey,
+  isHeadsDownCallKey,
+  renderHeadsDownCallForAgent,
+  type AgentRenderedAction,
+} from "@headsdown/sdk/agent";
+import type {
+  AgentControlUiIntent,
+  HeadsDownActionKey as SdkHeadsDownActionKey,
+  HeadsDownCall,
+  HeadsDownCallKey,
+} from "@headsdown/sdk";
 
-export type CanonicalHeadsDownCallKey = (typeof CANONICAL_HEADSDOWN_CALL_KEYS)[number];
-export type RenderableHeadsDownCallKey = Exclude<CanonicalHeadsDownCallKey, "rabbit_hole_detected">;
-
-export type HeadsDownActionKey =
-  | "continue"
-  | "continue_with_limit"
-  | "narrow_scope"
-  | "ask_user"
-  | "queue_for_later"
-  | "queue_for_morning"
-  | "pause_and_summarize"
-  | "stop_run"
-  | "resume_run"
-  | "allow_once"
-  | "allow_for_duration"
-  | "create_temporary_exception"
-  | "keep_queued";
-
-export type HeadsDownUiIntent =
-  | "view_details"
-  | "review_request"
-  | "review_runs"
-  | "review_handoff"
-  | "view_queue"
-  | "view_receipts"
-  | "adjust_playbooks"
-  | "start_run";
+export const CANONICAL_HEADSDOWN_CALL_KEYS = HEADSDOWN_CALL_KEYS;
+export type CanonicalHeadsDownCallKey = HeadsDownCallKey;
+export type RenderableHeadsDownCallKey = HeadsDownCallKey;
+export type HeadsDownActionKey = SdkHeadsDownActionKey;
+export type HeadsDownUiIntent = Exclude<AgentControlUiIntent, "none">;
 
 type RenderLabels = {
   title: string;
@@ -70,6 +49,10 @@ export interface RenderHeadsDownCallInput {
   key: string | null | undefined;
   title?: string | null;
   body?: string | null;
+  recommendedActionKey?: HeadsDownActionKey | string | null;
+  allowedActionKeys?: readonly (HeadsDownActionKey | string)[] | null;
+  reasonCodes?: readonly string[] | null;
+  privacyMode?: string | null;
   fallbackSignals?: UnknownCallFallbackSignals;
 }
 
@@ -79,11 +62,19 @@ export interface RenderedHeadsDownCallCopy extends RenderLabels {
   fallbackApplied: boolean;
 }
 
-const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
+type PromptActionDefaults = Pick<
+  RenderLabels,
+  | "primaryLabel"
+  | "primaryActionKey"
+  | "primaryUiIntent"
+  | "secondaryLabel"
+  | "secondaryActionKey"
+  | "secondaryUiIntent"
+>;
+
+const DEFAULT_PROMPT_ACTIONS: Record<HeadsDownCallKey, PromptActionDefaults> = {
   good_to_run: {
-    title: "Good to run",
-    body: "This task fits the time, scope, and attention available right now. Let the agent proceed within the approved bounds.",
-    primaryLabel: "Let the agent proceed",
+    primaryLabel: null,
     primaryActionKey: "continue",
     primaryUiIntent: null,
     secondaryLabel: "Why this call?",
@@ -91,19 +82,23 @@ const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
     secondaryUiIntent: "view_details",
   },
   keep_it_tight: {
-    title: "Keep it tight",
-    body: "There is enough room for a useful slice, not an open-ended run. Ask the agent for the smallest version that still ships value.",
-    primaryLabel: "Narrow scope",
+    primaryLabel: null,
     primaryActionKey: "narrow_scope",
     primaryUiIntent: null,
     secondaryLabel: "Why this call?",
     secondaryActionKey: null,
     secondaryUiIntent: "view_details",
   },
+  attention_window_closing: {
+    primaryLabel: null,
+    primaryActionKey: "allow_for_duration",
+    primaryUiIntent: null,
+    secondaryLabel: null,
+    secondaryActionKey: "pause_and_summarize",
+    secondaryUiIntent: null,
+  },
   not_worth_starting_now: {
-    title: "Not worth starting now",
-    body: "The likely cost is higher than the likely value right now. Queue it for later instead of burning time on a weak run.",
-    primaryLabel: "Queue for later",
+    primaryLabel: null,
     primaryActionKey: "queue_for_later",
     primaryUiIntent: null,
     secondaryLabel: "Why this call?",
@@ -111,9 +106,7 @@ const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
     secondaryUiIntent: "view_details",
   },
   off_the_clock: {
-    title: "Off the clock",
-    body: "Queued for morning keeps this ask from interrupting your evening. Your night stays yours.",
-    primaryLabel: "Queued for morning",
+    primaryLabel: null,
     primaryActionKey: "queue_for_morning",
     primaryUiIntent: null,
     secondaryLabel: "Why this call?",
@@ -121,28 +114,30 @@ const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
     secondaryUiIntent: "view_details",
   },
   finish_line_friction: {
-    title: "Finish-line friction",
-    body: "The work appears fixed in scope, but validation or delivery is stuck. Keep scope fixed and resolve only the delivery blocker.",
-    primaryLabel: "Pause + summarize",
+    primaryLabel: null,
     primaryActionKey: "pause_and_summarize",
     primaryUiIntent: null,
-    secondaryLabel: "Allow 15m",
+    secondaryLabel: null,
     secondaryActionKey: "allow_for_duration",
     secondaryUiIntent: null,
   },
+  rabbit_hole_detected: {
+    primaryLabel: null,
+    primaryActionKey: "pause_and_summarize",
+    primaryUiIntent: null,
+    secondaryLabel: "Why this call?",
+    secondaryActionKey: null,
+    secondaryUiIntent: "view_details",
+  },
   ready_to_resume: {
-    title: "Ready to resume",
-    body: "HeadsDown saved the thread so the agent can pick up without starting over. Resume the approved work or keep it queued.",
-    primaryLabel: "Resume approved work",
+    primaryLabel: null,
     primaryActionKey: "resume_run",
     primaryUiIntent: null,
-    secondaryLabel: "Keep queued",
+    secondaryLabel: null,
     secondaryActionKey: "keep_queued",
     secondaryUiIntent: null,
   },
   all_contained: {
-    title: "All contained",
-    body: "Runs are staying inside your time, scope, and interruption limits. Nothing needs you right now.",
     primaryLabel: null,
     primaryActionKey: null,
     primaryUiIntent: null,
@@ -151,38 +146,97 @@ const CANONICAL_CALL_COPY: Record<RenderableHeadsDownCallKey, RenderLabels> = {
     secondaryUiIntent: "view_details",
   },
   needs_your_yes: {
-    title: "Needs your yes",
-    body: "An agent wants to cross a boundary that should not be automatic. Review the request and approve, narrow, or keep it queued.",
     primaryLabel: "Review request",
     primaryActionKey: null,
     primaryUiIntent: "review_request",
-    secondaryLabel: "Keep queued",
+    secondaryLabel: null,
     secondaryActionKey: "keep_queued",
-    secondaryUiIntent: null,
-  },
-  attention_window_closing: {
-    title: "Window closing",
-    body: "Your focus window is nearly over. Extend if you need more time, or wrap now to leave a clean handoff.",
-    primaryLabel: "Extend",
-    primaryActionKey: "allow_for_duration",
-    primaryUiIntent: null,
-    secondaryLabel: "Wrap",
-    secondaryActionKey: "pause_and_summarize",
     secondaryUiIntent: null,
   },
 };
 
-function isRenderableHeadsDownCallKey(key: string): key is RenderableHeadsDownCallKey {
-  return (
-    (CANONICAL_HEADSDOWN_CALL_KEYS as readonly string[]).includes(key) &&
-    key !== "rabbit_hole_detected"
-  );
-}
-
 export function resolveUnknownHeadsDownCallFallback(
   signals?: UnknownCallFallbackSignals,
 ): RenderableHeadsDownCallKey {
-  const hasActionRiskOrBoundarySignal =
+  return renderHeadsDownCallForAgent(
+    toSdkHeadsDownCall({ key: "unknown", fallbackSignals: signals }),
+  ).callKey;
+}
+
+export function renderHeadsDownCallCopy(
+  input: RenderHeadsDownCallInput,
+): RenderedHeadsDownCallCopy | null {
+  const normalizedKey = normalizeCallKey(input.key);
+  const rendered = renderHeadsDownCallForAgent(toSdkHeadsDownCall(input));
+  const defaults = DEFAULT_PROMPT_ACTIONS[rendered.callKey];
+  const primary = promptAction(rendered.primaryAction, defaults, "primary");
+  const secondary = promptAction(rendered.secondaryAction, defaults, "secondary");
+
+  return {
+    key: rendered.callKey,
+    sourceKey:
+      rendered.fallbackReason === "known_key"
+        ? rendered.callKey
+        : normalizedKey.length > 0
+          ? normalizedKey
+          : null,
+    fallbackApplied: rendered.fallbackReason !== "known_key",
+    title: rendered.title,
+    body: rendered.body,
+    primaryLabel: primary.label,
+    primaryActionKey: primary.actionKey,
+    primaryUiIntent: primary.uiIntent,
+    secondaryLabel: secondary.label,
+    secondaryActionKey: secondary.actionKey,
+    secondaryUiIntent: secondary.uiIntent,
+  };
+}
+
+function toSdkHeadsDownCall(input: RenderHeadsDownCallInput): HeadsDownCall {
+  const normalizedKey = normalizeCallKey(input.key);
+  const knownKey = normalizedKey && isHeadsDownCallKey(normalizedKey) ? normalizedKey : null;
+  const signalFields = fallbackSignalFields(input.fallbackSignals);
+  const defaults = knownKey ? DEFAULT_PROMPT_ACTIONS[knownKey] : null;
+  const inputAllowedActions = normalizeActionKeys(input.allowedActionKeys);
+  const defaultAllowedActions = defaults ? defaultActionKeys(defaults) : [];
+  const allowedActionKnownKeys =
+    inputAllowedActions.length > 0 ? inputAllowedActions : defaultAllowedActions;
+  const recommendedActionKnownKey =
+    normalizeActionKey(input.recommendedActionKey) ?? defaults?.primaryActionKey ?? null;
+  const secondaryActionKnownKey = defaults?.secondaryActionKey ?? null;
+
+  return {
+    key: normalizedKey || cleanText(input.key) || "unknown",
+    knownKey,
+    title: cleanText(input.title) ?? "",
+    body: cleanText(input.body) ?? "",
+    severity: signalFields.severity,
+    urgency: signalFields.urgency,
+    primaryActionLabel: null,
+    primaryActionKey: recommendedActionKnownKey,
+    primaryActionKnownKey: recommendedActionKnownKey,
+    primaryActionIntent: defaults?.primaryUiIntent ?? "none",
+    secondaryActionLabel: null,
+    secondaryActionKey: secondaryActionKnownKey,
+    secondaryActionKnownKey,
+    secondaryActionIntent: defaults?.secondaryUiIntent ?? "none",
+    recommendedActionKey: recommendedActionKnownKey,
+    recommendedActionKnownKey,
+    allowedActionKeys: allowedActionKnownKeys,
+    allowedActionKnownKeys,
+    allowedUiIntents: signalFields.allowedUiIntents,
+    reasonCodes: [...normalizeReasonCodes(input.reasonCodes), ...signalFields.reasonCodes],
+    confidence: signalFields.confidence,
+    evidenceSource: "fallback",
+    privacyMode: normalizePrivacyMode(input.privacyMode),
+    expiresAt: null,
+  };
+}
+
+function fallbackSignalFields(
+  signals?: UnknownCallFallbackSignals,
+): Pick<HeadsDownCall, "severity" | "urgency" | "confidence" | "allowedUiIntents" | "reasonCodes"> {
+  const actionRequired =
     signals?.actionRequired === true ||
     signals?.approvalRequired === true ||
     signals?.riskSignal === true ||
@@ -191,95 +245,172 @@ export function resolveUnknownHeadsDownCallFallback(
     signals?.externalSideEffectSignal === true ||
     signals?.escalationSignal === true;
 
-  if (hasActionRiskOrBoundarySignal) {
-    return "needs_your_yes";
+  if (actionRequired) {
+    return {
+      severity: "action_required",
+      urgency: "high",
+      confidence: "exact",
+      allowedUiIntents: ["review_request"],
+      reasonCodes: ["human_decision"],
+    };
   }
 
-  const hasLimitOrScopeUncertainty =
+  const constrained =
     signals?.limitSignal === true ||
     signals?.scopeUncertainty === true ||
     signals?.validationUncertainty === true ||
     signals?.lowConfidence === true;
 
-  if (hasLimitOrScopeUncertainty) {
-    return "keep_it_tight";
-  }
-
-  const explicitNoActionAndInBounds =
-    signals?.noActionNeededExplicit === true && signals?.inBoundsExplicit === true;
-
-  if (explicitNoActionAndInBounds) {
-    return "all_contained";
-  }
-
-  return "needs_your_yes";
-}
-
-export function renderHeadsDownCallCopy(
-  input: RenderHeadsDownCallInput,
-): RenderedHeadsDownCallCopy | null {
-  const normalizedKey = normalizeCallKey(input.key);
-
-  if (normalizedKey === "rabbit_hole_detected") {
-    return null;
-  }
-
-  if (normalizedKey && isRenderableHeadsDownCallKey(normalizedKey)) {
-    const copy = CANONICAL_CALL_COPY[normalizedKey];
+  if (constrained) {
     return {
-      key: normalizedKey,
-      sourceKey: normalizedKey,
-      fallbackApplied: false,
-      ...copy,
+      severity: "caution",
+      urgency: "normal",
+      confidence: "estimated",
+      allowedUiIntents: [],
+      reasonCodes: ["scope_uncertain"],
     };
   }
 
-  const fallbackKey = resolveUnknownHeadsDownCallFallback(input.fallbackSignals);
-  const fallbackCopy = unknownFallbackCopy(fallbackKey);
+  if (signals?.noActionNeededExplicit === true && signals?.inBoundsExplicit === true) {
+    return {
+      severity: "neutral",
+      urgency: "normal",
+      confidence: "exact",
+      allowedUiIntents: [],
+      reasonCodes: [
+        "no_action_needed",
+        "runs_within_bounds",
+        "zero_pending_asks",
+        "limits_holding",
+      ],
+    };
+  }
 
   return {
-    key: fallbackKey,
-    sourceKey: normalizedKey.length > 0 ? normalizedKey : null,
-    fallbackApplied: true,
-    title: input.title?.trim() || fallbackCopy.title,
-    body: input.body?.trim() || fallbackCopy.body,
-    primaryLabel: fallbackCopy.primaryLabel,
-    primaryActionKey: fallbackCopy.primaryActionKey,
-    primaryUiIntent: fallbackCopy.primaryUiIntent,
-    secondaryLabel: fallbackCopy.secondaryLabel,
-    secondaryActionKey: fallbackCopy.secondaryActionKey,
-    secondaryUiIntent: fallbackCopy.secondaryUiIntent,
+    severity: "neutral",
+    urgency: "normal",
+    confidence: "exact",
+    allowedUiIntents: [],
+    reasonCodes: [],
   };
 }
 
-function unknownFallbackCopy(key: RenderableHeadsDownCallKey): RenderLabels {
-  if (key === "needs_your_yes") {
-    return {
-      ...CANONICAL_CALL_COPY.needs_your_yes,
-      body: "HeadsDown needs a human decision before this agent continues.",
-      secondaryLabel: "Why this call?",
-      secondaryActionKey: null,
-      secondaryUiIntent: "view_details",
-    };
+function promptAction(
+  rendered: AgentRenderedAction | null,
+  defaults: PromptActionDefaults,
+  slot: "primary" | "secondary",
+): {
+  label: string | null;
+  actionKey: HeadsDownActionKey | null;
+  uiIntent: HeadsDownUiIntent | null;
+} {
+  if (rendered) {
+    return { label: rendered.label, actionKey: rendered.key, uiIntent: null };
   }
 
-  if (key === "keep_it_tight") {
-    return {
-      ...CANONICAL_CALL_COPY.keep_it_tight,
-      primaryLabel: "Why this call?",
-      primaryActionKey: null,
-      primaryUiIntent: "view_details",
-      secondaryLabel: null,
-      secondaryActionKey: null,
-      secondaryUiIntent: null,
-    };
-  }
+  return slot === "primary"
+    ? {
+        label: defaults.primaryLabel ?? actionLabel(defaults.primaryActionKey),
+        actionKey: defaults.primaryActionKey,
+        uiIntent: defaults.primaryUiIntent,
+      }
+    : {
+        label: defaults.secondaryLabel ?? actionLabel(defaults.secondaryActionKey),
+        actionKey: defaults.secondaryActionKey,
+        uiIntent: defaults.secondaryUiIntent,
+      };
+}
 
-  return CANONICAL_CALL_COPY[key];
+function actionLabel(actionKey: HeadsDownActionKey | null): string | null {
+  switch (actionKey) {
+    case "continue":
+      return "Continue";
+    case "continue_with_limit":
+      return "Continue with limit";
+    case "narrow_scope":
+      return "Narrow scope";
+    case "ask_user":
+      return "Ask user";
+    case "queue_for_later":
+      return "Queue for later";
+    case "queue_for_morning":
+      return "Queue for morning";
+    case "pause_and_summarize":
+      return "Pause and summarize";
+    case "stop_run":
+      return "Stop run";
+    case "resume_run":
+      return "Resume run";
+    case "allow_once":
+      return "Allow once";
+    case "allow_for_duration":
+      return "Allow for duration";
+    case "create_temporary_exception":
+      return "Create temporary exception";
+    case "keep_queued":
+      return "Keep queued";
+    default:
+      return null;
+  }
+}
+
+function defaultActionKeys(defaults: PromptActionDefaults): HeadsDownActionKey[] {
+  return [defaults.primaryActionKey, defaults.secondaryActionKey].filter(
+    (value): value is HeadsDownActionKey => value !== null,
+  );
+}
+
+function normalizeActionKeys(
+  values: readonly (HeadsDownActionKey | string)[] | null | undefined,
+): HeadsDownActionKey[] {
+  if (!values || values.length === 0) return [];
+  return [
+    ...new Set(
+      values.map(normalizeActionKey).filter((value): value is HeadsDownActionKey => !!value),
+    ),
+  ];
+}
+
+function normalizeActionKey(
+  value: HeadsDownActionKey | string | null | undefined,
+): HeadsDownActionKey | null {
+  const normalized = normalizeCallKey(value);
+  return normalized && isHeadsDownActionKey(normalized) ? normalized : null;
+}
+
+function normalizeReasonCodes(values: readonly string[] | null | undefined): string[] {
+  if (!values || values.length === 0) return [];
+  return [...new Set(values.map(cleanText).filter((value): value is string => !!value))];
+}
+
+function normalizePrivacyMode(value: string | null | undefined): HeadsDownCall["privacyMode"] {
+  const normalized = normalizeCallKey(value);
+
+  switch (normalized) {
+    case "privacy_safe":
+    case "privacy_restricted":
+    case "unknown":
+      return normalized;
+    default:
+      return "unknown";
+  }
 }
 
 function normalizeCallKey(key: string | null | undefined): string {
-  return key?.trim().toLowerCase() ?? "";
+  return (
+    key
+      ?.trim()
+      .replace(/([a-z\d])([A-Z])/g, "$1_$2")
+      .replace(/[\s-]+/g, "_")
+      .replace(/__+/g, "_")
+      .toLowerCase() ?? ""
+  );
+}
+
+function cleanText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.replace(/[\r\n\t]+/g, " ").trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 export function formatHeadsDownCallForPrompt(rendered: RenderedHeadsDownCallCopy): string {

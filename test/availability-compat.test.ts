@@ -166,77 +166,35 @@ describe("headsdown compaction helper", () => {
   });
 });
 
-describe("availability override compatibility", () => {
-  it("uses native SDK override methods when available", async () => {
-    const created = await __internal.createAvailabilityOverrideCompat(
-      {
-        createAvailabilityOverride: async (input: unknown) => ({ id: "ovr-1", input }),
-      } as any,
-      { mode: "busy", durationMinutes: 30 },
-    );
-
-    expect(created).toEqual({ id: "ovr-1", input: { mode: "busy", durationMinutes: 30 } });
+describe("availability override SDK input", () => {
+  it("builds duration-based SDK input", () => {
+    expect(
+      __internal.availabilityOverrideInput({
+        mode: "busy",
+        durationMinutes: 30,
+        reason: "focus",
+        source: "pi",
+      }),
+    ).toEqual({ mode: "busy", durationMinutes: 30, reason: "focus", source: "pi" });
   });
 
-  it("falls back to GraphQL for active/get/cancel override when SDK methods are absent", async () => {
-    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
-    const client = {
-      graphql: {
-        async request(query: string, variables?: Record<string, unknown>) {
-          calls.push({ query, variables });
-          if (query.includes("query ActiveAvailabilityOverride")) {
-            return {
-              activeAvailabilityOverride: {
-                id: "ovr-1",
-                mode: "busy",
-              },
-            };
-          }
-          if (query.includes("mutation CreateAvailabilityOverride")) {
-            return {
-              createAvailabilityOverride: {
-                id: "ovr-2",
-                mode: "limited",
-              },
-            };
-          }
-          return {
-            cancelAvailabilityOverride: {
-              id: "ovr-2",
-              mode: "limited",
-              cancelledAt: "2026-04-21T00:00:00Z",
-            },
-          };
-        },
-      },
-    };
+  it("builds expires-at SDK input", () => {
+    expect(
+      __internal.availabilityOverrideInput({
+        mode: "limited",
+        expiresAt: "2026-04-21T00:00:00Z",
+        source: "pi",
+      }),
+    ).toEqual({ mode: "limited", expiresAt: "2026-04-21T00:00:00Z", source: "pi" });
+  });
 
-    const active = await __internal.getActiveAvailabilityOverrideCompat(client as any);
-    expect(active).toEqual({ id: "ovr-1", mode: "busy" });
-
-    const created = await __internal.createAvailabilityOverrideCompat(client as any, {
-      mode: "limited",
-      durationMinutes: 20,
-      source: "pi",
-    });
-    expect(created).toEqual({ id: "ovr-2", mode: "limited" });
-
-    const cancelled = await __internal.cancelAvailabilityOverrideCompat(
-      client as any,
-      "ovr-2",
-      "done",
-    );
-    expect(cancelled).toEqual({
-      id: "ovr-2",
-      mode: "limited",
-      cancelledAt: "2026-04-21T00:00:00Z",
-    });
-
-    expect(calls[0]!.query).toContain("ActiveAvailabilityOverride");
-    expect(calls[1]!.variables).toEqual({
-      input: { mode: "LIMITED", durationMinutes: 20, source: "pi" },
-    });
-    expect(calls[2]!.variables).toEqual({ id: "ovr-2", reason: "done", source: "pi" });
+  it("requires a duration or absolute expiry before calling the SDK", () => {
+    expect(() =>
+      __internal.availabilityOverrideInput({
+        mode: "offline",
+        source: "pi",
+      }),
+    ).toThrow("duration_minutes or expires_at is required");
   });
 });
 

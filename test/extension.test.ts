@@ -53,8 +53,8 @@ describe("Extension file", () => {
     expect(content).toContain("createDelegationGrant");
     expect(content).toContain("revokeDelegationGrant");
     expect(content).toContain('name: "headsdown_override"');
-    expect(content).toContain("createAvailabilityOverrideCompat");
-    expect(content).toContain("cancelAvailabilityOverrideCompat");
+    expect(content).toContain("createAvailabilityOverride");
+    expect(content).toContain("cancelAvailabilityOverride");
     expect(content).toContain('name: "headsdown_digest"');
     expect(content).toContain("listDigestSummaries");
     expect(content).toContain('name: "headsdown_continuation"');

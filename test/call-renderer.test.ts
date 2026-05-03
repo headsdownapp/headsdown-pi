@@ -9,8 +9,6 @@ import {
 describe("renderHeadsDownCallCopy", () => {
   it("renders every active canonical HeadsDown call key", () => {
     for (const key of CANONICAL_HEADSDOWN_CALL_KEYS) {
-      if (key === "rabbit_hole_detected") continue;
-
       const rendered = renderHeadsDownCallCopy({ key });
       expect(rendered?.key).toBe(key);
       expect(rendered?.fallbackApplied).toBe(false);
@@ -21,9 +19,15 @@ describe("renderHeadsDownCallCopy", () => {
     }
   });
 
-  it("treats legacy rabbit_hole_detected calls as no-op render events", () => {
-    expect(renderHeadsDownCallCopy({ key: "rabbit_hole_detected" })).toBeNull();
-    expect(renderHeadsDownCallCopy({ key: "RABBIT_HOLE_DETECTED" })).toBeNull();
+  it("renders rabbit_hole_detected through the SDK canonical fallback", () => {
+    const rendered = renderHeadsDownCallCopy({ key: "rabbit_hole_detected" });
+
+    expect(rendered?.key).toBe("rabbit_hole_detected");
+    expect(rendered?.fallbackApplied).toBe(false);
+    expect(rendered?.title).toBe("Rabbit hole detected");
+    expect(renderHeadsDownCallCopy({ key: "RABBIT_HOLE_DETECTED" })?.key).toBe(
+      "rabbit_hole_detected",
+    );
   });
 
   it("keeps backend action keys and UI intents separate for needs_your_yes", () => {
@@ -61,7 +65,7 @@ describe("renderHeadsDownCallCopy", () => {
     expect(rendered?.key).toBe("finish_line_friction");
     expect(rendered?.fallbackApplied).toBe(false);
     expect(rendered?.title).toBe("Finish-line friction");
-    expect(rendered?.body).toContain("validation or delivery is stuck");
+    expect(rendered?.body).toContain("Validation or delivery is stuck");
     expect(rendered?.body).not.toContain("growing past the size");
     expect(rendered?.primaryActionKey).toBe("pause_and_summarize");
     expect(rendered?.secondaryActionKey).toBe("allow_for_duration");
@@ -71,22 +75,22 @@ describe("renderHeadsDownCallCopy", () => {
     const rendered = renderHeadsDownCallCopy({ key: "off_the_clock" });
 
     expect(rendered?.title).toBe("Off the clock");
-    expect(rendered?.primaryLabel).toBe("Queued for morning");
+    expect(rendered?.primaryLabel).toBe("Queue for morning");
     expect(rendered?.primaryActionKey).toBe("queue_for_morning");
-    expect(rendered?.body).toContain("Your night stays yours");
+    expect(rendered?.body).toContain("Queue this for later");
   });
 
   it("renders attention_window_closing with extend and wrap actions", () => {
     const rendered = renderHeadsDownCallCopy({ key: "attention_window_closing" });
     expect(rendered?.key).toBe("attention_window_closing");
     expect(rendered?.title).toBe("Window closing");
-    expect(rendered?.primaryLabel).toBe("Extend");
+    expect(rendered?.primaryLabel).toBe("Allow for duration");
     expect(rendered?.primaryActionKey).toBe("allow_for_duration");
-    expect(rendered?.secondaryLabel).toBe("Wrap");
+    expect(rendered?.secondaryLabel).toBe("Pause and summarize");
     expect(rendered?.secondaryActionKey).toBe("pause_and_summarize");
     const output = formatHeadsDownCallForPrompt(rendered!);
-    expect(output).toContain("Primary: Extend (action=allow_for_duration)");
-    expect(output).toContain("Secondary: Wrap (action=pause_and_summarize)");
+    expect(output).toContain("Primary: Allow for duration (action=allow_for_duration)");
+    expect(output).toContain("Secondary: Pause and summarize (action=pause_and_summarize)");
   });
 
   it("falls back to needs_your_yes for unknown action/risk/boundary signals", () => {
@@ -100,8 +104,8 @@ describe("renderHeadsDownCallCopy", () => {
     expect(rendered?.body).toBe("HeadsDown needs a human decision before this agent continues.");
     expect(rendered?.primaryActionKey).toBeNull();
     expect(rendered?.primaryUiIntent).toBe("review_request");
-    expect(rendered?.secondaryActionKey).toBeNull();
-    expect(rendered?.secondaryUiIntent).toBe("view_details");
+    expect(rendered?.secondaryActionKey).toBe("keep_queued");
+    expect(rendered?.secondaryUiIntent).toBeNull();
   });
 
   it("falls back to keep_it_tight for unknown limit/scope/validation uncertainty", () => {
@@ -112,13 +116,13 @@ describe("renderHeadsDownCallCopy", () => {
 
     expect(rendered?.fallbackApplied).toBe(true);
     expect(rendered?.key).toBe("keep_it_tight");
-    expect(rendered?.body).toContain("useful slice");
-    expect(rendered?.primaryLabel).toBe("Why this call?");
-    expect(rendered?.primaryActionKey).toBeNull();
-    expect(rendered?.primaryUiIntent).toBe("view_details");
-    expect(rendered?.secondaryLabel).toBeNull();
+    expect(rendered?.body).toContain("stay inside a tighter slice");
+    expect(rendered?.primaryLabel).toBe("Narrow scope");
+    expect(rendered?.primaryActionKey).toBe("narrow_scope");
+    expect(rendered?.primaryUiIntent).toBeNull();
+    expect(rendered?.secondaryLabel).toBe("Why this call?");
     expect(rendered?.secondaryActionKey).toBeNull();
-    expect(rendered?.secondaryUiIntent).toBeNull();
+    expect(rendered?.secondaryUiIntent).toBe("view_details");
   });
 
   it("falls back to all_contained only with explicit no-action and in-bounds signals", () => {
@@ -169,12 +173,29 @@ describe("renderHeadsDownCallCopy", () => {
       key: "future_call_key",
       title: "Server call title",
       body: "Server call body",
+      privacyMode: "privacy_safe",
       fallbackSignals: { limitSignal: true },
     });
 
     expect(rendered?.key).toBe("keep_it_tight");
     expect(rendered?.title).toBe("Server call title");
     expect(rendered?.body).toBe("Server call body");
+  });
+
+  it("does not use server-provided title/body without explicit privacy-safe mode", () => {
+    for (const privacyMode of [undefined, "privacy_restricted"] as const) {
+      const rendered = renderHeadsDownCallCopy({
+        key: "future_call_key",
+        title: "Server call title",
+        body: "Server call body",
+        privacyMode,
+        fallbackSignals: { limitSignal: true },
+      });
+
+      expect(rendered?.key).toBe("keep_it_tight");
+      expect(rendered?.title).toBe("Keep it tight");
+      expect(rendered?.body).toContain("stay inside a tighter slice");
+    }
   });
 
   it("formats prompt/output copy for Pi with explicit action vs UI intent transport", () => {
