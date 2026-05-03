@@ -65,6 +65,7 @@ async function useConfigFile(config: Record<string, unknown> | string) {
   const path = join(dir, "config.json");
   await writeFile(path, typeof config === "string" ? config : JSON.stringify(config), "utf-8");
   vi.spyOn(ConfigStore.prototype, "filePath", "get").mockReturnValue(path);
+  process.env.HEADSDOWN_AUTOPILOT_STATE_PATH = join(dir, "autopilot-state.json");
   tempDirs.push(dir);
 }
 
@@ -122,10 +123,16 @@ async function fireTurnEnd(
 }
 
 const tempDirs: string[] = [];
+const originalAutopilotStatePath = process.env.HEADSDOWN_AUTOPILOT_STATE_PATH;
 
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  if (originalAutopilotStatePath === undefined) {
+    delete process.env.HEADSDOWN_AUTOPILOT_STATE_PATH;
+  } else {
+    process.env.HEADSDOWN_AUTOPILOT_STATE_PATH = originalAutopilotStatePath;
+  }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -455,6 +462,95 @@ describe("autopilot deferral turn_end hook", () => {
       "[HeadsDown] Unable to read fresh autopilot policy; using the conservative fallback. policy unavailable",
       "warning",
     );
+  });
+
+  it("marks a refined re-attempt superseded when autopilot defers it again", async () => {
+    await useConfigFile({
+      wakeUpDigest: { enabled: true },
+      autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 },
+    });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("offline", events, {
+      escalationStrategy: ["DEFER_FOR_HUMAN_REVIEW"],
+    }) as ReturnType<typeof makeClient> & {
+      listAgentRunEvents: ReturnType<typeof vi.fn>;
+      reportDeferredDecisionReAttempted: ReturnType<typeof vi.fn>;
+    };
+    const recordedEvent = {
+      eventType: "deferred_decision.recorded",
+      eventId: "event-recorded-refined",
+      id: "event-recorded-refined",
+      runId: "run-original",
+      occurredAt: "2026-04-30T10:00:00.000Z",
+      insertedAt: "2026-04-30T10:00:00.000Z",
+      payload: {
+        decision_id: "decision_original123456",
+        decision_kind: "would_have_asked",
+        decision_category: "validation",
+        urgency_bucket: "normal",
+        flagged_for_review: true,
+        local_session_summary: {
+          version: 1,
+          sessionId: "run-original",
+          generatedAt: "2026-04-30T10:00:00.000Z",
+          stale: false,
+          toolCallCount: 4,
+          fileChangeCount: 2,
+          deferredDecisionCount: 1,
+          continuationArtifactAvailable: true,
+          validationLocallyPassed: false,
+          approvedProposalRef: "proposal-1",
+          outcomeCategory: "in_progress",
+        },
+      },
+    };
+    const refinedEvent = {
+      ...recordedEvent,
+      eventType: "deferred_decision.resolved",
+      eventId: "event-resolved-refined",
+      id: "event-resolved-refined",
+      payload: {
+        decision_id: "decision_original123456",
+        resolution_kind: "refined",
+        refined_urgency_bucket: "elevated",
+        refined_decision_category: "validation",
+        resolved_action_key: "resume_run",
+      },
+    };
+    client.listAgentRunEvents = vi.fn(async ({ eventType, resolutionKind }) => {
+      if (eventType === "deferred_decision.recorded") return [recordedEvent];
+      if (eventType === "deferred_decision.resolved" && resolutionKind === "refined") {
+        return [refinedEvent];
+      }
+      if (eventType === "deferred_decision.resolved") return [refinedEvent];
+      return [];
+    });
+    client.reportDeferredDecisionReAttempted = vi.fn(async () => ({
+      ok: true,
+      event: null,
+      error: null,
+    }));
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const beforeAgentStart = handlers.get("before_agent_start")?.at(0);
+    if (!beforeAgentStart) throw new Error("before_agent_start handler was not registered");
+    const promptResult = await beforeAgentStart({ prompt: "continue", systemPrompt: "base" }, ctx);
+    expect(promptResult?.systemPrompt).toContain("Previously deferred and refined decisions");
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 1);
+
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
+    const deferral = events.find((event) => event.eventType === "deferred_decision.recorded");
+    expect(deferral?.payload).toMatchObject({ parent_decision_id: "decision_original123456" });
+    expect(client.reportDeferredDecisionReAttempted).toHaveBeenCalledTimes(1);
+    expect(client.reportDeferredDecisionReAttempted.mock.calls[0]?.[1]).toMatchObject({
+      decision_id: "decision_original123456",
+      outcome: "superseded",
+    });
   });
 
   it("records immediately when policy requires deferral and remains idempotent for the same turn", async () => {

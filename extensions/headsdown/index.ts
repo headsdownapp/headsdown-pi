@@ -60,6 +60,7 @@ import type {
   ScheduleResolution,
   Verdict,
 } from "@headsdown/sdk";
+
 import {
   applyTrustPolicy,
   decideAutoThinking,
@@ -113,7 +114,9 @@ import {
   type AutopilotEscalationOutcome,
 } from "./autopilot-deferral.js";
 import {
+  hasDecisionIdReAttempted,
   loadAutopilotState,
+  markDecisionIdsReAttempted,
   removeDecisionIdsFromSurfaced,
   saveAutopilotState,
   type AutopilotState,
@@ -121,10 +124,12 @@ import {
 import {
   assertPrivacySafeDeferredDecisionOutput,
   detectModeTransition,
+  formatRefinedReAttemptInstruction,
   formatWakeUpDigestInstruction,
   groupDeferredDecisionEntries,
   isSafeOpaqueToken,
   listUnresolvedDeferredDecisionEntries,
+  loadRefinedResolutions,
   markWakeUpDigestSurfaced,
   normalizeDecisionCategoryToken,
   normalizeUrgencyBucketToken,
@@ -135,9 +140,19 @@ import {
   type DeferredDecisionEventClient,
   type DeferredDecisionGroup,
   type ModeTransition,
+  type RefinedDeferredDecisionReAttempt,
   type WakeUpDigestConfig,
   type WakeUpDigestSummary,
 } from "./wake-up-digest.js";
+
+type DeferredDecisionReAttemptOutcome = "superseded" | "succeeded" | "failed" | "abandoned";
+
+type DeferredDecisionReAttemptedPayload = {
+  decision_id: string;
+  outcome: DeferredDecisionReAttemptOutcome;
+  local_session_summary?: LocalSessionSummary;
+  notes_bucket?: DeferredDecisionNotesBucket;
+};
 
 // === State ===
 
@@ -1744,6 +1759,7 @@ function buildDeferredDecisionEventInput(input: {
   telemetry: PiRunTelemetry;
   proposal: ProposalRecord | null;
   decisionId?: string;
+  parentDecisionId?: string;
   decisionKind: ReturnType<typeof pickDecisionKind>;
   decisionCategory: ReturnType<typeof pickDecisionCategory>;
   urgencyBucket: AutopilotDeferralUrgencyBucket;
@@ -1763,6 +1779,7 @@ function buildDeferredDecisionEventInput(input: {
     eventType: "deferred_decision.recorded",
     payload: stripUndefinedValues({
       decision_id: decisionId,
+      parent_decision_id: input.parentDecisionId,
       decision_kind: input.decisionKind,
       decision_category: input.decisionCategory,
       urgency_bucket: input.urgencyBucket,
@@ -2576,6 +2593,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let activeTimeBox: TimeBoxState | null = null;
   let lastObservedModeInProcess: Mode | null = null;
   let wakeUpDigestCache: { summary: WakeUpDigestSummary; fetchedAt: number } | null = null;
+  let refinedReAttemptsCache: {
+    attempts: RefinedDeferredDecisionReAttempt[];
+    fetchedAt: number;
+  } | null = null;
+  const activeRefinedReAttempts = new Map<string, RefinedDeferredDecisionReAttempt>();
+  const reportedRefinedReAttemptOutcomes = new Set<string>();
   let lastAutopilotFailureNoticeAt = 0;
   let lastAutopilotPolicyFailureNoticeAt = 0;
   let autopilotProgressVersion = 0;
@@ -3631,6 +3654,210 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     });
   }
 
+  function reAttemptSessionId(ctx: ExtensionContext): string {
+    return getSessionId(ctx) ?? "session_unknown";
+  }
+
+  function refinedReAttemptKey(
+    sessionId: string,
+    attempt: RefinedDeferredDecisionReAttempt,
+  ): string {
+    return `${sessionId}\0${attempt.run_id}\0${attempt.decision_id}`;
+  }
+
+  async function getCurrentRefinedReAttempts(
+    ctx: ExtensionContext,
+    options: { force?: boolean } = {},
+  ): Promise<RefinedDeferredDecisionReAttempt[]> {
+    const now = Date.now();
+    if (
+      !options.force &&
+      refinedReAttemptsCache &&
+      now - refinedReAttemptsCache.fetchedAt < 60_000
+    ) {
+      return refinedReAttemptsCache.attempts;
+    }
+
+    const config = await loadConfig();
+    if (!config.wakeUpDigest.enabled || !config.wakeUpDigest.reAttemptRefined) {
+      refinedReAttemptsCache = { attempts: [], fetchedAt: now };
+      return [];
+    }
+
+    const client = await getClient();
+    if (!client) return [];
+    const eventClient = asDeferredDecisionEventClient(withActorContext(client, ctx));
+    if (!eventClient) return [];
+
+    const attempts = await loadRefinedResolutions(eventClient, {
+      daysBack: config.wakeUpDigest.reAttemptWindowDays,
+      limit: config.wakeUpDigest.maxEntriesShown,
+    });
+    refinedReAttemptsCache = { attempts, fetchedAt: now };
+    return attempts;
+  }
+
+  async function buildRefinedReAttemptInstruction(ctx: ExtensionContext): Promise<string | null> {
+    const config = await loadConfig();
+    if (!config.wakeUpDigest.enabled || !config.wakeUpDigest.reAttemptRefined) return null;
+
+    const attempts = await getCurrentRefinedReAttempts(ctx);
+    if (attempts.length === 0) return null;
+
+    const sessionId = reAttemptSessionId(ctx);
+    const state = await loadAutopilotState();
+    const pending = attempts.filter(
+      (attempt) => !hasDecisionIdReAttempted(state, sessionId, attempt.run_id, attempt.decision_id),
+    );
+    const shown = pending.slice(0, config.wakeUpDigest.maxEntriesShown);
+    const instruction = formatRefinedReAttemptInstruction(
+      shown,
+      config.wakeUpDigest.maxEntriesShown,
+    );
+    if (!instruction) return null;
+
+    assertPrivacySafeDeferredDecisionOutput(
+      shown.map((attempt) => ({
+        decision_id: attempt.decision_id,
+        run_id: attempt.run_id,
+        resolved_action_key: attempt.resolved_action_key,
+        refined_urgency_bucket: attempt.refined_urgency_bucket,
+        refined_decision_category: attempt.refined_decision_category,
+        notes_bucket: attempt.notes_bucket,
+        summary: attempt.original.summary,
+      })),
+    );
+
+    for (const attempt of shown) {
+      activeRefinedReAttempts.set(refinedReAttemptKey(sessionId, attempt), attempt);
+    }
+    await saveAutopilotState(
+      markDecisionIdsReAttempted(
+        state,
+        sessionId,
+        shown.map((attempt) => ({ runId: attempt.run_id, decisionId: attempt.decision_id })),
+      ),
+    );
+    return instruction;
+  }
+
+  function reAttemptOutcomeRunId(
+    ctx: ExtensionContext,
+    attempt: RefinedDeferredDecisionReAttempt,
+  ): string {
+    return `run_${safeIdToken(`${reAttemptSessionId(ctx)}:${attempt.run_id}`)}`;
+  }
+
+  async function reportDeferredDecisionReAttemptOutcome(
+    ctx: ExtensionContext,
+    attempt: RefinedDeferredDecisionReAttempt,
+    outcome: DeferredDecisionReAttemptOutcome,
+  ): Promise<void> {
+    const sessionId = reAttemptSessionId(ctx);
+    const key = refinedReAttemptKey(sessionId, attempt);
+    if (reportedRefinedReAttemptOutcomes.has(key)) return;
+    const client = await getClientOrThrow();
+    const actorClient = withActorContext(client, ctx);
+    const method = (
+      actorClient as unknown as {
+        reportDeferredDecisionReAttempted?: (
+          context: Record<string, unknown>,
+          payload: DeferredDecisionReAttemptedPayload,
+        ) => Promise<unknown>;
+      }
+    ).reportDeferredDecisionReAttempted;
+
+    const context = {
+      workspaceRef: "unknown",
+      runId: reAttemptOutcomeRunId(ctx, attempt),
+      source: "pi_skill",
+      client: { kind: "pi", name: "Pi", version: HEADSDOWN_PI_CLIENT_VERSION },
+      actor: { kind: "agent", ref: "pi" },
+      correlationId: attempt.run_id,
+      idempotencyKey: `${reAttemptOutcomeRunId(ctx, attempt)}:deferred_decision.re_attempted:${attempt.decision_id}`,
+    };
+    const payload: DeferredDecisionReAttemptedPayload = {
+      decision_id: attempt.decision_id,
+      outcome,
+      ...(attempt.local_session_summary
+        ? { local_session_summary: attempt.local_session_summary }
+        : {}),
+      ...(attempt.notes_bucket
+        ? { notes_bucket: attempt.notes_bucket as DeferredDecisionNotesBucket }
+        : {}),
+    };
+    assertPrivacySafeDeferredDecisionOutput(payload);
+
+    try {
+      const result =
+        typeof method === "function"
+          ? await method.call(actorClient, context, payload)
+          : await reportPiAgentRunEventResult({
+              ...context,
+              eventType: "deferred_decision.re_attempted",
+              payload,
+            });
+      assertResolutionReportSucceeded(result);
+      reportedRefinedReAttemptOutcomes.add(key);
+      activeRefinedReAttempts.delete(key);
+    } catch (error) {
+      if (isAlreadyResolvedError(error)) {
+        reportedRefinedReAttemptOutcomes.add(key);
+        activeRefinedReAttempts.delete(key);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  function singleActiveRefinedReAttemptForAction(
+    actionKey: HeadsDownActionKey,
+  ): RefinedDeferredDecisionReAttempt | null {
+    const attempts = [...activeRefinedReAttempts.values()].filter(
+      (attempt) => attempt.resolved_action_key === actionKey,
+    );
+    return attempts.length === 1 ? attempts[0] : null;
+  }
+
+  async function reportRefinedReAttemptOutcomeForAction(
+    ctx: ExtensionContext,
+    actionKey: HeadsDownActionKey,
+    outcome: Extract<DeferredDecisionReAttemptOutcome, "succeeded" | "failed">,
+  ): Promise<void> {
+    const attempt = singleActiveRefinedReAttemptForAction(actionKey);
+    if (!attempt) return;
+    await reportDeferredDecisionReAttemptOutcome(ctx, attempt, outcome);
+  }
+
+  async function reportSucceededRefinedReAttemptForAction(
+    ctx: ExtensionContext,
+    actionKey: HeadsDownActionKey,
+  ): Promise<void> {
+    await reportRefinedReAttemptOutcomeForAction(ctx, actionKey, "succeeded");
+  }
+
+  function singleActiveRefinedReAttempt(): RefinedDeferredDecisionReAttempt | null {
+    return activeRefinedReAttempts.size === 1
+      ? (activeRefinedReAttempts.values().next().value ?? null)
+      : null;
+  }
+
+  async function reportAbandonedRefinedReAttempts(ctx: ExtensionContext): Promise<void> {
+    const failures: string[] = [];
+    for (const attempt of [...activeRefinedReAttempts.values()]) {
+      try {
+        await reportDeferredDecisionReAttemptOutcome(ctx, attempt, "abandoned");
+      } catch (error) {
+        failures.push(sanitizeErrorMessage(error));
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(
+        `${failures.length} refined re-attempt outcome report(s) failed: ${failures[0]}`,
+      );
+    }
+  }
+
   async function getCurrentWakeUpDigestSummary(
     ctx: ExtensionContext,
     options: { force?: boolean } = {},
@@ -3763,7 +3990,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (value === undefined) return undefined;
     const normalized = normalizeUrgencyBucketToken(value);
     if (normalized && normalized !== "unknown") return normalized;
-    throw new Error("refined_urgency_bucket must be one of low, normal, or high.");
+    throw new Error("refined_urgency_bucket must be one of low, normal, elevated, or high.");
   }
 
   function validateOptionalRefinedDecisionCategory(value: string | undefined): string | undefined {
@@ -3864,11 +4091,28 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return "dismissed";
   }
 
+  function validateDeferredResolutionParamsForAction(
+    action: HeadsDownDeferredToolAction,
+    params: HeadsDownDeferredToolParams,
+  ): void {
+    if (action !== "override" && params.resolved_action_key !== undefined) {
+      throw new Error("resolved_action_key is only supported when action='override'.");
+    }
+    const hasRefineOnlyParams =
+      params.refined_urgency_bucket !== undefined ||
+      params.refined_decision_category !== undefined ||
+      params.notes_bucket !== undefined;
+    if (action !== "refine" && hasRefineOnlyParams) {
+      throw new Error("refined fields and notes_bucket are only supported when action='refine'.");
+    }
+  }
+
   function buildDeferredDecisionResolvedPayload(
     action: HeadsDownDeferredToolAction,
     params: HeadsDownDeferredToolParams,
     entry: DeferredDecisionEntry,
   ): DeferredDecisionResolvedPayload {
+    validateDeferredResolutionParamsForAction(action, params);
     const resolvedActionKey =
       action === "override" && params.resolved_action_key
         ? normalizeActionKey(params.resolved_action_key)
@@ -3884,6 +4128,11 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const notesBucket = validateOptionalNotesBucket(params.notes_bucket);
     if (action === "override" && !resolvedActionKey) {
       throw new Error("resolved_action_key is required when action='override'.");
+    }
+    if (action === "refine" && !refinedUrgencyBucket && !refinedDecisionCategory && !notesBucket) {
+      throw new Error(
+        "At least one refined_urgency_bucket, refined_decision_category, or notes_bucket is required when action='refine'.",
+      );
     }
 
     const payload: DeferredDecisionResolvedPayload = {
@@ -3903,9 +4152,13 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return payload;
   }
 
-  function isDuplicateResolutionError(error: unknown): boolean {
+  function isAlreadyResolvedMessage(message: string): boolean {
+    return /already(?: been)? (?:resolved|recorded)/i.test(message);
+  }
+
+  function isAlreadyResolvedError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
-    return /already|duplicate|unique|idempotency/i.test(message);
+    return isAlreadyResolvedMessage(message);
   }
 
   function isAlreadyResolvedPayload(value: unknown): boolean {
@@ -3914,17 +4167,23 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (payload.ok === true) return false;
     const code = typeof payload.error?.code === "string" ? payload.error.code : "";
     const message = typeof payload.error?.message === "string" ? payload.error.message : "";
-    return /already|duplicate|unique|idempotency/i.test(`${code} ${message}`);
+    return isAlreadyResolvedMessage(`${code} ${message}`);
   }
 
   function assertResolutionReportSucceeded(value: unknown): void {
     if (!value || typeof value !== "object") return;
-    const payload = value as { ok?: unknown; error?: { message?: unknown } | null };
+    const payload = value as {
+      ok?: unknown;
+      error?: { message?: unknown } | null;
+      errorMessage?: unknown;
+    };
     if (payload.ok !== false) return;
     const message =
       typeof payload.error?.message === "string"
         ? payload.error.message
-        : "Resolution write failed.";
+        : typeof payload.errorMessage === "string"
+          ? payload.errorMessage
+          : "Resolution write failed.";
     throw new Error(message);
   }
 
@@ -3949,13 +4208,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       throw new Error("HeadsDown SDK does not expose reportDeferredDecisionResolved.");
     }
 
-    const actorContext = buildActorContext(ctx);
     const context = {
-      workspaceRef: actorContext.workspaceRef,
+      workspaceRef: "unknown",
       runId: entry.run_id,
-      source: "pi",
-      client: { kind: "pi_extension", name: "headsdown-pi", version: HEADSDOWN_PI_CLIENT_VERSION },
-      actor: { kind: "agent", ref: "pi-agent" },
+      source: "pi_skill",
+      client: { kind: "pi", name: "Pi", version: HEADSDOWN_PI_CLIENT_VERSION },
+      actor: { kind: "agent", ref: "pi" },
       correlationId: entry.run_id,
       idempotencyKey: `${entry.run_id}:deferred_decision.resolved:${entry.decision_id}`,
     };
@@ -3967,7 +4225,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       assertResolutionReportSucceeded(result);
       return { ok: true, alreadyResolved: false };
     } catch (error) {
-      if (isDuplicateResolutionError(error)) return { ok: true, alreadyResolved: true };
+      if (isAlreadyResolvedError(error)) return { ok: true, alreadyResolved: true };
       throw error;
     }
   }
@@ -4412,6 +4670,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     availabilitySnapshot = null;
     lastObservedModeInProcess = null;
     wakeUpDigestCache = null;
+    refinedReAttemptsCache = null;
+    activeRefinedReAttempts.clear();
+    reportedRefinedReAttemptOutcomes.clear();
     autoQueuedRunIds = new Set<string>();
     resetAutopilotRuntimeState();
     attentionWindowDedupe.clear();
@@ -4433,6 +4694,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       );
     }
 
+    try {
+      await getCurrentRefinedReAttempts(ctx, { force: true });
+    } catch {
+      refinedReAttemptsCache = { attempts: [], fetchedAt: Date.now() };
+    }
+
     if (sessionStartReason === "resume" && (await continuationExists()) && ctx.hasUI) {
       ctx.ui.notify(
         "[HeadsDown] Continuation artifact found. Load it with headsdown_continuation.",
@@ -4444,6 +4711,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     restoreProposalState(ctx);
     restoreTimeBoxState(ctx);
+    refinedReAttemptsCache = null;
     resetAutopilotRuntimeState();
     await updateStatusUI(ctx);
     updateTimeBoxUI(ctx, activeWrapUpDeadlineAt(availabilitySnapshot?.schedule?.wrapUpGuidance));
@@ -4501,6 +4769,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     const shutdownReason = (event as { reason?: string }).reason;
     appendContinuityEntry("shutdown", { shutdownReason });
+    try {
+      await reportAbandonedRefinedReAttempts(ctx);
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `[HeadsDown] Unable to record abandoned refined re-attempts: ${sanitizeErrorMessage(error)}.`,
+          "warning",
+        );
+      }
+    }
     await saveAutomaticContinuation("session-shutdown", ctx);
 
     const latest = getLatestApprovedProposal();
@@ -4618,6 +4896,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
                   instructionBlocks.push(`[HeadsDown] ${queueResult.message}`);
                   if (queueResult.queued) {
                     autoQueuedRunIds.add(queueTarget.runId);
+                    try {
+                      await reportSucceededRefinedReAttemptForAction(ctx, "queue_for_morning");
+                    } catch (error) {
+                      notifyRefinedReAttemptOutcomeFailure(ctx, error, {
+                        outcome: "succeeded",
+                        actionKey: "queue_for_morning",
+                      });
+                    }
                   }
                   if (ctx.hasUI) {
                     ctx.ui.notify(`[HeadsDown] ${queueResult.message}`, "info");
@@ -4651,6 +4937,20 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const wakeUpInstruction = formatWakeUpDigestInstruction(wakeUpSummary);
     if (wakeUpInstruction) {
       instructionBlocks.push(wakeUpInstruction);
+    }
+
+    try {
+      const refinedReAttemptInstruction = await buildRefinedReAttemptInstruction(ctx);
+      if (refinedReAttemptInstruction) {
+        instructionBlocks.push(refinedReAttemptInstruction);
+      }
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `[HeadsDown] Refined deferred-decision re-attempts are temporarily unavailable: ${sanitizeErrorMessage(error)}.`,
+          "warning",
+        );
+      }
     }
 
     if (instructionBlocks.length === 0) return undefined;
@@ -4809,7 +5109,32 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     );
   }
 
+  function notifyRefinedReAttemptOutcomeFailure(
+    ctx: ExtensionContext,
+    error: unknown,
+    details: {
+      outcome?: DeferredDecisionReAttemptOutcome;
+      actionKey?: HeadsDownActionKey;
+      decisionId?: string;
+    } = {},
+  ): void {
+    if (!ctx.hasUI) return;
+    const context = [
+      details.outcome ? `outcome=${details.outcome}` : null,
+      details.actionKey ? `action=${details.actionKey}` : null,
+      details.decisionId ? `decision=${details.decisionId}` : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(", ");
+    const suffix = context ? ` (${context})` : "";
+    ctx.ui.notify(
+      `[HeadsDown] Refined re-attempt outcome report failed${suffix}: ${sanitizeErrorMessage(error)}.`,
+      "warning",
+    );
+  }
+
   async function recordAutopilotDeferredDecision(input: {
+    ctx: ExtensionContext;
     telemetry: PiRunTelemetry;
     proposal: ProposalRecord;
     config: AutopilotDeferralConfig;
@@ -4837,10 +5162,12 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     });
 
     autopilotStuckState.deferredDecisionId ??= `decision_${randomBytes(16).toString("hex")}`;
+    const supersededAttempt = singleActiveRefinedReAttempt();
     const eventInput = buildDeferredDecisionEventInput({
       telemetry: nextTelemetry,
       proposal: input.proposal,
       decisionId: autopilotStuckState.deferredDecisionId,
+      parentDecisionId: supersededAttempt?.decision_id,
       decisionKind: pickDecisionKind(),
       decisionCategory: pickDecisionCategory(input.questionCategory),
       urgencyBucket: pickUrgencyBucket(input.config),
@@ -4882,6 +5209,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (result.ok) {
       input.telemetry.deferredDecisionsCount = nextTelemetry.deferredDecisionsCount;
       input.telemetry.sequence = nextTelemetry.sequence;
+      if (supersededAttempt) {
+        try {
+          await reportDeferredDecisionReAttemptOutcome(input.ctx, supersededAttempt, "superseded");
+        } catch (error) {
+          notifyRefinedReAttemptOutcomeFailure(input.ctx, error, {
+            outcome: "superseded",
+            decisionId: supersededAttempt.decision_id,
+          });
+        }
+      }
     }
 
     return result.ok;
@@ -4984,6 +5321,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
 
     if (isDeferredStep) {
       const recorded = await recordAutopilotDeferredDecision({
+        ctx: input.ctx,
         telemetry: getTelemetryForProposal(proposal),
         proposal,
         config: config.autopilotDeferral,
@@ -5080,14 +5418,25 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return undefined;
   });
 
-  pi.on("tool_execution_end", async (event) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
     const toolCallId = (event as { toolCallId?: string }).toolCallId;
     if (toolCallId) inFlightToolExecutions.delete(toolCallId);
+    const toolName = (event as { toolName?: string }).toolName;
+    const isError = (event as { isError?: boolean }).isError === true;
     lastToolContext = {
-      toolKind: toolKindForRuntimeTool((event as { toolName?: string }).toolName),
-      outcome: (event as { isError?: boolean }).isError ? "failed" : "succeeded",
+      toolKind: toolKindForRuntimeTool(toolName),
+      outcome: isError ? "failed" : "succeeded",
       progressVersion: autopilotProgressVersion,
     };
+    const actionKey = normalizeActionKey(toolName);
+    if (actionKey) {
+      const outcome = isError ? "failed" : "succeeded";
+      try {
+        await reportRefinedReAttemptOutcomeForAction(ctx, actionKey, outcome);
+      } catch (error) {
+        notifyRefinedReAttemptOutcomeFailure(ctx, error, { outcome, actionKey });
+      }
+    }
     markAutopilotProgress();
     return undefined;
   });
@@ -5735,7 +6084,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         ),
       ),
       refined_urgency_bucket: Type.Optional(
-        StringEnum(["low", "normal", "high"] as const, {
+        StringEnum(["low", "normal", "elevated", "high"] as const, {
           description: "Replacement urgency bucket for refine resolutions.",
         }),
       ),
@@ -5820,7 +6169,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         alreadyResolved: resolution.alreadyResolved,
         notice:
           action === "refine"
-            ? "Refinement recorded. Pi does not re-attempt refined decisions automatically yet."
+            ? "Refinement recorded. Pi will surface refined decisions for re-attempt on the next eligible wake-up when wake-up re-attempts are enabled."
             : resolution.alreadyResolved
               ? "Already resolved, likely by another session."
               : "Resolution recorded.",
@@ -6217,6 +6566,16 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           });
           consumed = resumeResult.consumed;
           resumeAction = resumeResult.resumeAction;
+          if (resumeResult.resumeAction.attempted && resumeResult.resumeAction.ok === true) {
+            try {
+              await reportSucceededRefinedReAttemptForAction(_ctx, "resume_run");
+            } catch (error) {
+              notifyRefinedReAttemptOutcomeFailure(_ctx, error, {
+                outcome: "succeeded",
+                actionKey: "resume_run",
+              });
+            }
+          }
         }
 
         const response = artifact
@@ -6700,6 +7059,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           return;
         }
 
+        try {
+          await reportSucceededRefinedReAttemptForAction(ctx, "allow_for_duration");
+        } catch (error) {
+          notifyRefinedReAttemptOutcomeFailure(ctx, error, {
+            outcome: "succeeded",
+            actionKey: "allow_for_duration",
+          });
+        }
         clearAttentionWindowWarning(ctx, resolution.runId);
         await refreshAvailability(ctx, { force: true });
         await pollAttentionWindowWarning(ctx, { force: true });
@@ -6745,6 +7112,14 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         return;
       }
 
+      try {
+        await reportSucceededRefinedReAttemptForAction(ctx, "pause_and_summarize");
+      } catch (error) {
+        notifyRefinedReAttemptOutcomeFailure(ctx, error, {
+          outcome: "succeeded",
+          actionKey: "pause_and_summarize",
+        });
+      }
       clearAttentionWindowWarning(ctx, resolution.runId);
       ctx.ui.notify("[HeadsDown] Wrap submitted. Saving handoff.", "info");
       return;

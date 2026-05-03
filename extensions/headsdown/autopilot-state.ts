@@ -17,6 +17,8 @@ export interface AutopilotState {
   lastObservedMode: ContractMode | null;
   surfacedDecisionIds: Record<string, string[]>;
   surfacedAtByDecisionId: Record<string, string>;
+  reAttemptedDecisionIds: Record<string, string[]>;
+  reAttemptedAtByDecisionId: Record<string, string>;
 }
 
 export function emptyAutopilotState(): AutopilotState {
@@ -24,6 +26,8 @@ export function emptyAutopilotState(): AutopilotState {
     lastObservedMode: null,
     surfacedDecisionIds: {},
     surfacedAtByDecisionId: {},
+    reAttemptedDecisionIds: {},
+    reAttemptedAtByDecisionId: {},
   };
 }
 
@@ -59,18 +63,18 @@ function normalizeSurfacedAtByDecisionId(value: unknown): Record<string, string>
   ) as Record<string, string>;
 }
 
-function surfacedDecisionKey(runId: string, decisionId: string): string {
-  return JSON.stringify([runId, decisionId]);
+function scopedDecisionKey(scopeId: string, decisionId: string): string {
+  return JSON.stringify([scopeId, decisionId]);
 }
 
-function surfacedDecisionTimestamp(
-  surfacedAtByDecisionId: Record<string, string>,
-  runId: string,
+function scopedDecisionTimestamp(
+  timestampByDecisionId: Record<string, string>,
+  scopeId: string,
   decisionId: string,
 ): string | undefined {
   return (
-    surfacedAtByDecisionId[surfacedDecisionKey(runId, decisionId)] ??
-    surfacedAtByDecisionId[decisionId]
+    timestampByDecisionId[scopedDecisionKey(scopeId, decisionId)] ??
+    timestampByDecisionId[decisionId]
   );
 }
 
@@ -83,6 +87,8 @@ export function normalizeAutopilotState(value: unknown): AutopilotState {
     lastObservedMode: isContractMode(raw.lastObservedMode) ? raw.lastObservedMode : null,
     surfacedDecisionIds: normalizeSurfacedDecisionIds(raw.surfacedDecisionIds),
     surfacedAtByDecisionId: normalizeSurfacedAtByDecisionId(raw.surfacedAtByDecisionId),
+    reAttemptedDecisionIds: normalizeSurfacedDecisionIds(raw.reAttemptedDecisionIds),
+    reAttemptedAtByDecisionId: normalizeSurfacedAtByDecisionId(raw.reAttemptedAtByDecisionId),
   };
 }
 
@@ -94,17 +100,36 @@ export function pruneAutopilotState(state: AutopilotState, now: Date = new Date(
       return Number.isFinite(timestamp) && timestamp >= cutoff;
     }),
   ) as Record<string, string>;
+  const reAttemptedAtByDecisionId = Object.fromEntries(
+    Object.entries(state.reAttemptedAtByDecisionId).filter(([, reAttemptedAt]) => {
+      const timestamp = Date.parse(reAttemptedAt);
+      return Number.isFinite(timestamp) && timestamp >= cutoff;
+    }),
+  ) as Record<string, string>;
 
-  const hasTimestampMap = Object.keys(state.surfacedAtByDecisionId).length > 0;
+  const hasSurfacedTimestampMap = Object.keys(state.surfacedAtByDecisionId).length > 0;
   const surfacedDecisionIds = Object.fromEntries(
     Object.entries(state.surfacedDecisionIds)
       .map(([runId, decisionIds]) => {
-        const keptDecisionIds = hasTimestampMap
+        const keptDecisionIds = hasSurfacedTimestampMap
           ? decisionIds.filter((decisionId) =>
-              surfacedDecisionTimestamp(surfacedAtByDecisionId, runId, decisionId),
+              scopedDecisionTimestamp(surfacedAtByDecisionId, runId, decisionId),
             )
           : decisionIds;
         return [runId, keptDecisionIds] as const;
+      })
+      .filter(([, decisionIds]) => decisionIds.length > 0),
+  );
+  const hasReAttemptTimestampMap = Object.keys(state.reAttemptedAtByDecisionId).length > 0;
+  const reAttemptedDecisionIds = Object.fromEntries(
+    Object.entries(state.reAttemptedDecisionIds)
+      .map(([sessionId, decisionIds]) => {
+        const keptDecisionIds = hasReAttemptTimestampMap
+          ? decisionIds.filter((decisionId) =>
+              scopedDecisionTimestamp(reAttemptedAtByDecisionId, sessionId, decisionId),
+            )
+          : decisionIds;
+        return [sessionId, keptDecisionIds] as const;
       })
       .filter(([, decisionIds]) => decisionIds.length > 0),
   );
@@ -113,6 +138,8 @@ export function pruneAutopilotState(state: AutopilotState, now: Date = new Date(
     ...state,
     surfacedDecisionIds,
     surfacedAtByDecisionId,
+    reAttemptedDecisionIds,
+    reAttemptedAtByDecisionId,
   };
 }
 
@@ -135,7 +162,7 @@ export function markDecisionIdsSurfaced(
     if (!decisionIds.includes(entry.decisionId)) {
       surfacedDecisionIds[entry.runId] = [...decisionIds, entry.decisionId];
     }
-    surfacedAtByDecisionId[surfacedDecisionKey(entry.runId, entry.decisionId)] = surfacedAt;
+    surfacedAtByDecisionId[scopedDecisionKey(entry.runId, entry.decisionId)] = surfacedAt;
   }
 
   return pruneAutopilotState({ ...state, surfacedDecisionIds, surfacedAtByDecisionId }, now);
@@ -164,13 +191,57 @@ export function removeDecisionIdsFromSurfaced(
   const remainingDecisionIds = new Set(Object.values(surfacedDecisionIds).flat());
   const surfacedAtByDecisionId = { ...state.surfacedAtByDecisionId };
   for (const entry of entries) {
-    delete surfacedAtByDecisionId[surfacedDecisionKey(entry.runId, entry.decisionId)];
+    delete surfacedAtByDecisionId[scopedDecisionKey(entry.runId, entry.decisionId)];
     if (!remainingDecisionIds.has(entry.decisionId)) {
       delete surfacedAtByDecisionId[entry.decisionId];
     }
   }
 
   return { ...state, surfacedDecisionIds, surfacedAtByDecisionId };
+}
+
+function reAttemptedDecisionRef(runId: string, decisionId: string): string {
+  return JSON.stringify([runId, decisionId]);
+}
+
+export function hasDecisionIdReAttempted(
+  state: AutopilotState,
+  sessionId: string,
+  runId: string,
+  decisionId: string,
+): boolean {
+  return (
+    state.reAttemptedDecisionIds[sessionId]?.includes(reAttemptedDecisionRef(runId, decisionId)) ===
+    true
+  );
+}
+
+export function markDecisionIdsReAttempted(
+  state: AutopilotState,
+  sessionId: string,
+  entries: ReadonlyArray<{ runId: string; decisionId: string }>,
+  now: Date = new Date(),
+): AutopilotState {
+  const reAttemptedDecisionIds: Record<string, string[]> = Object.fromEntries(
+    Object.entries(state.reAttemptedDecisionIds).map(([existingSessionId, existingDecisionIds]) => [
+      existingSessionId,
+      [...existingDecisionIds],
+    ]),
+  );
+  const reAttemptedAtByDecisionId = { ...state.reAttemptedAtByDecisionId };
+  const reAttemptedAt = now.toISOString();
+  const existingDecisionIds = reAttemptedDecisionIds[sessionId] ?? [];
+
+  for (const entry of entries) {
+    const decisionRef = reAttemptedDecisionRef(entry.runId, entry.decisionId);
+    if (!existingDecisionIds.includes(decisionRef)) {
+      existingDecisionIds.push(decisionRef);
+    }
+    reAttemptedAtByDecisionId[scopedDecisionKey(sessionId, decisionRef)] = reAttemptedAt;
+  }
+
+  reAttemptedDecisionIds[sessionId] = existingDecisionIds;
+  return pruneAutopilotState({ ...state, reAttemptedDecisionIds, reAttemptedAtByDecisionId }, now);
 }
 
 export async function loadAutopilotState(
