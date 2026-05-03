@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Wired Pi autopilot prompt and deferral decisions to the shared `@headsdown/sdk` classifier policy, prompt, action-shape, capability, and escalation helpers.
+- Added privacy-safe deferred-decision classifier context for SDK version compatibility, final disposition, and declared sandbox capability.
+
 ## 0.2.1 - 2026-04-29
 
 - Added a publish-time esbuild bundling step for extension entrypoints into `dist/extensions`.

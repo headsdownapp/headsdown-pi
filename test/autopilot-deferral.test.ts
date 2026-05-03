@@ -203,6 +203,15 @@ describe("autopilot deferral detection", () => {
         },
       ],
       classifierDecisionId: "decision_abcdef1234567890",
+      finalStep: "defer_for_human_review",
+      finalReasonCode: "severity_above_latitude",
+      versionCompatibility: {
+        level: "none",
+        direction: "match",
+        message: "Classifier version match.",
+        shouldProceed: true,
+        fallbackLatitude: null,
+      },
     });
 
     expect(context).toEqual({
@@ -214,6 +223,15 @@ describe("autopilot deferral detection", () => {
       latitude_at_decision: "cautious",
       sandbox_preference: "preferred",
       classifier_decision_id: "decision_abcdef1234567890",
+      final_step: "defer_for_human_review",
+      final_reason_code: "severity_above_latitude",
+      version_compatibility: {
+        level: "none",
+        direction: "match",
+        message: "Classifier version match.",
+        should_proceed: true,
+        fallback_latitude: null,
+      },
       capability_summary: {
         sandbox_available: false,
         sandbox_stale: false,

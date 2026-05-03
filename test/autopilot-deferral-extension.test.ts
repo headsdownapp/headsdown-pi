@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigStore, HeadsDownClient } from "@headsdown/sdk";
+import { ConfigStore, HeadsDownClient, computeEscalationPath } from "@headsdown/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension, { __internal } from "../extensions/headsdown/index.js";
 
@@ -81,7 +81,7 @@ function makeClient(
       schedule: { wrapUpGuidance: { active: false } },
     })),
     graphql: {
-      request: vi.fn(async () => ({
+      request: vi.fn(async (_query?: string, _variables?: Record<string, unknown>) => ({
         autopilotPolicy: {
           latitude: mode === "offline" ? "CAUTIOUS" : "VERIFY",
           escalationStrategy: ["TRY_ALTERNATIVE", "DEFER_FOR_HUMAN_REVIEW"],
@@ -129,6 +129,80 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
+describe("autopilot SDK classifier seams", () => {
+  it("declares Pi sandbox capability once as unavailable until a real sandbox exists", () => {
+    const capabilities = __internal.declareIntegrationCapabilities(
+      new Date("2026-04-28T10:00:00.000Z"),
+    );
+
+    expect(capabilities).toMatchObject({
+      classifierVersion: "1.1.0",
+      capturedAt: "2026-04-28T10:00:00.000Z",
+      sandbox: {
+        available: false,
+        fsIsolation: "none",
+        networkIsolation: "none",
+        identityIsolation: "none",
+      },
+    });
+
+    const escalation = computeEscalationPath({
+      classifiedAction: {
+        outcome: "routine",
+        reasonCode: "local_edit",
+        source: "deterministic",
+        toolKind: "edit",
+      },
+      policy: {
+        classifierVersion: "1.1.0",
+        latitude: "balanced",
+        escalationStrategy: ["try_in_sandbox", "defer_for_human_review"],
+        sandboxPreference: "required",
+      },
+      capabilities,
+    });
+
+    expect(escalation).toMatchObject({
+      steps: ["defer_for_human_review"],
+      reasonCode: "sandbox_required_but_unavailable",
+    });
+  });
+
+  it("preserves SDK conservative outcomes for critical actions and major version drift", () => {
+    const capabilities = __internal.declareIntegrationCapabilities();
+
+    expect(
+      computeEscalationPath({
+        classifiedAction: {
+          outcome: "critical",
+          reasonCode: "drop_database",
+          source: "deterministic",
+          toolKind: "bash",
+        },
+        policy: { classifierVersion: "1.1.0", latitude: "hold" },
+        capabilities,
+      }),
+    ).toMatchObject({ steps: ["defer_for_human_review"], reasonCode: "critical_always_defer" });
+
+    expect(
+      computeEscalationPath({
+        classifiedAction: {
+          outcome: "routine",
+          reasonCode: "local_edit",
+          source: "deterministic",
+          toolKind: "edit",
+        },
+        policy: { classifierVersion: "2.0.0", latitude: "hold" },
+        capabilities,
+      }),
+    ).toMatchObject({
+      steps: ["defer_for_human_review"],
+      reasonCode: "version_mismatch_lockdown",
+      version: { level: "error", direction: "major_mismatch", shouldProceed: false },
+    });
+  });
+});
+
 describe("autopilot deferral turn_end hook", () => {
   it("uses configured custom patterns when deciding whether to record", () => {
     const config = __internal.normalizeAutopilotDeferralConfig({
@@ -154,7 +228,10 @@ describe("autopilot deferral turn_end hook", () => {
   it("nudges with SDK classifier guidance before recording after escalation exhausts", async () => {
     await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
     const events: Record<string, unknown>[] = [];
-    const client = makeClient("limited", events);
+    const client = makeClient("limited", events, {
+      identityActionOverrides: [{ actionKey: "git.push_main", strategy: "defer_for_human_review" }],
+      houseRules: ["Never publish without review"],
+    });
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
     const { handlers, pi } = registerHeadsDownHarness();
     const ctx = makeContext();
@@ -162,7 +239,12 @@ describe("autopilot deferral turn_end hook", () => {
 
     await fireTurnEnd(handlers, ctx, [{ type: "text", text: "Should I update the tests?" }], 1);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(pi.sendMessage.mock.calls[0])).toContain("Autopilot classifier addendum");
+    const nudge = JSON.stringify(pi.sendMessage.mock.calls[0]);
+    expect(nudge).toContain("Autopilot classifier addendum");
+    expect(nudge).toContain("Identity-action overrides: git.push_main");
+    expect(nudge).toContain("Enumerated house rules: Never publish without review");
+    expect(nudge).toContain("Current escalation strategy: try_alternative, defer_for_human_review");
+    expect(nudge).toContain("Current sandbox preference: preferred");
     expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
       0,
     );
@@ -203,6 +285,176 @@ describe("autopilot deferral turn_end hook", () => {
     expect(serialized).not.toContain("Should I update the tests?");
     expect(serialized).not.toContain("README.md");
     expect(serialized).not.toContain(process.cwd());
+  });
+
+  it("re-reads the SDK autopilot policy for each escalation decision", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0, nudgeCooldownMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("limited", events);
+    const policies = [
+      {
+        latitude: "VERIFY",
+        escalationStrategy: ["TRY_ALTERNATIVE", "DEFER_FOR_HUMAN_REVIEW"],
+        sandboxPreference: "PREFERRED",
+        classifierVersion: "1.1.0",
+      },
+      {
+        latitude: "CAUTIOUS",
+        escalationStrategy: ["TRY_ALTERNATIVE", "DEFER_FOR_HUMAN_REVIEW"],
+        sandboxPreference: "PREFERRED",
+        classifierVersion: "1.1.0",
+      },
+    ];
+    let policyIndex = 0;
+    client.graphql.request.mockImplementation(async (query?: string) => ({
+      autopilotPolicy: policies[Math.min(policyIndex++, policies.length - 1)],
+      query,
+    }));
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers, pi } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+
+    await fireTurnEnd(handlers, ctx, "Would you like me to update tests too?", 1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.eventType === "deferred_decision.recorded")).toHaveLength(
+      0,
+    );
+
+    await fireTurnEnd(handlers, ctx, "Please confirm the default.", 2);
+
+    await expect
+      .poll(() => events.filter((event) => event.eventType === "deferred_decision.recorded").length)
+      .toBe(1);
+    expect(client.graphql.request).toHaveBeenCalledTimes(2);
+    const payload = events[0].payload as Record<string, any>;
+    expect(payload.autopilot_context).toMatchObject({
+      latitude_at_decision: "cautious",
+      final_step: "defer_for_human_review",
+      final_reason_code: "severity_above_latitude",
+    });
+  });
+
+  it("injects SDK classifier prompt fragments in the autopilot context seam", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("limited", events, {
+      identityActionOverrides: [{ actionKey: "git.push_main", strategy: "defer_for_human_review" }],
+      houseRules: ["Keep public operations reviewed"],
+    });
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const context = handlers.get("context")?.at(0);
+    if (!context) throw new Error("context handler was not registered");
+
+    const result = await context({ messages: [] }, ctx);
+
+    const injected = result?.messages?.at(-1);
+    expect(injected).toMatchObject({ customType: "headsdown-autopilot-guidance", display: false });
+    const content = String(injected?.content);
+    expect(content).toContain("Autopilot active");
+    expect(content).toContain("Autopilot classifier addendum");
+    expect(content).toContain("Identity-action overrides: git.push_main");
+    expect(content).toContain("Enumerated house rules: Keep public operations reviewed");
+    expect(content).toContain(
+      "Current escalation strategy: try_alternative, defer_for_human_review",
+    );
+    expect(content).toContain("Current sandbox preference: preferred");
+  });
+
+  it("injects SDK classifier prompt fragments in the before-agent system prompt seam", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events, { houseRules: ["Prefer reversible steps"] }) as any,
+    );
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const beforeAgentStart = handlers.get("before_agent_start")?.at(0);
+    if (!beforeAgentStart) throw new Error("before_agent_start handler was not registered");
+
+    const result = await beforeAgentStart({ prompt: "continue", systemPrompt: "base" }, ctx);
+
+    expect(result?.systemPrompt).toContain("base");
+    expect(result?.systemPrompt).toContain("Autopilot active");
+    expect(result?.systemPrompt).toContain("Autopilot classifier addendum");
+    expect(result?.systemPrompt).toContain("Enumerated house rules: Prefer reversible steps");
+  });
+
+  it("does not inject classifier guidance without an approved proposal or outside autopilot modes", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("limited", events) as any,
+    );
+    const noProposalHarness = registerHeadsDownHarness();
+    const noProposalCtx = makeContext();
+    noProposalCtx.sessionManager.getBranch.mockReturnValue([]);
+    await startSession(noProposalHarness.handlers, noProposalCtx);
+    const noProposalContext = noProposalHarness.handlers.get("context")?.at(0);
+    const noProposalBeforeAgentStart = noProposalHarness.handlers.get("before_agent_start")?.at(0);
+    if (!noProposalContext) throw new Error("context handler was not registered");
+    if (!noProposalBeforeAgentStart) {
+      throw new Error("before_agent_start handler was not registered");
+    }
+
+    const noProposalResult = await noProposalContext({ messages: [] }, noProposalCtx);
+    const noProposalPromptResult = await noProposalBeforeAgentStart(
+      { prompt: "continue", systemPrompt: "base" },
+      noProposalCtx,
+    );
+    expect(JSON.stringify(noProposalResult ?? {})).not.toContain("Autopilot classifier addendum");
+    expect(JSON.stringify(noProposalPromptResult ?? {})).not.toContain(
+      "Autopilot classifier addendum",
+    );
+
+    vi.restoreAllMocks();
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(
+      makeClient("online", events) as any,
+    );
+    const onlineHarness = registerHeadsDownHarness();
+    const onlineCtx = makeContext();
+    await startSession(onlineHarness.handlers, onlineCtx);
+    const onlineContext = onlineHarness.handlers.get("context")?.at(0);
+    const onlineBeforeAgentStart = onlineHarness.handlers.get("before_agent_start")?.at(0);
+    if (!onlineContext) throw new Error("context handler was not registered");
+    if (!onlineBeforeAgentStart) throw new Error("before_agent_start handler was not registered");
+
+    const onlineResult = await onlineContext({ messages: [] }, onlineCtx);
+    const onlinePromptResult = await onlineBeforeAgentStart(
+      { prompt: "continue", systemPrompt: "base" },
+      onlineCtx,
+    );
+    expect(JSON.stringify(onlineResult ?? {})).not.toContain("Autopilot classifier addendum");
+    expect(JSON.stringify(onlinePromptResult ?? {})).not.toContain("Autopilot classifier addendum");
+  });
+
+  it("warns and falls back conservatively when SDK policy reads fail", async () => {
+    await useConfigFile({ autopilotDeferral: { idleThresholdMs: 0 } });
+    const events: Record<string, unknown>[] = [];
+    const client = makeClient("limited", events);
+    client.graphql.request.mockRejectedValue(new Error("policy unavailable"));
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { handlers } = registerHeadsDownHarness();
+    const ctx = makeContext();
+    await startSession(handlers, ctx);
+    const context = handlers.get("context")?.at(0);
+    if (!context) throw new Error("context handler was not registered");
+
+    const result = await context({ messages: [] }, ctx);
+
+    expect(JSON.stringify(result ?? {})).toContain("Autopilot classifier addendum");
+    expect(JSON.stringify(result ?? {})).toContain(
+      "Current escalation strategy: defer_for_human_review",
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "[HeadsDown] Unable to read fresh autopilot policy; using the conservative fallback. policy unavailable",
+      "warning",
+    );
   });
 
   it("records immediately when policy requires deferral and remains idempotent for the same turn", async () => {
