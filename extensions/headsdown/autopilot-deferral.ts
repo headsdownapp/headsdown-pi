@@ -3,6 +3,7 @@ import type {
   ClassifiedAction,
   ClassifierEscalationStep,
   ClassifierPolicy,
+  ClassifierVersionCompatibility,
   IntegrationCapabilities,
   LocalSessionSummary,
   QuestionCategory,
@@ -50,6 +51,9 @@ export interface AutopilotContextInput {
     readonly reasonCode: string;
   }>;
   readonly classifierDecisionId?: string;
+  readonly finalStep?: ClassifierEscalationStep;
+  readonly finalReasonCode?: string;
+  readonly versionCompatibility?: ClassifierVersionCompatibility;
 }
 
 export const DEFAULT_IDLE_THRESHOLD_MS = 30_000;
@@ -245,6 +249,17 @@ export function buildAutopilotContext(input: AutopilotContextInput): Record<stri
     latitude_at_decision: input.policy.latitude,
     sandbox_preference: input.policy.sandboxPreference,
     classifier_decision_id: input.classifierDecisionId,
+    final_step: input.finalStep,
+    final_reason_code: input.finalReasonCode,
+    version_compatibility: input.versionCompatibility
+      ? {
+          level: input.versionCompatibility.level,
+          direction: input.versionCompatibility.direction,
+          message: input.versionCompatibility.message,
+          should_proceed: input.versionCompatibility.shouldProceed,
+          fallback_latitude: input.versionCompatibility.fallbackLatitude,
+        }
+      : undefined,
     capability_summary: {
       sandbox_available: input.capabilities.sandbox.available,
       sandbox_stale: input.capabilities.stale === true,

@@ -26,6 +26,7 @@ import {
   buildClassifierPromptFragments,
   classifyActionShapeFallback,
   computeEscalationPath,
+  fetchAutopilotPolicy,
 } from "@headsdown/sdk";
 import {
   HEADSDOWN_ACTION_KEYS,
@@ -40,7 +41,6 @@ import type {
   AvailabilityOverrideInput,
   ClassifiedAction,
   ClassifierEscalationStep,
-  ClassifierLatitude,
   ClassifierPolicy,
   Contract,
   DeferredDecisionNotesBucket,
@@ -225,13 +225,6 @@ interface PiRunTelemetry {
   scopeDriftReported: boolean;
   completedReported: boolean;
   deferredDecisionsCount: number;
-}
-
-interface AutopilotPolicyPayload {
-  latitude?: string | null;
-  escalationStrategy?: string[] | null;
-  sandboxPreference?: string | null;
-  classifierVersion?: string | null;
 }
 
 interface LastToolContextState {
@@ -526,17 +519,6 @@ const APPLY_HEADSDOWN_ACTION_MUTATION = `
   }
 `;
 
-const AUTOPILOT_POLICY_QUERY = `
-  query AutopilotPolicyForPi($mode: Mode) {
-    autopilotPolicy(mode: $mode) {
-      latitude
-      escalationStrategy
-      sandboxPreference
-      classifierVersion
-    }
-  }
-`;
-
 function getLowLevelGraphQLClient(client: HeadsDownClient): {
   request: (query: string, variables?: Record<string, unknown>) => Promise<Record<string, unknown>>;
 } | null {
@@ -587,69 +569,32 @@ async function getAvailabilityContext(client: HeadsDownClient): Promise<Availabi
   }
 }
 
-function normalizeClassifierLatitude(value: unknown): ClassifierLatitude {
-  const normalized = normalizeEnumKey(value);
-  return normalized === "hold" ||
-    normalized === "verify" ||
-    normalized === "balanced" ||
-    normalized === "cautious" ||
-    normalized === "lockdown"
-    ? normalized
-    : "cautious";
+function isMode(value: string | null | undefined): value is Mode {
+  return value === "online" || value === "busy" || value === "limited" || value === "offline";
 }
 
-function normalizeEscalationStep(value: unknown): ClassifierEscalationStep | null {
-  const normalized = normalizeEnumKey(value);
-  return normalized === "try_alternative" ||
-    normalized === "try_in_sandbox" ||
-    normalized === "defer_to_end_of_run" ||
-    normalized === "defer_for_human_review"
-    ? normalized
-    : null;
-}
-
-function adaptAutopilotPolicy(value: AutopilotPolicyPayload | null | undefined): ClassifierPolicy {
-  const sandboxPreference = normalizeEnumKey(value?.sandboxPreference);
-  const adaptedSandboxPreference =
-    sandboxPreference === "required" ||
-    sandboxPreference === "preferred" ||
-    sandboxPreference === "avoid"
-      ? sandboxPreference
-      : sandboxPreference === "disabled"
-        ? "avoid"
-        : undefined;
-
+function fallbackAutopilotPolicy(_mode: string | null | undefined): ClassifierPolicy {
   return {
-    classifierVersion: value?.classifierVersion ?? AUTOPILOT_CLASSIFIER_VERSION,
-    latitude: normalizeClassifierLatitude(value?.latitude),
-    escalationStrategy: Array.isArray(value?.escalationStrategy)
-      ? value.escalationStrategy
-          .map((step) => normalizeEscalationStep(step))
-          .filter((step): step is ClassifierEscalationStep => step !== null)
-      : undefined,
-    sandboxPreference: adaptedSandboxPreference,
+    classifierVersion: AUTOPILOT_CLASSIFIER_VERSION,
+    latitude: "cautious",
+    escalationStrategy: ["defer_for_human_review"],
+    sandboxPreference: "avoid",
+    identityActionOverrides: [],
+    houseRules: [],
   };
 }
 
-async function getAutopilotPolicy(
+async function readAutopilotPolicyFresh(
   client: HeadsDownClient,
   mode: string | null | undefined,
 ): Promise<ClassifierPolicy> {
-  const graphql = getLowLevelGraphQLClient(client);
-  if (!graphql) {
-    return adaptAutopilotPolicy(null);
-  }
-
-  const data = await graphql.request(AUTOPILOT_POLICY_QUERY, { mode: toGraphQLEnumValue(mode) });
-  return adaptAutopilotPolicy(
-    (data.autopilotPolicy as AutopilotPolicyPayload | null | undefined) ?? null,
-  );
+  return fetchAutopilotPolicy(client, isMode(mode) ? mode : "offline");
 }
 
-function defaultIntegrationCapabilities(): IntegrationCapabilities {
+function declareIntegrationCapabilities(now: Date = new Date()): IntegrationCapabilities {
   return {
     classifierVersion: AUTOPILOT_CLASSIFIER_VERSION,
-    capturedAt: new Date().toISOString(),
+    capturedAt: now.toISOString(),
     sandbox: {
       available: false,
       fsIsolation: "none",
@@ -658,6 +603,48 @@ function defaultIntegrationCapabilities(): IntegrationCapabilities {
     },
     toolKinds: ["bash", "edit", "webfetch", "mcp", "computer_use"],
   };
+}
+
+async function resolveAutopilotPolicyForMode(input: {
+  client: HeadsDownClient | null;
+  mode: string | null | undefined;
+  onFailure?: (error: unknown) => void;
+}): Promise<ClassifierPolicy> {
+  if (!input.client) return fallbackAutopilotPolicy(input.mode);
+
+  try {
+    return await readAutopilotPolicyFresh(input.client, input.mode);
+  } catch (error) {
+    input.onFailure?.(error);
+    return fallbackAutopilotPolicy(input.mode);
+  }
+}
+
+function shouldInjectAutopilotClassifierPrompt(input: {
+  mode: string | null | undefined;
+  hasActiveProposal: boolean;
+}): boolean {
+  return input.hasActiveProposal && (input.mode === "offline" || input.mode === "limited");
+}
+
+function formatAutopilotPolicyDetails(policy: ClassifierPolicy): string {
+  const escalationStrategy = policy.escalationStrategy?.join(", ") || "sdk_default";
+  const sandboxPreference = policy.sandboxPreference ?? "sdk_default";
+
+  return [
+    `[HeadsDown] Current escalation strategy: ${escalationStrategy}.`,
+    `[HeadsDown] Current sandbox preference: ${sandboxPreference}.`,
+  ].join("\n");
+}
+
+function buildAutopilotClassifierPrompt(policy: ClassifierPolicy): string {
+  const fragments = buildClassifierPromptFragments({
+    latitude: policy.latitude,
+    identityActionOverrides: policy.identityActionOverrides,
+    houseRules: policy.houseRules,
+  });
+
+  return [fragments.fullSystemAddendum, formatAutopilotPolicyDetails(policy)].join("\n\n");
 }
 
 function getSessionId(ctx: ExtensionContext): string | undefined {
@@ -2492,11 +2479,13 @@ export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
   AGENT_CONTROL_OVERVIEW_QUERY,
   APPLY_HEADSDOWN_ACTION_MUTATION,
-  AUTOPILOT_POLICY_QUERY,
   getLowLevelGraphQLClient,
   getAvailabilityContext,
-  adaptAutopilotPolicy,
-  defaultIntegrationCapabilities,
+  fallbackAutopilotPolicy,
+  readAutopilotPolicyFresh,
+  declareIntegrationCapabilities,
+  resolveAutopilotPolicyForMode,
+  buildAutopilotClassifierPrompt,
   getAgentControlOverviewCompat,
   getAgentControlOverviewResult,
   applyHeadsDownActionCompat,
@@ -2567,12 +2556,14 @@ export const __internal = {
   normalizeHeadsDownCommandArgs,
   extractAssistantText,
   shouldRecordAutopilotDeferral,
+  shouldInjectAutopilotClassifierPrompt,
   toOpaqueWorkspaceRef,
   runLocalReferee,
   CONTINUATION_PATH,
 };
 
 export default function headsdownExtension(pi: ExtensionAPI) {
+  const integrationCapabilities = declareIntegrationCapabilities();
   let approvedProposals: ProposalRecord[] = [];
   let proposalScopes = new Map<string, ProposalScopeSnapshot>();
   let cachedConfig: HeadsDownPiConfig | null = null;
@@ -2586,6 +2577,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
   let lastObservedModeInProcess: Mode | null = null;
   let wakeUpDigestCache: { summary: WakeUpDigestSummary; fetchedAt: number } | null = null;
   let lastAutopilotFailureNoticeAt = 0;
+  let lastAutopilotPolicyFailureNoticeAt = 0;
   let autopilotProgressVersion = 0;
   let autopilotStuckGeneration = 0;
   let autopilotSyntheticTurnIndex = 0;
@@ -4563,6 +4555,27 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     const client = await getClient();
+    const autopilotMode = availabilitySnapshot?.contract?.mode;
+    if (
+      shouldInjectAutopilotClassifierPrompt({
+        mode: autopilotMode,
+        hasActiveProposal: Boolean(activeProposal),
+      })
+    ) {
+      const policy = await resolveAutopilotPolicyForMode({
+        client,
+        mode: autopilotMode,
+        onFailure: (error) => notifyAutopilotPolicyFailure(ctx, error),
+      });
+      const legacyGuidance = formatAutopilotGuidance({
+        mode: autopilotMode,
+        hasActiveProposal: Boolean(activeProposal),
+      });
+      instructionBlocks.push(
+        [legacyGuidance, buildAutopilotClassifierPrompt(policy)].filter(Boolean).join("\n\n"),
+      );
+    }
+
     if (client) {
       try {
         const actorClient = withActorContext(client, ctx);
@@ -4659,10 +4672,29 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const wrapUpHintInstruction = buildEffectiveWrapUpInstruction(
       refreshedSnapshot?.schedule?.wrapUpGuidance,
     );
-    const autopilotGuidance = formatAutopilotGuidance({
-      mode: refreshedSnapshot?.contract?.mode ?? null,
-      hasActiveProposal: hasApprovedProposal(),
-    });
+    let autopilotGuidance: string | null = null;
+    const autopilotMode = refreshedSnapshot?.contract?.mode ?? null;
+    const activeProposal = hasApprovedProposal();
+    if (
+      shouldInjectAutopilotClassifierPrompt({
+        mode: autopilotMode,
+        hasActiveProposal: activeProposal,
+      })
+    ) {
+      const client = await getClient();
+      const policy = await resolveAutopilotPolicyForMode({
+        client,
+        mode: autopilotMode,
+        onFailure: (error) => notifyAutopilotPolicyFailure(ctx, error),
+      });
+      const legacyGuidance = formatAutopilotGuidance({
+        mode: autopilotMode,
+        hasActiveProposal: activeProposal,
+      });
+      autopilotGuidance = [legacyGuidance, buildAutopilotClassifierPrompt(policy)]
+        .filter(Boolean)
+        .join("\n\n");
+    }
     const wakeUpSummary = await getCurrentWakeUpDigestSummary(ctx);
     const wakeUpInstruction = formatWakeUpDigestInstruction(wakeUpSummary);
     if (!wrapUpHintInstruction && !autopilotGuidance && !wakeUpInstruction) return undefined;
@@ -4737,9 +4769,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     step: ClassifierEscalationStep;
     classifiedAction: ClassifiedAction;
   }): string {
-    const fragments = buildClassifierPromptFragments({ latitude: input.policy.latitude });
     return [
-      fragments.fullSystemAddendum,
+      buildAutopilotClassifierPrompt(input.policy),
       "[HeadsDown] Autopilot anti-stuck nudge: apply the shared policy above to continue without waiting for a live answer.",
       `[HeadsDown] Current escalation step: ${input.step}. Classification: ${input.classifiedAction.outcome}.`,
       "[HeadsDown] Use only privacy-safe local reasoning. Do not quote the deferred question or local work content in hosted telemetry.",
@@ -4764,6 +4795,20 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     );
   }
 
+  function notifyAutopilotPolicyFailure(ctx: ExtensionContext, error: unknown): void {
+    if (!ctx.hasUI) return;
+
+    const now = Date.now();
+    if (now - lastAutopilotPolicyFailureNoticeAt < AUTOPILOT_FAILURE_NOTICE_COOLDOWN_MS) return;
+
+    lastAutopilotPolicyFailureNoticeAt = now;
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(
+      `[HeadsDown] Unable to read fresh autopilot policy; using the conservative fallback. ${message}`,
+      "warning",
+    );
+  }
+
   async function recordAutopilotDeferredDecision(input: {
     telemetry: PiRunTelemetry;
     proposal: ProposalRecord;
@@ -4772,6 +4817,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     classifiedAction: ClassifiedAction;
     policy: ClassifierPolicy;
     capabilities: IntegrationCapabilities;
+    escalation: ReturnType<typeof computeEscalationPath>;
   }): Promise<boolean> {
     const nextTelemetry = {
       ...input.telemetry,
@@ -4807,6 +4853,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
             capabilities: input.capabilities,
             attempts: autopilotStuckState.attemptedSteps,
             classifierDecisionId: autopilotStuckState.deferredDecisionId,
+            finalStep: autopilotStuckState.attemptedSteps.at(-1)?.step,
+            finalReasonCode: input.escalation.reasonCode,
+            versionCompatibility: input.escalation.version,
           })
         : undefined,
     });
@@ -4864,25 +4913,22 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     }
 
     const client = await getClient();
-    let policy = adaptAutopilotPolicy({
-      classifierVersion: AUTOPILOT_CLASSIFIER_VERSION,
-      latitude: mode,
+    const policy = await resolveAutopilotPolicyForMode({
+      client,
+      mode,
+      onFailure: (error) => notifyAutopilotPolicyFailure(input.ctx, error),
     });
-    if (client) {
-      try {
-        policy = await getAutopilotPolicy(client, mode);
-      } catch {
-        // Policy lookup failures must not make the anti-stuck path disappear. Fall back to the conservative local policy.
-      }
-    }
     const questionCategory = questionCategoryForPattern(input.detection.matchedPatternKey);
     const actionShape = buildInteractionAskUserActionShape({
       questionCategory,
       recentToolContext: recentToolContext(),
     });
     const classifiedAction = classifyActionShapeFallback(actionShape);
-    const capabilities = defaultIntegrationCapabilities();
-    const escalation = computeEscalationPath({ classifiedAction, policy, capabilities });
+    const escalation = computeEscalationPath({
+      classifiedAction,
+      policy,
+      capabilities: integrationCapabilities,
+    });
     const signature = `${proposal.id}:${input.detection.matchedPatternKey}:${classifiedAction.reasonCode}`;
 
     if (autopilotStuckState.signature !== signature) {
@@ -4944,7 +4990,8 @@ export default function headsdownExtension(pi: ExtensionAPI) {
         questionCategory,
         classifiedAction,
         policy,
-        capabilities,
+        capabilities: integrationCapabilities,
+        escalation,
       });
       if (recorded) {
         resetAutopilotStuckState();
