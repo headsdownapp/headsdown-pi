@@ -65,16 +65,16 @@ function makeEvent(input: {
       flagged_for_review: true,
       local_session_summary: {
         version: 1,
-        sessionId: input.runId ?? "run-1",
-        generatedAt: occurredAt,
+        session_id: input.runId ?? "run-1",
+        generated_at: occurredAt,
         stale: false,
-        toolCallCount: 4,
-        fileChangeCount: 2,
-        deferredDecisionCount: 1,
-        continuationArtifactAvailable: true,
-        validationLocallyPassed: false,
-        approvedProposalRef: "proposal-1",
-        outcomeCategory: "in_progress",
+        tool_call_count: 4,
+        file_change_count: 2,
+        deferred_decision_count: 1,
+        continuation_artifact_available: true,
+        validation_locally_passed: false,
+        approved_proposal_ref: "proposal-1",
+        outcome_category: "in_progress",
       },
       ...input.payload,
     },
@@ -216,7 +216,11 @@ describe("headsdown_deferred tool", () => {
     expect(payload.remaining.count).toBe(0);
     expect(reportDeferredDecisionResolved).toHaveBeenCalledWith(
       expect.objectContaining({
+        workspaceRef: "unknown",
         runId: "run-1",
+        source: "pi_skill",
+        client: { kind: "pi", name: "Pi", version: "0.2.0" },
+        actor: { kind: "agent", ref: "pi" },
         idempotencyKey: "run-1:deferred_decision.resolved:decision-1",
       }),
       expect.objectContaining({ decision_id: "decision-1", resolution_kind: "approved" }),
@@ -489,7 +493,37 @@ describe("headsdown_deferred tool", () => {
         undefined,
         makeContext(),
       ),
-    ).rejects.toThrow("refined_urgency_bucket must be one of low, normal, or high");
+    ).rejects.toThrow("refined_urgency_bucket must be one of low, normal, elevated, or high");
+
+    await expect(
+      tool.execute(
+        "tool-0c",
+        { action: "refine", decision_id: "decision-1" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    ).rejects.toThrow("At least one refined_urgency_bucket");
+
+    await expect(
+      tool.execute(
+        "tool-0d",
+        { action: "approve", decision_id: "decision-1", notes_bucket: "other" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    ).rejects.toThrow("refined fields and notes_bucket are only supported");
+
+    await expect(
+      tool.execute(
+        "tool-0e",
+        { action: "approve", decision_id: "decision-1", resolved_action_key: "resume_run" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    ).rejects.toThrow("resolved_action_key is only supported");
 
     const payload = textResult(
       await tool.execute(
@@ -508,7 +542,7 @@ describe("headsdown_deferred tool", () => {
       ),
     );
 
-    expect(payload.notice).toContain("does not re-attempt refined decisions automatically yet");
+    expect(payload.notice).toContain("will surface refined decisions for re-attempt");
     expect(reportDeferredDecisionResolved).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -524,7 +558,7 @@ describe("headsdown_deferred tool", () => {
     );
   });
 
-  it("treats duplicate resolution writes as already resolved", async () => {
+  it("treats explicit already-resolved writes as already resolved", async () => {
     const recorded = [
       makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-1" }),
     ];
@@ -534,7 +568,7 @@ describe("headsdown_deferred tool", () => {
         eventType === "deferred_decision.recorded" ? recorded : [],
       ),
       reportDeferredDecisionResolved: vi.fn(async () => {
-        throw new Error("duplicate key value violates unique constraint");
+        throw new Error("Deferred decision already resolved.");
       }),
     };
     vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
@@ -553,5 +587,32 @@ describe("headsdown_deferred tool", () => {
     expect(payload.ok).toBe(true);
     expect(payload.alreadyResolved).toBe(true);
     expect(payload.notice).toContain("Already resolved");
+  });
+
+  it("does not hide conflicting duplicate resolution writes", async () => {
+    const recorded = [
+      makeEvent({ eventType: "deferred_decision.recorded", decisionId: "decision-1" }),
+    ];
+    const client = {
+      withActor: vi.fn(() => client),
+      listAgentRunEvents: vi.fn(async ({ eventType }: { eventType?: string }) =>
+        eventType === "deferred_decision.recorded" ? recorded : [],
+      ),
+      reportDeferredDecisionResolved: vi.fn(async () => {
+        throw new Error("duplicate event does not match existing persisted body");
+      }),
+    };
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+    const { tool } = registerToolHarness();
+
+    await expect(
+      tool.execute(
+        "tool-1",
+        { action: "dismiss", decision_id: "decision-1" },
+        undefined,
+        undefined,
+        makeContext(),
+      ),
+    ).rejects.toThrow("duplicate event does not match existing persisted body");
   });
 });
