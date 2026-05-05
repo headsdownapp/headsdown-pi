@@ -1,17 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertLocalRefereeOutcomeSummaryPayload,
   assertLocalRefereeOutcomeSummaryPayloadIsSafe,
   buildLocalRefereeOutcomeSummaryPayload,
   renderLocalRefereeOutcomeSharePreview,
   shouldShareLocalRefereeOutcomeSummary,
 } from "../extensions/headsdown/referee/outcome-sharing.js";
-import type { LocalRefereeReceipt } from "../extensions/headsdown/referee/receipt.js";
+import type { LocalRefereeReceipt } from "@headsdown/sdk/referee";
 
 function fixtureReceipt(): LocalRefereeReceipt {
   return {
     schemaVersion: 1,
     generatedAt: "2026-01-01T00:00:00.000Z",
-    contractRef: "contract_test",
+    contractRef: "contract_0123456789abcdef",
     verdict: "passed",
     evidence: {
       filesTouchedBucket: "1_to_2",
@@ -23,8 +24,18 @@ function fixtureReceipt(): LocalRefereeReceipt {
       outcome: "completed",
     },
     checks: [
-      { id: "check-1", type: "validation_status", status: "passed", reasonCode: "ok" },
-      { id: "check-2", type: "max_files_touched", status: "passed", reasonCode: "ok" },
+      {
+        id: "check_1",
+        type: "validation_status",
+        status: "passed",
+        reasonCode: "validation_status_matched",
+      },
+      {
+        id: "check_2",
+        type: "max_files_touched",
+        status: "passed",
+        reasonCode: "files_within_limit",
+      },
     ],
   };
 }
@@ -33,7 +44,7 @@ describe("Local Referee outcome sharing payload", () => {
   it("builds metadata-only payloads from local referee receipts", () => {
     const payload = buildLocalRefereeOutcomeSummaryPayload({
       receipt: fixtureReceipt(),
-      clientVersion: "0.2.0",
+      client: { kind: "pi", version: "0.2.0" },
       executionMode: "local_only",
     });
 
@@ -49,11 +60,44 @@ describe("Local Referee outcome sharing payload", () => {
     });
   });
 
+  it("keeps the Pi clientVersion wrapper compatible with older local callers", () => {
+    const payload = buildLocalRefereeOutcomeSummaryPayload({
+      receipt: fixtureReceipt(),
+      clientVersion: "0.2.0",
+      executionMode: "local_only",
+    });
+
+    expect(payload.client).toEqual({ kind: "pi", version: "0.2.0" });
+  });
+
+  it("enforces Pi client metadata at the local wrapper boundary", () => {
+    const payload = buildLocalRefereeOutcomeSummaryPayload({
+      receipt: fixtureReceipt(),
+      client: { kind: "pi", version: "0.2.0" },
+      executionMode: "local_only",
+    });
+
+    expect(() => assertLocalRefereeOutcomeSummaryPayload(payload)).not.toThrow();
+    expect(() =>
+      buildLocalRefereeOutcomeSummaryPayload({
+        receipt: fixtureReceipt(),
+        client: { kind: "other", version: "0.2.0" },
+        executionMode: "local_only",
+      } as any),
+    ).toThrow("client kind must be pi");
+    expect(() =>
+      assertLocalRefereeOutcomeSummaryPayload({
+        ...payload,
+        client: { kind: "other", version: "0.2.0" },
+      }),
+    ).toThrow("client kind must be pi");
+  });
+
   it("rejects prohibited fields recursively", () => {
     expect(() =>
       assertLocalRefereeOutcomeSummaryPayloadIsSafe({
         safe: { nested: "ok" },
-        branchName: "feature/private",
+        branch: "feature_private",
       }),
     ).toThrow("prohibited field");
 
@@ -69,7 +113,7 @@ describe("Local Referee outcome sharing payload", () => {
     const preview = renderLocalRefereeOutcomeSharePreview(
       buildLocalRefereeOutcomeSummaryPayload({
         receipt: fixtureReceipt(),
-        clientVersion: "0.2.0",
+        client: { kind: "pi", version: "0.2.0" },
         executionMode: "local_only",
       }),
     );

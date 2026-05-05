@@ -195,7 +195,8 @@ Create `.headsdown/referee.json` in the workspace:
     { "type": "max_tool_calls", "max": 10 },
     { "type": "require_tests", "required": true },
     { "type": "network_required", "required": false },
-    { "type": "outcome", "required": "completed" }
+    { "type": "outcome", "required": "completed" },
+    { "type": "git_commit_present", "required": true }
   ]
 }
 ```
@@ -206,11 +207,11 @@ Run Local Referee from Pi:
 /headsdown referee
 ```
 
-Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `elapsed_minutes`, and `outcome`.
+Agents can also call the `headsdown_referee` tool with optional local evidence such as `files_touched`, `tool_calls`, `validation_status`, `tests_run`, `network_required`, `git_commit_present`, `elapsed_minutes`, and `outcome`.
 
 After high-signal runs, Local Referee can show an explicit "Share outcome summary" preview with the exact metadata categories before anything is sent. Local mode remains the default. Sharing is opt-in, workspace-scoped, and fail-closed.
 
-Supported check types are `validation_status`, `max_files_touched`, `max_tool_calls`, `require_tests`, `network_required`, and `outcome`. `require_tests` may omit `required` as shorthand for `true`; `network_required` must always set `required` explicitly because both `true` and `false` are meaningful.
+Supported check types are `validation_status`, `max_files_touched`, `max_tool_calls`, `require_tests`, `network_required`, `outcome`, and `git_commit_present`. `require_tests` and `git_commit_present` may omit `required` as shorthand for `true`; `network_required` must always set `required` explicitly because both `true` and `false` are meaningful.
 
 The receipt includes only derived review fields: verdict, check outcomes, broad count/time buckets, validation status, test/network booleans, outcome category, generated time, and an opaque contract reference. It does not include prompts, source code, file contents, file paths, repository names, branch names, terminal output, test logs, message contents, credentials, or raw contract text.
 
