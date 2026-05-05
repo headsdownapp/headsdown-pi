@@ -5,12 +5,12 @@ import { HeadsDownClient } from "@headsdown/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import headsdownExtension from "../extensions/headsdown/index.js";
 import {
+  evaluateLocalRefereeContract,
+  LocalRefereeContractError,
+  normalizeLocalRefereeEvidence,
   parseLocalRefereeContract,
   parseLocalRefereeContractJson,
-  LocalRefereeContractError,
-} from "../extensions/headsdown/referee/contract.js";
-import { evaluateLocalRefereeContract } from "../extensions/headsdown/referee/evaluate.js";
-import { normalizeLocalRefereeEvidence } from "../extensions/headsdown/referee/evidence.js";
+} from "@headsdown/sdk/referee";
 import {
   __localRefereeRunnerInternal,
   loadLocalRefereeContract,
@@ -203,6 +203,22 @@ describe("Local Referee receipt and runner", () => {
     expect(result.receipt.evidence.filesTouchedBucket).toBe("1_to_2");
   });
 
+  it("defaults omitted tool call evidence to zero for legacy local runs", async () => {
+    const cwd = await tempWorkspaceWithContract({
+      version: 1,
+      checks: [{ type: "max_tool_calls", max: 0 }],
+    });
+
+    const result = await runLocalReferee({
+      cwd,
+      evidence: {},
+      adapters: { gitStatusShort: vi.fn().mockResolvedValue("") },
+    });
+
+    expect(result.evaluation.verdict).toBe("passed");
+    expect(result.receipt.evidence.toolCallsBucket).toBe("0");
+  });
+
   it("fails safely when touched-file counting is unavailable", async () => {
     const cwd = await tempWorkspaceWithContract();
 
@@ -295,6 +311,38 @@ describe("Local Referee receipt and runner", () => {
     expect(result.content[0].text).toContain("Share this run summary with HeadsDown?");
     expect(result.content[0].text).not.toContain("Not authenticated");
     expect(result.details.evaluation.verdict).toBe("passed");
+  });
+
+  it("passes explicit git commit evidence through the registered headsdown_referee tool", async () => {
+    const cwd = await tempWorkspaceWithContract({
+      version: 1,
+      checks: [{ type: "git_commit_present", required: true }],
+    });
+    const tools = new Map<string, any>();
+    const pi = {
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    headsdownExtension(pi as any);
+    const tool = tools.get("headsdown_referee");
+
+    const result = await tool.execute(
+      "tool-call",
+      {
+        evidence: {
+          files_touched: 0,
+          tool_calls: 0,
+          git_commit_present: true,
+        },
+      },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd },
+    );
+
+    expect(result.details.evaluation.verdict).toBe("passed");
+    expect(result.details.receipt.evidence.gitCommitPresent).toBe(true);
   });
 
   it("shows an explicit preview even when the run is not a high-signal share prompt", async () => {

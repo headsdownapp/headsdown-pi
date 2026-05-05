@@ -207,6 +207,7 @@ interface LocalRefereeToolParams {
     validation_status?: string;
     tests_run?: boolean;
     network_required?: boolean;
+    git_commit_present?: boolean;
     elapsed_minutes?: number;
     outcome?: string;
   };
@@ -5613,6 +5614,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           network_required: Type.Optional(
             Type.Boolean({ description: "Whether the local run required network access." }),
           ),
+          git_commit_present: Type.Optional(
+            Type.Boolean({ description: "Whether the local run produced a git commit." }),
+          ),
           elapsed_minutes: Type.Optional(
             Type.Number({ description: "Elapsed local run time in minutes." }),
           ),
@@ -5634,6 +5638,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
           validationStatus: params.evidence?.validation_status,
           testsRun: params.evidence?.tests_run,
           networkRequired: params.evidence?.network_required,
+          gitCommitPresent: params.evidence?.git_commit_present,
           elapsedMinutes: params.evidence?.elapsed_minutes,
           outcome: params.evidence?.outcome,
         },
@@ -5644,7 +5649,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const currentPreference = workspaceOutcomeSharingPreference(config, workspaceRef);
       const outcomePayload = buildLocalRefereeOutcomeSummaryPayload({
         receipt: result.receipt,
-        clientVersion: HEADSDOWN_PI_CLIENT_VERSION,
+        client: { kind: "pi", version: HEADSDOWN_PI_CLIENT_VERSION },
         executionMode: "local_only",
       });
       const previewText = renderLocalRefereeOutcomeSharePreview(outcomePayload);

@@ -4,20 +4,17 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
   LOCAL_REFEREE_CONTRACT_PATH,
-  parseLocalRefereeContractJson,
-  type LocalRefereeContract,
-} from "./contract.js";
-import { evaluateLocalRefereeContract, type LocalRefereeEvaluation } from "./evaluate.js";
-import {
+  buildLocalRefereeReceipt,
+  evaluateLocalRefereeContract,
   normalizeLocalRefereeEvidence,
+  parseLocalRefereeContractJson,
+  renderLocalRefereeReceipt,
+  type LocalRefereeContract,
+  type LocalRefereeEvaluation,
   type LocalRefereeEvidence,
   type LocalRefereeRawEvidence,
-} from "./evidence.js";
-import {
-  buildLocalRefereeReceipt,
-  renderLocalRefereeReceipt,
   type LocalRefereeReceipt,
-} from "./receipt.js";
+} from "@headsdown/sdk/referee";
 
 const execFile = promisify(execFileCallback);
 const GIT_STATUS_ARGS = ["status", "--short", "--untracked-files=all"] as const;
@@ -120,7 +117,12 @@ export async function collectLocalRefereeEvidence(options: {
   const gitStatusShort = options.adapters?.gitStatusShort ?? defaultGitStatusShort;
   const filesTouched =
     rawEvidence.filesTouched ?? (await countTouchedFiles(options.cwd, gitStatusShort));
-  return normalizeLocalRefereeEvidence({ networkRequired: false, ...rawEvidence, filesTouched });
+  return normalizeLocalRefereeEvidence({
+    ...rawEvidence,
+    filesTouched,
+    toolCalls: rawEvidence.toolCalls ?? 0,
+    networkRequired: rawEvidence.networkRequired ?? false,
+  });
 }
 
 export async function runLocalReferee(

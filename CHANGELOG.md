@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Adopted the shared `@headsdown/sdk/referee` core for local Referee verification with no user-visible behavior change.
 - Wired Pi autopilot prompt and deferral decisions to the shared `@headsdown/sdk` classifier policy, prompt, action-shape, capability, and escalation helpers.
 - Added privacy-safe deferred-decision classifier context for SDK version compatibility, final disposition, and declared sandbox capability.
 
