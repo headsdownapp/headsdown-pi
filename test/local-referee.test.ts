@@ -203,6 +203,29 @@ describe("Local Referee receipt and runner", () => {
     expect(result.receipt.evidence.filesTouchedBucket).toBe("1_to_2");
   });
 
+  it("normalizes legacy count evidence before SDK evaluation", async () => {
+    const cwd = await tempWorkspaceWithContract({
+      version: 1,
+      checks: [
+        { type: "max_files_touched", max: 0 },
+        { type: "max_tool_calls", max: 1 },
+      ],
+    });
+
+    const result = await runLocalReferee({
+      cwd,
+      evidence: {
+        filesTouched: -1,
+        toolCalls: 1.5,
+      },
+      adapters: { gitStatusShort: vi.fn().mockRejectedValue(new Error("should not count files")) },
+    });
+
+    expect(result.evaluation.verdict).toBe("passed");
+    expect(result.receipt.evidence.filesTouchedBucket).toBe("0");
+    expect(result.receipt.evidence.toolCallsBucket).toBe("1_to_2");
+  });
+
   it("defaults omitted tool call evidence to zero for legacy local runs", async () => {
     const cwd = await tempWorkspaceWithContract({
       version: 1,

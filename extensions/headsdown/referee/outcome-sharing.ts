@@ -1,11 +1,11 @@
 import {
+  assertLocalRefereeOutcomeSummaryPayload as assertSdkLocalRefereeOutcomeSummaryPayload,
   buildLocalRefereeOutcomeSummaryPayload as buildSdkLocalRefereeOutcomeSummaryPayload,
   type LocalRefereeOutcomeSummaryPayload as SdkLocalRefereeOutcomeSummaryPayload,
   type LocalRefereeReceipt,
 } from "@headsdown/sdk/referee";
 
 export {
-  assertLocalRefereeOutcomeSummaryPayload,
   assertLocalRefereeOutcomeSummaryPayloadIsSafe,
   renderLocalRefereeOutcomeSharePreview,
   shouldShareLocalRefereeOutcomeSummary,
@@ -39,15 +39,32 @@ export type BuildLocalRefereeOutcomeSummaryPayloadInput = {
     }
 );
 
+export function assertLocalRefereeOutcomeSummaryPayload(
+  value: unknown,
+): asserts value is LocalRefereeOutcomeSummaryPayload {
+  assertSdkLocalRefereeOutcomeSummaryPayload(value);
+
+  if (value.client.kind !== "pi") {
+    throw new Error("Outcome summary client kind must be pi.");
+  }
+}
+
 export function buildLocalRefereeOutcomeSummaryPayload(
   input: BuildLocalRefereeOutcomeSummaryPayloadInput,
 ): LocalRefereeOutcomeSummaryPayload {
   const client =
     "client" in input ? input.client : { kind: "pi" as const, version: input.clientVersion };
 
-  return buildSdkLocalRefereeOutcomeSummaryPayload({
+  if (client.kind !== "pi") {
+    throw new Error("Outcome summary client kind must be pi.");
+  }
+
+  const payload = buildSdkLocalRefereeOutcomeSummaryPayload({
     receipt: input.receipt,
     client,
     executionMode: input.executionMode,
-  }) as LocalRefereeOutcomeSummaryPayload;
+  });
+
+  assertLocalRefereeOutcomeSummaryPayload(payload);
+  return payload;
 }

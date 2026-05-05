@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertLocalRefereeOutcomeSummaryPayload,
   assertLocalRefereeOutcomeSummaryPayloadIsSafe,
   buildLocalRefereeOutcomeSummaryPayload,
   renderLocalRefereeOutcomeSharePreview,
@@ -67,6 +68,29 @@ describe("Local Referee outcome sharing payload", () => {
     });
 
     expect(payload.client).toEqual({ kind: "pi", version: "0.2.0" });
+  });
+
+  it("enforces Pi client metadata at the local wrapper boundary", () => {
+    const payload = buildLocalRefereeOutcomeSummaryPayload({
+      receipt: fixtureReceipt(),
+      client: { kind: "pi", version: "0.2.0" },
+      executionMode: "local_only",
+    });
+
+    expect(() => assertLocalRefereeOutcomeSummaryPayload(payload)).not.toThrow();
+    expect(() =>
+      buildLocalRefereeOutcomeSummaryPayload({
+        receipt: fixtureReceipt(),
+        client: { kind: "other", version: "0.2.0" },
+        executionMode: "local_only",
+      } as any),
+    ).toThrow("client kind must be pi");
+    expect(() =>
+      assertLocalRefereeOutcomeSummaryPayload({
+        ...payload,
+        client: { kind: "other", version: "0.2.0" },
+      }),
+    ).toThrow("client kind must be pi");
   });
 
   it("rejects prohibited fields recursively", () => {

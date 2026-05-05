@@ -96,6 +96,15 @@ async function countTouchedFiles(cwd: string, gitStatusShort: (cwd: string) => P
   }
 }
 
+function normalizeLegacyCountEvidence(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.floor(parsed));
+  }
+  return fallback;
+}
+
 export async function loadLocalRefereeContract(options: {
   cwd: string;
   contractPath?: string;
@@ -116,11 +125,15 @@ export async function collectLocalRefereeEvidence(options: {
   const rawEvidence = options.evidence ?? {};
   const gitStatusShort = options.adapters?.gitStatusShort ?? defaultGitStatusShort;
   const filesTouched =
-    rawEvidence.filesTouched ?? (await countTouchedFiles(options.cwd, gitStatusShort));
+    rawEvidence.filesTouched === undefined || rawEvidence.filesTouched === null
+      ? await countTouchedFiles(options.cwd, gitStatusShort)
+      : normalizeLegacyCountEvidence(rawEvidence.filesTouched);
+  const toolCalls = normalizeLegacyCountEvidence(rawEvidence.toolCalls);
+
   return normalizeLocalRefereeEvidence({
     ...rawEvidence,
     filesTouched,
-    toolCalls: rawEvidence.toolCalls ?? 0,
+    toolCalls,
     networkRequired: rawEvidence.networkRequired ?? false,
   });
 }
