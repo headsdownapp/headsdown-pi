@@ -307,9 +307,22 @@ interface AgentRunSummaryPayload {
   handoffState: string | null;
 }
 
+interface SessionTimeboxExtensionRequestPayload {
+  id: string;
+  requestedExtensionMinutes: number;
+  requestedAt: string;
+}
+
+interface AgentSessionSummaryPayload {
+  sessionId: string;
+  timeboxExpiresAt: string | null;
+  pendingTimeboxExtensionRequest: SessionTimeboxExtensionRequestPayload | null;
+}
+
 interface AgentControlOverviewPayload {
   headsdownCall: HeadsDownCallPayload | null;
   runSummaries: AgentRunSummaryPayload[];
+  sessionSummaries: AgentSessionSummaryPayload[];
 }
 
 interface ApplyHeadsDownActionInput {
@@ -416,6 +429,7 @@ const MAX_PROPOSAL_AGE_MS = 8 * 60 * 60 * 1000; // 8 hours
 const AVAILABILITY_CACHE_TTL_MS = 90 * 1000; // 90 seconds
 const ATTENTION_WINDOW_POLL_COOLDOWN_MS = 30 * 1000;
 const ATTENTION_WINDOW_STATUS_KEY = "headsdown:attention-window";
+const SESSION_TIMEBOX_PROMPT_KEY = "headsdown:session-timebox-prompt";
 const TIME_BOX_STATUS_KEY = "headsdown:time-box";
 const TIME_BOX_WIDGET_KEY = "headsdown:time-box";
 const TIME_BOX_WIDGET_THRESHOLD_MINUTES = 3;
@@ -489,6 +503,59 @@ const AVAILABILITY_COMPAT_QUERY = `
 
 const AGENT_CONTROL_OVERVIEW_QUERY = `
   query AgentControlOverviewForPi {
+    agentControlOverview {
+      headsdownCall {
+        key
+        title
+        body
+        privacyMode
+        recommendedActionKey
+        allowedActionKeys
+        reasonCodes
+      }
+      runSummaries {
+        runId
+        callKey
+        actionState
+        allowedActionKeys
+        safeTitle
+        clientLabel
+        resumeEligibleAt
+        nextWorkWindowStartsAt
+        handoffAvailable
+        handoffState
+      }
+      sessionSummaries {
+        sessionId
+        timeboxExpiresAt
+        pendingTimeboxExtensionRequest {
+          id
+          requestedExtensionMinutes
+          requestedAt
+        }
+      }
+    }
+  }
+`;
+
+const REQUEST_SESSION_TIMEBOX_EXTENSION_MUTATION = `
+  mutation RequestSessionTimeboxExtensionForPi($sessionId: String!, $requestedExtensionMinutes: Int!) {
+    requestSessionTimeboxExtension(
+      sessionId: $sessionId
+      requestedExtensionMinutes: $requestedExtensionMinutes
+    ) {
+      sessionId
+      pendingTimeboxExtensionRequest {
+        id
+        requestedExtensionMinutes
+        requestedAt
+      }
+    }
+  }
+`;
+
+const LEGACY_AGENT_CONTROL_OVERVIEW_QUERY = `
+  query AgentControlOverviewForPiLegacy {
     agentControlOverview {
       headsdownCall {
         key
@@ -842,6 +909,40 @@ function normalizeRunSummaryPayload(value: unknown): AgentRunSummaryPayload | nu
   };
 }
 
+function normalizeSessionTimeboxExtensionRequestPayload(
+  value: unknown,
+): SessionTimeboxExtensionRequestPayload | null {
+  if (!value || typeof value !== "object") return null;
+
+  const request = value as Record<string, unknown>;
+  const id = toStringOrNull(request.id);
+  const requestedExtensionMinutes = normalizeDurationMinutes(
+    typeof request.requestedExtensionMinutes === "number"
+      ? request.requestedExtensionMinutes
+      : undefined,
+  );
+  const requestedAt = toStringOrNull(request.requestedAt);
+
+  if (!id || !requestedExtensionMinutes || !requestedAt) return null;
+  return { id, requestedExtensionMinutes, requestedAt };
+}
+
+function normalizeAgentSessionSummaryPayload(value: unknown): AgentSessionSummaryPayload | null {
+  if (!value || typeof value !== "object") return null;
+
+  const summary = value as Record<string, unknown>;
+  const sessionId = toStringOrNull(summary.sessionId);
+  if (!sessionId) return null;
+
+  return {
+    sessionId,
+    timeboxExpiresAt: toStringOrNull(summary.timeboxExpiresAt),
+    pendingTimeboxExtensionRequest: normalizeSessionTimeboxExtensionRequestPayload(
+      summary.pendingTimeboxExtensionRequest,
+    ),
+  };
+}
+
 function normalizeAgentControlOverviewPayload(value: unknown): AgentControlOverviewPayload | null {
   if (!value || typeof value !== "object") return null;
 
@@ -851,10 +952,16 @@ function normalizeAgentControlOverviewPayload(value: unknown): AgentControlOverv
         .map((item) => normalizeRunSummaryPayload(item))
         .filter((item): item is AgentRunSummaryPayload => item !== null)
     : [];
+  const sessionSummaries = Array.isArray(payload.sessionSummaries)
+    ? payload.sessionSummaries
+        .map((item) => normalizeAgentSessionSummaryPayload(item))
+        .filter((item): item is AgentSessionSummaryPayload => item !== null)
+    : [];
 
   return {
     headsdownCall: normalizeHeadsDownCallPayload(payload.headsdownCall),
     runSummaries,
+    sessionSummaries,
   };
 }
 
@@ -866,15 +973,20 @@ async function getAgentControlOverviewCompat(
       getAgentControlOverview?: () => Promise<unknown>;
     }
   ).getAgentControlOverview;
+  const graphql = getLowLevelGraphQLClient(client);
+
+  let nativeOverview: AgentControlOverviewPayload | null = null;
 
   if (typeof nativeMethod === "function") {
     const nativePayload = await nativeMethod.call(client);
-    return normalizeAgentControlOverviewPayload(nativePayload);
+    nativeOverview = normalizeAgentControlOverviewPayload(nativePayload);
+    if (nativeOverview && (nativeOverview.sessionSummaries.length > 0 || !graphql)) {
+      return nativeOverview;
+    }
   }
 
-  const graphql = getLowLevelGraphQLClient(client);
   if (!graphql) {
-    return null;
+    return nativeOverview;
   }
 
   try {
@@ -882,8 +994,24 @@ async function getAgentControlOverviewCompat(
     return normalizeAgentControlOverviewPayload(data.agentControlOverview);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (
+      message.includes("sessionSummaries") ||
+      message.includes("pendingTimeboxExtensionRequest") ||
+      message.includes("timeboxExpiresAt") ||
+      message.includes("Cannot query field")
+    ) {
+      if (nativeOverview) return nativeOverview;
+
+      try {
+        const legacyData = await graphql.request(LEGACY_AGENT_CONTROL_OVERVIEW_QUERY);
+        return normalizeAgentControlOverviewPayload(legacyData.agentControlOverview);
+      } catch {
+        return null;
+      }
+    }
+    if (nativeOverview) return nativeOverview;
     if (message.includes("agentControlOverview") || message.includes("headsdownCall")) {
-      return null;
+      return nativeOverview;
     }
     throw error;
   }
@@ -919,6 +1047,54 @@ async function callNativeApplyHeadsDownAction(
     ok: result.ok === true,
     runSummary: normalizeRunSummaryPayload(result.runSummary),
   };
+}
+
+async function requestSessionTimeboxExtensionCompat(
+  client: HeadsDownClient,
+  sessionId: string,
+  requestedExtensionMinutes: number,
+): Promise<SessionTimeboxExtensionRequestPayload> {
+  const nativeMethod = (
+    client as unknown as {
+      requestSessionTimeboxExtension?: (input: {
+        sessionId: string;
+        requestedExtensionMinutes: number;
+      }) => Promise<unknown>;
+    }
+  ).requestSessionTimeboxExtension;
+
+  if (typeof nativeMethod === "function") {
+    const result = (await nativeMethod.call(client, {
+      sessionId,
+      requestedExtensionMinutes,
+    })) as Record<string, unknown>;
+    const mutationPayload = result.requestSessionTimeboxExtension as
+      | Record<string, unknown>
+      | undefined;
+    const request = normalizeSessionTimeboxExtensionRequestPayload(
+      result.request ??
+        result.pendingTimeboxExtensionRequest ??
+        mutationPayload?.pendingTimeboxExtensionRequest ??
+        result,
+    );
+    if (request) return request;
+  }
+
+  const graphql = getLowLevelGraphQLClient(client);
+  if (!graphql) {
+    throw new Error("Session timebox extension requests require updated HeadsDown client support.");
+  }
+
+  const data = await graphql.request(REQUEST_SESSION_TIMEBOX_EXTENSION_MUTATION, {
+    sessionId,
+    requestedExtensionMinutes,
+  });
+  const payload = data.requestSessionTimeboxExtension as Record<string, unknown> | undefined;
+  const request = normalizeSessionTimeboxExtensionRequestPayload(
+    payload?.pendingTimeboxExtensionRequest,
+  );
+  if (!request) throw new Error("HeadsDown did not return a session timebox extension request.");
+  return request;
 }
 
 async function applyHeadsDownActionCompat(
@@ -2496,6 +2672,8 @@ function buildHeadsDownCommandHelp(): string {
 export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
   AGENT_CONTROL_OVERVIEW_QUERY,
+  REQUEST_SESSION_TIMEBOX_EXTENSION_MUTATION,
+  LEGACY_AGENT_CONTROL_OVERVIEW_QUERY,
   APPLY_HEADSDOWN_ACTION_MUTATION,
   getLowLevelGraphQLClient,
   getAvailabilityContext,
@@ -2506,6 +2684,7 @@ export const __internal = {
   buildAutopilotClassifierPrompt,
   getAgentControlOverviewCompat,
   getAgentControlOverviewResult,
+  requestSessionTimeboxExtensionCompat,
   applyHeadsDownActionCompat,
   buildActorContext,
   withActorContext,
@@ -2517,6 +2696,7 @@ export const __internal = {
   toGraphQLEnumValue,
   normalizeHeadsDownCallPayload,
   normalizeRunSummaryPayload,
+  normalizeAgentSessionSummaryPayload,
   normalizeAgentControlOverviewPayload,
   pickQueueForMorningRun,
   isAlreadyQueuedForMorning,
@@ -2617,7 +2797,9 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     attemptedSteps: [],
   };
   const attentionWindowDedupe = new Map<string, string>();
+  const sessionTimeboxPromptDedupe = new Map<string, string>();
   let lastAttentionWindowPollAt = 0;
+  let lastSessionTimeboxPollAt = 0;
   let lastAttentionWindowPollFailureNoticeAt = 0;
   const pendingOutcomeSharePreviews = new Map<
     string,
@@ -4462,6 +4644,101 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     return typeof isIdle !== "function" || isIdle();
   }
 
+  function resolveCurrentSessionTimebox(input: {
+    ctx: ExtensionContext;
+    overview: AgentControlOverviewPayload | null | undefined;
+    thresholdMinutes: number;
+    now: number;
+  }): {
+    summary: AgentSessionSummaryPayload;
+    remainingMinutes: number;
+    fingerprint: string;
+  } | null {
+    const sessionId = getSessionId(input.ctx);
+    if (!sessionId || !input.overview) return null;
+
+    const summary = input.overview.sessionSummaries.find((item) => item.sessionId === sessionId);
+    if (!summary?.timeboxExpiresAt || summary.pendingTimeboxExtensionRequest) return null;
+
+    const expiresAtMs = Date.parse(summary.timeboxExpiresAt);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= input.now) return null;
+
+    const remainingMinutes = Math.ceil((expiresAtMs - input.now) / 60_000);
+    if (remainingMinutes > input.thresholdMinutes) return null;
+
+    return {
+      summary,
+      remainingMinutes,
+      fingerprint: `${summary.sessionId}:${summary.timeboxExpiresAt}:${input.thresholdMinutes}`,
+    };
+  }
+
+  async function maybePromptSessionTimeboxExtension(input: {
+    ctx: ExtensionContext;
+    actorClient: HeadsDownClient;
+    overview: AgentControlOverviewPayload | null | undefined;
+    thresholdMinutes: number;
+    now: number;
+  }): Promise<void> {
+    if (!input.ctx.hasUI || typeof input.ctx.ui.select !== "function") return;
+
+    const candidate = resolveCurrentSessionTimebox({
+      ctx: input.ctx,
+      overview: input.overview,
+      thresholdMinutes: input.thresholdMinutes,
+      now: input.now,
+    });
+    if (!candidate) return;
+
+    if (sessionTimeboxPromptDedupe.get(candidate.summary.sessionId) === candidate.fingerprint) {
+      return;
+    }
+
+    sessionTimeboxPromptDedupe.set(candidate.summary.sessionId, candidate.fingerprint);
+
+    const choices = ["Request 15 minutes", "Request 30 minutes", "Wrap up"];
+    const selected = await input.ctx.ui.select(
+      `HeadsDown session timebox: ${candidate.remainingMinutes}m left`,
+      choices,
+    );
+
+    if (selected === "Request 15 minutes" || selected === "Request 30 minutes") {
+      const requestedExtensionMinutes = selected === "Request 15 minutes" ? 15 : 30;
+      try {
+        await requestSessionTimeboxExtensionCompat(
+          input.actorClient,
+          candidate.summary.sessionId,
+          requestedExtensionMinutes,
+        );
+        input.ctx.ui.notify(
+          `[HeadsDown] Requested ${requestedExtensionMinutes} more minutes for this session.`,
+          "info",
+        );
+      } catch (error) {
+        sessionTimeboxPromptDedupe.delete(candidate.summary.sessionId);
+        input.ctx.ui.notify(
+          `[HeadsDown] Could not request more session time: ${sanitizeErrorMessage(error)}.`,
+          "warning",
+        );
+      }
+      return;
+    }
+
+    if (selected === "Wrap up") {
+      pi.sendMessage(
+        {
+          customType: "headsdown-session-timebox-wrap",
+          content:
+            "[HeadsDown] Session timebox is closing. Wrap up now and save a concise handoff.",
+          display: false,
+          details: { sessionId: candidate.summary.sessionId },
+        },
+        { deliverAs: "steer" },
+      );
+      input.ctx.ui.notify("[HeadsDown] Wrap-up guidance sent for this session.", "info");
+    }
+  }
+
   function deliverAttentionWindowWarning(
     ctx: ExtensionContext,
     input: {
@@ -4516,6 +4793,30 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     const activeProposal = getLatestApprovedProposal();
 
     if (!activeProposal) {
+      const shouldPollHostedSessionTimebox =
+        options.force === true ||
+        now - lastSessionTimeboxPollAt >= ATTENTION_WINDOW_POLL_COOLDOWN_MS;
+
+      if (shouldPollHostedSessionTimebox) {
+        lastSessionTimeboxPollAt = now;
+        const client = await getClient();
+        if (client) {
+          try {
+            const actorClient = withActorContext(client, ctx);
+            const overview = await getAgentControlOverviewCompat(actorClient);
+            await maybePromptSessionTimeboxExtension({
+              ctx,
+              actorClient,
+              overview,
+              thresholdMinutes: DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES,
+              now,
+            });
+          } catch {
+            // Session timebox prompting is advisory; local timebox guidance still applies below.
+          }
+        }
+      }
+
       if (localOnlyWarningActive) {
         deliverAttentionWindowWarning(ctx, {
           source: "box",
@@ -4563,6 +4864,15 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       const effective = resolveEffectiveDeadline(activeTimeBox, backendDeadlineAt, now);
       const thresholdMinutes =
         guidance?.thresholdMinutes ?? DEFAULT_ATTENTION_WINDOW_THRESHOLD_MINUTES;
+
+      await maybePromptSessionTimeboxExtension({
+        ctx,
+        actorClient,
+        overview,
+        thresholdMinutes,
+        now,
+      });
+
       const backendWarningActive =
         guidance?.active === true &&
         resolution.runId !== null &&
@@ -4677,8 +4987,10 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     autoQueuedRunIds = new Set<string>();
     resetAutopilotRuntimeState();
     attentionWindowDedupe.clear();
+    sessionTimeboxPromptDedupe.clear();
     lastAutopilotFailureNoticeAt = 0;
     lastAttentionWindowPollAt = 0;
+    lastSessionTimeboxPollAt = 0;
     lastAttentionWindowPollFailureNoticeAt = 0;
     clearAttentionWindowWarning(ctx);
 
@@ -4714,6 +5026,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     restoreTimeBoxState(ctx);
     refinedReAttemptsCache = null;
     resetAutopilotRuntimeState();
+    sessionTimeboxPromptDedupe.clear();
     await updateStatusUI(ctx);
     updateTimeBoxUI(ctx, activeWrapUpDeadlineAt(availabilitySnapshot?.schedule?.wrapUpGuidance));
   });
@@ -6930,6 +7243,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
       activeTimeBox = createTimeBox(durationMs);
       const persisted = persistTimeBox();
       attentionWindowDedupe.clear();
+      sessionTimeboxPromptDedupe.clear();
       updateTimeBoxUI(ctx, activeWrapUpDeadlineAt(availabilitySnapshot?.schedule?.wrapUpGuidance));
       ctx.ui.notify(formatTimeBoxConfirmation(activeTimeBox, replaced), "info");
       if (!persisted) {

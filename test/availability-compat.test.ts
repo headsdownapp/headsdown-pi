@@ -370,6 +370,55 @@ describe("agent control off-clock queue flow", () => {
     expect(result.runSummary?.allowedActionKeys).toEqual(["resume_run"]);
   });
 
+  it("keeps native overview when optional session summary enrichment fails", async () => {
+    const client = {
+      async getAgentControlOverview() {
+        return {
+          headsdownCall: { key: "READY_TO_RESUME" },
+          runSummaries: [{ runId: "run-native", callKey: "READY_TO_RESUME" }],
+        };
+      },
+      graphql: {
+        async request() {
+          throw new Error("network down");
+        },
+      },
+    };
+
+    const overview = await __internal.getAgentControlOverviewCompat(client as any);
+    expect(overview?.headsdownCall?.key).toBe("ready_to_resume");
+    expect(overview?.runSummaries[0]?.runId).toBe("run-native");
+    expect(overview?.sessionSummaries).toEqual([]);
+  });
+
+  it("falls back to legacy overview query when low-level GraphQL lacks optional session fields", async () => {
+    const calls: string[] = [];
+    const client = {
+      graphql: {
+        async request(query: string) {
+          calls.push(query);
+          if (query.includes("pendingTimeboxExtensionRequest")) {
+            throw new Error(
+              'Cannot query field "pendingTimeboxExtensionRequest" on type "AgentSessionSummary"',
+            );
+          }
+
+          return {
+            agentControlOverview: {
+              headsdownCall: { key: "READY_TO_RESUME" },
+              runSummaries: [{ runId: "run-legacy", callKey: "READY_TO_RESUME" }],
+            },
+          };
+        },
+      },
+    };
+
+    const overview = await __internal.getAgentControlOverviewCompat(client as any);
+    expect(calls).toHaveLength(2);
+    expect(overview?.headsdownCall?.key).toBe("ready_to_resume");
+    expect(overview?.runSummaries[0]?.runId).toBe("run-legacy");
+  });
+
   it("supports legacy one-argument native action helpers", async () => {
     const client = {
       async applyHeadsDownAction(input: Record<string, unknown>) {
