@@ -64,6 +64,12 @@ function makeContext() {
   };
 }
 
+function makeContextWithoutApprovedProposal() {
+  const ctx = makeContext();
+  ctx.sessionManager.getBranch.mockReturnValue([]);
+  return ctx;
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -837,6 +843,305 @@ describe("attention window mid-flow polling", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("Warning checks are temporarily unavailable"),
       "warning",
+    );
+  });
+  it("prompts for a closing hosted session timebox without an approved proposal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          wrapUpGuidance: { active: false, thresholdMinutes: 15 },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+        sessionSummaries: [
+          {
+            sessionId: "session-1",
+            timeboxExpiresAt: "2026-04-28T10:12:00.000Z",
+            pendingTimeboxExtensionRequest: null,
+          },
+        ],
+      })),
+      requestSessionTimeboxExtension: vi.fn(async () => ({
+        sessionId: "session-1",
+        request: {
+          id: "request-1",
+          requestedExtensionMinutes: 30,
+          requestedAt: "2026-04-28T10:00:00.000Z",
+        },
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContextWithoutApprovedProposal();
+    ctx.ui.select.mockResolvedValue("Request 30 minutes");
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledWith("HeadsDown session timebox: 12m left", [
+      "Request 15 minutes",
+      "Request 30 minutes",
+      "Wrap up",
+    ]);
+    expect(client.requestSessionTimeboxExtension).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      requestedExtensionMinutes: 30,
+    });
+
+    vi.setSystemTime(new Date("2026-04-28T10:00:10.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    expect(client.getAgentControlOverview).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompts once for a closing hosted session timebox and requests 15 minutes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          nextTransitionAt: "2026-04-28T11:00:00.000Z",
+          wrapUpGuidance: {
+            active: false,
+            remainingMinutes: null,
+            deadlineAt: null,
+            thresholdMinutes: 15,
+            profile: "wrap_up",
+            source: "threshold",
+            reason: "window closing",
+            hints: ["completion_first"],
+            selectedMode: "wrap_up",
+          },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+        sessionSummaries: [
+          {
+            sessionId: "session-1",
+            timeboxExpiresAt: "2026-04-28T10:12:00.000Z",
+            pendingTimeboxExtensionRequest: null,
+          },
+        ],
+      })),
+      requestSessionTimeboxExtension: vi.fn(async () => ({
+        sessionId: "session-1",
+        request: {
+          id: "request-1",
+          requestedExtensionMinutes: 15,
+          requestedAt: "2026-04-28T10:00:00.000Z",
+        },
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    ctx.ui.select.mockResolvedValue("Request 15 minutes");
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledWith("HeadsDown session timebox: 12m left", [
+      "Request 15 minutes",
+      "Request 30 minutes",
+      "Wrap up",
+    ]);
+    expect(client.requestSessionTimeboxExtension).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      requestedExtensionMinutes: 15,
+    });
+
+    vi.setSystemTime(new Date("2026-04-28T10:00:31.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows retry when a session timebox extension request fails", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const requestSessionTimeboxExtension = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce({
+        sessionId: "session-1",
+        request: {
+          id: "request-2",
+          requestedExtensionMinutes: 15,
+          requestedAt: "2026-04-28T10:00:31.000Z",
+        },
+      });
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          wrapUpGuidance: { active: false, thresholdMinutes: 15 },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+        sessionSummaries: [
+          {
+            sessionId: "session-1",
+            timeboxExpiresAt: "2026-04-28T10:12:00.000Z",
+            pendingTimeboxExtensionRequest: null,
+          },
+        ],
+      })),
+      requestSessionTimeboxExtension,
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    ctx.ui.select.mockResolvedValue("Request 15 minutes");
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    vi.setSystemTime(new Date("2026-04-28T10:00:31.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledTimes(2);
+    expect(requestSessionTimeboxExtension).toHaveBeenCalledTimes(2);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Could not request more session time"),
+      "warning",
+    );
+  });
+  it("lets an ignored session timebox prompt expire normally", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          wrapUpGuidance: { active: false, thresholdMinutes: 15 },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+        sessionSummaries: [
+          {
+            sessionId: "session-1",
+            timeboxExpiresAt: "2026-04-28T10:12:00.000Z",
+            pendingTimeboxExtensionRequest: null,
+          },
+        ],
+      })),
+      requestSessionTimeboxExtension: vi.fn(),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    ctx.ui.select.mockResolvedValue(undefined);
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+    vi.setSystemTime(new Date("2026-04-28T10:00:31.000Z"));
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+    expect(client.requestSessionTimeboxExtension).not.toHaveBeenCalled();
+  });
+
+  it("steers wrap-up when the user chooses wrap up from the session timebox prompt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T10:00:00.000Z"));
+
+    const { handlers, pi } = registerHeadsDownHarness();
+    const sessionStart = handlers.get("session_start")?.at(0);
+    const toolCall = handlers.get("tool_call")?.at(0);
+    if (!sessionStart || !toolCall) throw new Error("required handlers were not registered");
+
+    const client = {
+      withActor: vi.fn(function (this: any) {
+        return this;
+      }),
+      getAvailability: vi.fn(async () => ({
+        contract: { id: "contract-1", mode: "busy", lock: false },
+        schedule: {
+          inReachableHours: true,
+          wrapUpGuidance: { active: false, thresholdMinutes: 15 },
+        },
+      })),
+      getAgentControlOverview: vi.fn(async () => ({
+        headsdownCall: null,
+        runSummaries: [],
+        sessionSummaries: [
+          {
+            sessionId: "session-1",
+            timeboxExpiresAt: "2026-04-28T10:12:00.000Z",
+            pendingTimeboxExtensionRequest: null,
+          },
+        ],
+      })),
+    };
+
+    vi.spyOn(HeadsDownClient, "fromCredentials").mockResolvedValue(client as any);
+
+    const ctx = makeContext();
+    ctx.ui.select.mockResolvedValue("Wrap up");
+    await sessionStart({ reason: "new" }, ctx);
+
+    await toolCall({ toolName: "read", input: { path: "README.md" } }, ctx);
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "headsdown-session-timebox-wrap",
+        details: { sessionId: "session-1" },
+      }),
+      { deliverAs: "steer" },
     );
   });
 });
