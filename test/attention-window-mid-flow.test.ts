@@ -144,7 +144,7 @@ describe("attention window mid-flow polling", () => {
     );
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       __internal.ATTENTION_WINDOW_STATUS_KEY,
-      "Window closing: 12m left. /headsdown extend or /headsdown wrap",
+      "Window closing: 12m left. /headsdown wrap when you want to stop here",
     );
 
     availabilityState.remainingMinutes = 9;
@@ -158,7 +158,7 @@ describe("attention window mid-flow polling", () => {
     expect(warningCalls).toHaveLength(1);
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       __internal.ATTENTION_WINDOW_STATUS_KEY,
-      "Window closing: 9m left. /headsdown extend or /headsdown wrap",
+      "Window closing: 9m left. /headsdown wrap when you want to stop here",
     );
 
     availabilityState.remainingMinutes = 4;
@@ -273,7 +273,7 @@ describe("attention window mid-flow polling", () => {
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(__internal.TIME_BOX_STATUS_KEY, "Box: 10m left");
     expect(ctx.ui.setWidget).toHaveBeenCalledWith(__internal.TIME_BOX_WIDGET_KEY, [
       "Service deadline arrives in 2m",
-      "/headsdown extend 15m  /  /headsdown wrap",
+      "/headsdown wrap when you want to stop here",
     ]);
   });
 
@@ -385,7 +385,7 @@ describe("attention window mid-flow polling", () => {
 
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       __internal.ATTENTION_WINDOW_STATUS_KEY,
-      "Window closing: 12m left. /headsdown extend or /headsdown wrap",
+      "Window closing: 12m left. /headsdown wrap when you want to stop here",
     );
     expect(ctx.ui.notify).not.toHaveBeenCalledWith(
       expect.stringContaining("Window closing"),

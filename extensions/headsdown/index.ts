@@ -554,34 +554,6 @@ const REQUEST_SESSION_TIMEBOX_EXTENSION_MUTATION = `
   }
 `;
 
-const LEGACY_AGENT_CONTROL_OVERVIEW_QUERY = `
-  query AgentControlOverviewForPiLegacy {
-    agentControlOverview {
-      headsdownCall {
-        key
-        title
-        body
-        privacyMode
-        recommendedActionKey
-        allowedActionKeys
-        reasonCodes
-      }
-      runSummaries {
-        runId
-        callKey
-        actionState
-        allowedActionKeys
-        safeTitle
-        clientLabel
-        resumeEligibleAt
-        nextWorkWindowStartsAt
-        handoffAvailable
-        handoffState
-      }
-    }
-  }
-`;
-
 const APPLY_HEADSDOWN_ACTION_MUTATION = `
   mutation ApplyHeadsDownActionForPi($input: ApplyHeadsdownActionInput!) {
     applyHeadsdownAction(input: $input) {
@@ -993,26 +965,7 @@ async function getAgentControlOverviewCompat(
     const data = await graphql.request(AGENT_CONTROL_OVERVIEW_QUERY);
     return normalizeAgentControlOverviewPayload(data.agentControlOverview);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (
-      message.includes("sessionSummaries") ||
-      message.includes("pendingTimeboxExtensionRequest") ||
-      message.includes("timeboxExpiresAt") ||
-      message.includes("Cannot query field")
-    ) {
-      if (nativeOverview) return nativeOverview;
-
-      try {
-        const legacyData = await graphql.request(LEGACY_AGENT_CONTROL_OVERVIEW_QUERY);
-        return normalizeAgentControlOverviewPayload(legacyData.agentControlOverview);
-      } catch {
-        return null;
-      }
-    }
     if (nativeOverview) return nativeOverview;
-    if (message.includes("agentControlOverview") || message.includes("headsdownCall")) {
-      return nativeOverview;
-    }
     throw error;
   }
 }
@@ -1406,7 +1359,7 @@ function attentionCountdownText(remainingMinutes: number | null | undefined): st
 }
 
 function attentionWindowStatusText(remainingMinutes: number | null | undefined): string {
-  return `Window closing: ${attentionCountdownText(remainingMinutes)} /headsdown extend or /headsdown wrap`;
+  return `Window closing: ${attentionCountdownText(remainingMinutes)} /headsdown wrap when you want to stop here`;
 }
 
 function localTimeBoxStatusText(remainingMinutes: number | null | undefined): string {
@@ -2673,7 +2626,6 @@ export const __internal = {
   AVAILABILITY_COMPAT_QUERY,
   AGENT_CONTROL_OVERVIEW_QUERY,
   REQUEST_SESSION_TIMEBOX_EXTENSION_MUTATION,
-  LEGACY_AGENT_CONTROL_OVERVIEW_QUERY,
   APPLY_HEADSDOWN_ACTION_MUTATION,
   getLowLevelGraphQLClient,
   getAvailabilityContext,
@@ -3001,7 +2953,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     if (effective.source === "backend") {
       ctx.ui.setWidget(TIME_BOX_WIDGET_KEY, [
         `Service deadline arrives in ${formatRemainingMinutesLabel(effective.remainingMinutes)}m`,
-        "/headsdown extend 15m  /  /headsdown wrap",
+        "/headsdown wrap when you want to stop here",
       ]);
       return;
     }
@@ -4763,7 +4715,7 @@ export default function headsdownExtension(pi: ExtensionAPI) {
     ctx.ui.notify(
       input.source === "box"
         ? "[HeadsDown] Box deadline closing. Wrap cleanly, or clear the box with /headsdown box clear. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop."
-        : "[HeadsDown] Window closing. Extend with /headsdown extend [15m] or Wrap with /headsdown wrap. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop.",
+        : "[HeadsDown] Window closing. Wrap with /headsdown wrap if you want to stop here. Session timebox extension requests are handled by the session timebox prompt. Doing nothing keeps the agent running with tighter wrap-up hints, the deadline does not force a stop.",
       "warning",
     );
     attentionWindowDedupe.set(input.runKey, input.fingerprint);
