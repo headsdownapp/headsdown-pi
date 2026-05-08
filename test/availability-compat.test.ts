@@ -391,34 +391,6 @@ describe("agent control off-clock queue flow", () => {
     expect(overview?.sessionSummaries).toEqual([]);
   });
 
-  it("falls back to legacy overview query when low-level GraphQL lacks optional session fields", async () => {
-    const calls: string[] = [];
-    const client = {
-      graphql: {
-        async request(query: string) {
-          calls.push(query);
-          if (query.includes("pendingTimeboxExtensionRequest")) {
-            throw new Error(
-              'Cannot query field "pendingTimeboxExtensionRequest" on type "AgentSessionSummary"',
-            );
-          }
-
-          return {
-            agentControlOverview: {
-              headsdownCall: { key: "READY_TO_RESUME" },
-              runSummaries: [{ runId: "run-legacy", callKey: "READY_TO_RESUME" }],
-            },
-          };
-        },
-      },
-    };
-
-    const overview = await __internal.getAgentControlOverviewCompat(client as any);
-    expect(calls).toHaveLength(2);
-    expect(overview?.headsdownCall?.key).toBe("ready_to_resume");
-    expect(overview?.runSummaries[0]?.runId).toBe("run-legacy");
-  });
-
   it("supports legacy one-argument native action helpers", async () => {
     const client = {
       async applyHeadsDownAction(input: Record<string, unknown>) {
@@ -971,10 +943,10 @@ describe("attention window helpers", () => {
 
   it("formats persistent attention window status text", () => {
     expect(__internal.attentionWindowStatusText(12)).toBe(
-      "Window closing: 12m left. /headsdown extend or /headsdown wrap",
+      "Window closing: 12m left. /headsdown wrap when you want to stop here",
     );
     expect(__internal.attentionWindowStatusText(null)).toBe(
-      "Window closing: Closing soon. /headsdown extend or /headsdown wrap",
+      "Window closing: Closing soon. /headsdown wrap when you want to stop here",
     );
   });
 });
