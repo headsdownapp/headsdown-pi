@@ -56,9 +56,9 @@
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.1",
     "prettier": "^3.4.0",
     "typescript": "^6.0.0",
-    "vitest": "^3.1.0"
+    "vitest": "^4.1.8"
   }
 }
